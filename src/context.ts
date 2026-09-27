@@ -3,6 +3,8 @@ import { checkpointId, nonempty, type JsonValue } from "./codec.js";
 import { submit, type ChildActivityHandle } from "./client.js";
 import {
   message,
+  captureFailure,
+  recordedFailure,
   NonRetryableError,
   retryable,
   RunnerQError,
@@ -77,8 +79,12 @@ export class ActivityContext {
       try {
         const stored = await s.recover(() => s.storage.getResult(id));
         if (stored) {
-          if (stored.state === "Err")
-            throw new NonRetryableError(messageFromData(decode(stored)));
+          if (stored.state === "Err") {
+            const data = decode(stored);
+            throw new NonRetryableError(messageFromData(data), {
+              cause: recordedFailure(data),
+            });
+          }
           return parse(decode(stored), options.parse, `step ${name}`);
         }
         guard(s);
@@ -101,6 +107,10 @@ export class ActivityContext {
               ["claim_lost", "configuration"].includes(error.code)
             )
           ) {
+            const failure = encode(
+              { error: message(error), failure: captureFailure(error) },
+              "json-v1",
+            );
             await s.recover(
               () =>
                 s.storage.checkpoint(
@@ -108,7 +118,7 @@ export class ActivityContext {
                   id,
                   {
                     state: "Err",
-                    ...encode({ error: message(error) }, "json-v1"),
+                    ...failure,
                   },
                   `run:${name}`,
                 ),

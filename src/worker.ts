@@ -3,7 +3,7 @@ import { EventEmitter, captureRejectionSymbol } from "node:events";
 import type { ActivityDefinition } from "./activity.js";
 import { ActivityContext } from "./context.js";
 import { encode, decode } from "./serialization.js";
-import { message, retryable, RunnerQError } from "./errors.js";
+import { message, retryable, RunnerQError, captureFailure } from "./errors.js";
 import { integer } from "./options.js";
 import { pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
@@ -421,8 +421,9 @@ export class Worker extends EventEmitter<WorkerEvents> {
         this.publish("claimLost", event);
         return;
       }
+      const failure = captureFailure(error);
       const status = await scope.recover(
-        () => storage.fail(fence, message(error), retryable(error)),
+        () => storage.fail(fence, failure.message, retryable(error), failure),
         true,
       );
       this.publish(

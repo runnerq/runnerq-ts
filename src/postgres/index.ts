@@ -6,8 +6,8 @@ import {
   type PoolConfig,
   type QueryResultRow,
 } from "pg";
-import { checkpointId, json, nonempty, type JsonValue } from "../codec.js";
-import { databaseError, RunnerQError } from "../errors.js";
+import { checkpointId, nonempty, type JsonValue } from "../codec.js";
+import { databaseError, RunnerQError, type FailureDetails } from "../errors.js";
 import type { SerializedValue } from "../serialization.js";
 import { integer } from "../options.js";
 import { pause } from "../async.js";
@@ -620,6 +620,7 @@ export class PostgresStorage
     f: Fence,
     reason: string,
     retry: boolean,
+    failure?: FailureDetails,
   ): Promise<"failed" | "retrying" | "dead_letter"> {
     const status = await this.tx(async (c) => {
       const r = await c.query(
@@ -630,13 +631,14 @@ export class PostgresStorage
       if (!a) {
         const previous = await c.query(
           `SELECT event_type FROM runnerq_events WHERE queue_name=$1 AND activity_id=$2 AND worker_id=$3
-          AND detail->>'error'=$4 AND event_type=ANY($5::text[]) ORDER BY id DESC LIMIT 1`,
+          AND detail->>'error'=$4 AND event_type=ANY($5::text[]) AND (detail->'failure') IS NOT DISTINCT FROM $6::jsonb ORDER BY id DESC LIMIT 1`,
           [
             this.queue,
             f.ownerId,
             f.token,
             reason,
             retry ? ["Retrying", "DeadLetter"] : ["Failed"],
+            failure === undefined ? null : JSON.stringify(failure),
           ],
         );
         const event = previous.rows[0]?.event_type;
@@ -674,6 +676,7 @@ export class PostgresStorage
             serialization: "json-v1",
             data: {
               error: reason,
+              ...(failure ? { failure } : {}),
               type: retry ? "dead_letter" : "non_retryable",
               failed_at: new Date().toISOString(),
             },
@@ -685,7 +688,7 @@ export class PostgresStorage
         f.ownerId,
         again ? "Retrying" : retry ? "DeadLetter" : "Failed",
         f.token,
-        { error: reason, retryable: retry },
+        { error: reason, retryable: retry, ...(failure ? { failure } : {}) },
       );
       return status;
     });
@@ -749,7 +752,7 @@ export class PostgresStorage
     return r[0]
       ? {
           state: r[0].state,
-          data: json(r[0].data),
+          data: r[0].data,
           serialization: r[0].serialization,
         }
       : null;
@@ -1123,7 +1126,7 @@ export class PostgresStorage
     if (!rows[0])
       throw new RunnerQError("not_found", "Activity input not found");
     return {
-      data: json(rows[0].payload),
+      data: rows[0].payload,
       serialization: rows[0].serialization,
     };
   }

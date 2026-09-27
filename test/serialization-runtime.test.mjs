@@ -119,7 +119,7 @@ integration(
       assert.ok(invocations >= 2);
       const inspector = new Inspector({ storage });
       assert.equal(
-        (await inspector.input(handle.id)).when instanceof Date,
+        (await inspector.input(handle.id)).data.when instanceof Date,
         true,
       );
       assert.equal(

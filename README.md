@@ -182,6 +182,30 @@ try {
 
 The runtime remembers suspension even if caught and will not incorrectly complete the activity. It cannot stop arbitrary application side effects after a catch or in a finally block.
 
+## Persisted failures
+
+Terminal handler failures and permanent `ctx.run()` failures retain a portable `failure` record containing `name`, `message`, `stack`, string/integer `code`, optional plain-JSON `data`, and nested `cause`. Retry events retain the same diagnostics. Cause capture stops at eight errors and marks cycles or excessive depth explicitly. Non-JSON error data is replaced with an explanatory string; arbitrary custom properties and custom exception prototypes are not persisted.
+
+`handle.result()` throws `ActivityFailedError` with the recorded exception as a `RecordedError` in `cause`. Replayed permanent steps throw `NonRetryableError` with a `RecordedError` cause. These wrappers preserve SDK failure semantics; the recorded cause exposes the original name, stack, code, data, and cause chain without invoking user constructors. This is separate from returning an `Error` as a successful native value.
+
+```ts
+import { ActivityFailedError, RecordedError } from "runnerq";
+
+try {
+  await handle.result();
+} catch (error) {
+  if (
+    error instanceof ActivityFailedError &&
+    error.cause instanceof RecordedError
+  ) {
+    reportFailure(error.cause.name, error.cause.code, error.cause.data);
+  }
+  throw error;
+}
+```
+
+Worker-captured diagnostics live in result/checkpoint records and failure events; `lastError` remains a compact message. Lease expiry cannot capture an exception from a process that is no longer running. No additional schema migration is required for these diagnostics.
+
 ## Cancellation and lifecycle
 
 `ctx.signal` aborts on execution timeout, claim loss, or exhausted shutdown grace. Pass it to fetch, cancellable database clients and other I/O. Cancellation cannot terminate synchronous JavaScript or force an uncooperative Promise to settle. Such handlers remain tracked; the SDK does not release local execution capacity by merely racing a timeout Promise. CPU-heavy work belongs in isolated worker processes.
@@ -233,11 +257,17 @@ const inspector = new Inspector({ storage });
 const waiting = await inspector.list({ rootsOnly: true, status: "waiting" });
 const steps = await inspector.steps(activityId);
 const history = await inspector.history(activityId);
+const input = await inspector.input(activityId);
+if (input.decoded) {
+  useInput(input.data);
+} else {
+  reportUnreadable(input.serialization, input.rawData, input.decodeError);
+}
 
 await inspector.close();
 ```
 
-The inspector uses camelCase and canonical lowercase statuses. List responses intentionally omit payloads; use `inspector.input(activityId)` to fetch an activity's input separately.
+The inspector uses camelCase and canonical lowercase statuses. List responses intentionally omit payloads; use `inspector.input(activityId)` to fetch an activity's input separately. Input, result, and step payloads have a `decoded` discriminator: successful reads expose `data`; failed decoding exposes `rawData`, `serialization`, and structured `decodeError`, with `data` set to undefined. A bad checkpoint does not prevent inspection of the others. `result()` still returns null when no result exists. Database errors and missing inputs still throw. Callers upgrading from the previous input API must read `input.data` after checking `input.decoded`.
 
 `inspector.events({ signal, bufferSize })` is a bounded async iterable; `inspector.on("event", listener)` is also available. A shared tailer runs while subscribers exist. Slow iterators receive an overflow error and should refresh current state. The live feed is best-effort: PostgreSQL sequence order is not commit order. Fetch persisted per-activity history for authoritative inspection. `inspector.close()` stops the tailer without closing storage.
 

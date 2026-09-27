@@ -37,6 +37,14 @@ COMMIT;
 
 Coordinate the change with clients and workers; old readers cannot decode new native values. The initializer does not apply migrations, and missing/unknown formats do not trigger decoder inference. This SQL only upgrades the previous TS layout; it does not migrate inline-input Go schemas.
 
+## Failure diagnostics and inspection
+
+Failure records remain portable protocol JSON, independent of native recipes. Workers capture `FailureDetails` once before retrying a failed activity transition; permanent step failures likewise capture their representation before checkpoint persistence. `Storage.fail` accepts optional diagnostics, which PostgreSQL writes to terminal results and failure/retry events in the same transaction. Lost-reply reconciliation compares the captured diagnostics as well as the message and event type. `last_error` remains a short message; no new columns are needed.
+
+Clients and replayed failed steps wrap reconstructed `RecordedError` causes in the existing SDK error types. Custom exception constructors are never called. Only named fields (`name`, `message`, `stack`, `code`, `data`, `cause`) are retained, with bounded cause depth and explicit placeholders for unsupported data.
+
+Raw storage reads do not decode user payloads. Execution decoders continue to reject invalid payloads. Inspector payload reads instead return a discriminated `InspectedValue`: either `decoded: true` with `data`, or `decoded: false` with `rawData` and `decodeError`. Per-record decoding keeps other checkpoints visible; storage and lookup failures still propagate. The raw data is the database driver's JSON representation, not the original JSON text.
+
 ## Atomic transitions
 
 | Transition       | Transaction invariants                                                                                     |

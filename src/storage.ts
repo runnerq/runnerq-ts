@@ -1,3 +1,4 @@
+import type { FailureDetails } from "./errors.js";
 import type { JsonValue } from "./codec.js";
 import type { ExecutionOptions } from "./options.js";
 import type { SerializedValue, SerializationFormat } from "./serialization.js";
@@ -127,6 +128,7 @@ export interface Storage {
     fence: Fence,
     reason: string,
     retryable: boolean,
+    failure?: FailureDetails,
   ): Promise<"failed" | "retrying" | "dead_letter">;
   checkpoint(
     fence: Fence,
