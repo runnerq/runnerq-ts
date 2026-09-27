@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { EventEmitter, captureRejectionSymbol } from "node:events";
 import type { ActivityDefinition } from "./activity.js";
 import { ActivityContext } from "./context.js";
@@ -80,7 +79,6 @@ export class Worker extends EventEmitter<WorkerEvents> {
   private lifetime = new AbortController();
   private maintenance: Promise<void>[] = [];
   private dispatch?: Promise<void>;
-  private poolId = randomUUID();
   private state: "idle" | "starting" | "running" | "stopping" | "stopped" =
     "idle";
   private startPromise?: Promise<void>;
@@ -181,14 +179,8 @@ export class Worker extends EventEmitter<WorkerEvents> {
           "configuration",
           "At least one registered handler is required and all filtered types must be registered",
         );
-      await this.config.storage.registerPool(
-        this.poolId,
-        this.config.concurrency,
-        types,
-      );
       this.state = "running";
       this.maintenance = [
-        this.loop(10_000, () => this.config.storage.heartbeatPool(this.poolId)),
         this.loop(this.config.reaperIntervalMs, () =>
           this.config.storage.reap(this.config.reaperBatchSize),
         ),
@@ -449,16 +441,9 @@ export class Worker extends EventEmitter<WorkerEvents> {
     if (this.state === "starting") await this.startPromise?.catch(() => {});
     this.state = "stopping";
     this.intake.abort();
-    const deregister = this.config.storage
-      .deregisterPool(this.poolId)
-      .catch((error) => this.report(error));
     const drain = (async () => {
       await this.dispatch;
-      await Promise.allSettled([
-        ...this.inFlight,
-        ...this.maintenance,
-        deregister,
-      ]);
+      await Promise.allSettled([...this.inFlight, ...this.maintenance]);
     })();
     let timer: NodeJS.Timeout | undefined;
     const drained = await Promise.race([

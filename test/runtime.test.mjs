@@ -9,7 +9,6 @@ import {
   Worker,
   NonRetryableError,
   RunnerQError,
-  Inspector,
 } from "../dist/index.js";
 import { dsn, setup, until } from "./helpers.mjs";
 const integration = (name, fn) =>

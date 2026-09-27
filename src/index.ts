@@ -5,8 +5,6 @@ export type { ResultOptions, ChildActivityHandle } from "./client.js";
 export { ActivityContext } from "./context.js";
 export type { StepContext } from "./context.js";
 export { Worker } from "./worker.js";
-export { Inspector } from "./inspector.js";
-export type { InspectedValue } from "./inspector.js";
 export type { FailureDetails } from "./errors.js";
 export type {
   WorkerConfig,
@@ -32,7 +30,6 @@ export type {
   ActivityStatus,
   ActivitySnapshot,
   ActivityEvent,
-  QueueStats,
   ListOptions,
 } from "./storage.js";
 

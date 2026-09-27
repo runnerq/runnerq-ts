@@ -20,7 +20,7 @@ The default attempt budget is unlimited, stored as `max_retries = 0`; a positive
 
 ## Serialization
 
-User data is encoded before entering the storage contract. `Submission` and `Claim` carry raw JSON payload plus its format. `StoredResult` and `SerializedValue` pair JSON data with a required serialization identifier. Custom storage backends must preserve that identifier in submit/claim, checkpoint/complete/signal, input/result reads and inspection; immutable-write reconciliation compares both data and format.
+User data is encoded before entering the storage contract. `Submission` and `Claim` carry raw JSON payload plus its format. `StoredResult` and `SerializedValue` pair JSON data with a required serialization identifier. Custom storage backends must preserve that identifier in submit/claim, checkpoint/complete/signal and input/result reads; immutable-write reconciliation compares both data and format.
 
 `runnerq_inputs.serialization` and `runnerq_results.serialization` are non-null text columns, defaulting to `json-v1` for protocol writers. The TS API explicitly writes `superjson-v1` for native values. Their JSONB columns hold SuperJSON's `{ json, meta? }` representation for native values and the raw application JSON for portable values. Encoding metadata stays in the separate input/result tables. Activity scheduling state and event details remain portable JSON.
 
@@ -37,13 +37,13 @@ COMMIT;
 
 Coordinate the change with clients and workers; old readers cannot decode new native values. The initializer does not apply migrations, and missing/unknown formats do not trigger decoder inference. This SQL only upgrades the previous TS layout; it does not migrate inline-input Go schemas.
 
-## Failure diagnostics and inspection
+## Failure diagnostics
 
 Failure records remain portable protocol JSON, independent of native recipes. Workers capture `FailureDetails` once before retrying a failed activity transition; permanent step failures likewise capture their representation before checkpoint persistence. `Storage.fail` accepts optional diagnostics, which PostgreSQL writes to terminal results and failure/retry events in the same transaction. Lost-reply reconciliation compares the captured diagnostics as well as the message and event type. `last_error` remains a short message; no new columns are needed.
 
 Clients and replayed failed steps wrap reconstructed `RecordedError` causes in the existing SDK error types. Custom exception constructors are never called. Only named fields (`name`, `message`, `stack`, `code`, `data`, `cause`) are retained, with bounded cause depth and explicit placeholders for unsupported data.
 
-Raw storage reads do not decode user payloads. Execution decoders continue to reject invalid payloads. Inspector payload reads instead return a discriminated `InspectedValue`: either `decoded: true` with `data`, or `decoded: false` with `rawData` and `decodeError`. Per-record decoding keeps other checkpoints visible; storage and lookup failures still propagate. The raw data is the database driver's JSON representation, not the original JSON text.
+Raw storage reads do not decode user payloads. Execution decoders reject invalid payloads.
 
 ## Atomic transitions
 
@@ -72,9 +72,9 @@ Retention bounds both deleted roots and examined candidates per batch. Separatin
 
 ## Notifications and observations
 
-The PostgreSQL adapter has a normal query pool and one lazy LISTEN client. Channels match Go: `rq_w_<queue>`, `rq_r_<queue>`, and `rq_e_<queue>`. Notification sends are coalesced after business transactions commit, with at most 200 result UUIDs per payload and bounded pending IDs. Notifications may be dropped. Result waiters subscribe before querying; work and result paths requery on bounded fallbacks. A reconnect wakes local subscriptions.
+The PostgreSQL adapter has a normal query pool and one lazy LISTEN client. Channels match Go: `rq_w_<queue>` and `rq_r_<queue>`. Notification sends are coalesced after business transactions commit, with at most 200 result UUIDs per payload and bounded pending IDs. Notifications may be dropped. Result waiters subscribe before querying; work and result paths requery on bounded fallbacks. A reconnect wakes local subscriptions.
 
-Inspector streaming tails persisted event IDs with bounded per-consumer queues. Sequence IDs are strings because JavaScript numbers cannot represent every PostgreSQL BIGINT. A dashboard feed may omit late-committing rows below its cursor; authoritative activity history is read directly. Worker EventEmitter observations are local and cannot replace durable state transitions.
+Event sequence IDs are strings because JavaScript numbers cannot represent every PostgreSQL BIGINT. Worker EventEmitter observations are local and cannot replace durable state transitions.
 
 ## Replay limitations
 

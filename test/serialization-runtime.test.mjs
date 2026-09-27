@@ -1,12 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  activity,
-  runner,
-  RunnerQClient,
-  Worker,
-  Inspector,
-} from "../dist/index.js";
+import { activity, runner, RunnerQClient, Worker } from "../dist/index.js";
 import { encode, decode } from "../dist/serialization.js";
 import { checkpointId } from "../dist/codec.js";
 import { dsn, setup, claim, submission, until } from "./helpers.mjs";
@@ -117,21 +111,22 @@ integration(
       assert.equal(result.signal.get("yes"), 1n);
       assert.equal(effects, 1);
       assert.ok(invocations >= 2);
-      const inspector = new Inspector({ storage });
       assert.equal(
-        (await inspector.input(handle.id)).data.when instanceof Date,
+        decode(await storage.getInput(handle.id)).when instanceof Date,
         true,
       );
       assert.equal(
-        (await inspector.result(handle.id)).data.result.amount,
+        decode(await storage.getResult(handle.id)).result.amount,
         9007199254740993n,
       );
       assert.equal(
-        (await inspector.steps(handle.id)).find((s) => s.name === "native-step")
-          .data.date instanceof Date,
+        decode(
+          (await storage.steps(handle.id)).find(
+            (s) => s.name === "native-step",
+          ),
+        ).date instanceof Date,
         true,
       );
-      await inspector.close();
       assert.equal(
         (await storage.getInput(handle.id)).serialization,
         "superjson-v1",

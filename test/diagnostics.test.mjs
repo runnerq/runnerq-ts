@@ -5,7 +5,6 @@ import {
   runner,
   Worker,
   RunnerQClient,
-  Inspector,
   NonRetryableError,
   RecordedError,
 } from "../dist/index.js";
@@ -142,7 +141,7 @@ test(
 );
 
 test(
-  "inspection exposes unreadable payloads individually while execution remains strict",
+  "results that can't be decoded fail with a serialization error",
   { skip: !dsn, timeout: 15000 },
   async (t) => {
     const { storage, pool, queue } = await setup(t),
@@ -182,36 +181,9 @@ test(
         }),
       ],
     );
-    const inspector = new Inspector({ storage });
-    try {
-      const input = await inspector.input(a.id);
-      assert.equal(input.decoded, false);
-      assert.deepEqual(input.rawData, a.payload);
-      assert.equal(input.data, undefined);
-      assert.match(input.decodeError.cause.message, /future-v9/);
-      const result = await inspector.result(a.id);
-      assert.equal(result.decoded, false);
-      assert.equal(result.rawData.json, "x");
-      const steps = await inspector.steps(a.id);
-      assert.equal(steps.find((s) => s.name === "good").decoded, true);
-      assert.ok(steps.find((s) => s.name === "good").data instanceof Date);
-      assert.equal(steps.find((s) => s.name === "bad").decoded, false);
-      const client = new RunnerQClient({ storage });
-      await assert.rejects(client.handle(activity("test"), a.id).result(), {
-        code: "serialization",
-      });
-      // Invalid JSON values must reach the diagnostic decoder rather than fail during raw reads.
-      await pool.query(
-        "UPDATE runnerq_inputs SET serialization='json-v1',payload='9007199254740994'::jsonb WHERE queue_name=$1 AND activity_id=$2",
-        [queue, a.id],
-      );
-      assert.equal((await inspector.input(a.id)).decoded, false);
-      await assert.rejects(
-        inspector.input("00000000-0000-4000-8000-000000000000"),
-        { code: "not_found" },
-      );
-    } finally {
-      await inspector.close();
-    }
+    const client = new RunnerQClient({ storage });
+    await assert.rejects(client.handle(activity("test"), a.id).result(), {
+      code: "serialization",
+    });
   },
 );
