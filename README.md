@@ -97,18 +97,18 @@ const Signup = activity("SignupWorkflow", {
 
 Activity options are immutable values. Later options override earlier ones. These configure the **activity**, not individual `ctx.run` steps.
 
-| Option                                                 | Default / meaning                                                              |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| `runner.priority("high")`                              | `"normal"`; choices: low, normal, high, critical                               |
-| `runner.maxAttempts(3)`                                | Three total attempts; `1` disables retries; `"unlimited"` removes the limit    |
-| `runner.timeoutMs(300_000)`                            | Per-invocation cooperative timeout, in whole seconds expressed as milliseconds |
-| `runner.maxRetryDelayMs(3_600_000)`                    | Backoff cap, in whole seconds expressed as milliseconds                        |
-| `runner.delayMs(5_000)`                                | Delay initial execution; millisecond precision                                 |
-| `runner.metadata({ source: "webhook" })`               | String-valued metadata                                                         |
-| `runner.idempotencyKey("order-123", "returnExisting")` | Atomic business-key deduplication within queue and activity type               |
-| `runner.step("ship")`                                  | Replay-safe named child; valid only with `ctx.spawn()`                         |
-| `runner.asRoot()`                                      | Detach a handler-issued child from lineage; still execution-fenced             |
-| `runner.newOnReplay()`                                 | Explicitly allow a new child on every replay                                   |
+| Option                                                 | Default / meaning                                                                                |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `runner.priority("high")`                              | `"normal"`; choices: low, normal, high, critical                                                 |
+| `runner.maxAttempts(3)`                                | Default: `"unlimited"`; `3` means three total attempts; `1` means one total attempt (no retries) |
+| `runner.timeoutMs(300_000)`                            | Per-invocation cooperative timeout, in whole seconds expressed as milliseconds                   |
+| `runner.maxRetryDelayMs(3_600_000)`                    | Backoff cap, in whole seconds expressed as milliseconds                                          |
+| `runner.delayMs(5_000)`                                | Delay initial execution; millisecond precision                                                   |
+| `runner.metadata({ source: "webhook" })`               | String-valued metadata                                                                           |
+| `runner.idempotencyKey("order-123", "returnExisting")` | Atomic business-key deduplication within queue and activity type                                 |
+| `runner.step("ship")`                                  | Replay-safe named child; valid only with `ctx.spawn()`                                           |
+| `runner.asRoot()`                                      | Detach a handler-issued child from lineage; still execution-fenced                               |
+| `runner.newOnReplay()`                                 | Explicitly allow a new child on every replay                                                     |
 
 Duplicate policies: `returnExisting` returns the original handle and input; `allowReuse` creates a new activity and repoints the key; `allowReuseOnFailure` does so only after failure/dead-letter; `noReuse` rejects an existing key. Named steps, business idempotency and `newOnReplay()` are mutually exclusive. A named step cannot be detached with `asRoot()`.
 

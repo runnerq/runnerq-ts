@@ -16,6 +16,8 @@ The schema lock uses the same numeric key as Go. The baseline preserves final na
 
 Inputs are immutable rows in `runnerq_inputs`. Submission writes activity state, input, idempotency ownership, dependency and event in one transaction. A duplicated key retaining an existing activity never replaces its input. Claiming selects and locks state rows first, then loads only the selected input batch in that transaction. Missing inputs fail the claim transaction.
 
+The default attempt budget is unlimited, stored as `max_retries = 0`; a positive value is the total attempt limit. Existing separate-input TS databases created with the earlier column default need `ALTER TABLE runnerq_activities ALTER COLUMN max_retries SET DEFAULT 0` before connecting with this version. This changes the default only; existing activities retain their configured budgets. Initialization does not perform this change automatically.
+
 ## Atomic transitions
 
 | Transition       | Transaction invariants                                                                                     |

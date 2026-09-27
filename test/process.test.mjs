@@ -12,6 +12,14 @@ test(
       client = new RunnerQClient({ storage });
     const messages = [];
     const children = [];
+    const killChildren = () => {
+      for (const child of children)
+        if (child.exitCode === null && child.signalCode === null)
+          child.kill("SIGKILL");
+    };
+    t.signal.addEventListener("abort", killChildren, { once: true });
+    const exitSignal = () =>
+      AbortSignal.any([t.signal, AbortSignal.timeout(5000)]);
     const spawn = (mode) => {
       const child = fork(
         new URL("./process-worker.mjs", import.meta.url),
@@ -31,7 +39,7 @@ test(
       await until(() =>
         messages.some((m) => m.pid === first.pid && m.type === "checkpointed"),
       );
-      const died = once(first, "exit");
+      const died = once(first, "exit", { signal: exitSignal() });
       first.kill("SIGKILL");
       await died;
       await pool.query(
@@ -47,16 +55,28 @@ test(
         receipt: "recorded",
       });
       assert.equal(messages.filter((m) => m.type === "effect").length, 1);
-      const stopped = once(second, "exit");
+      const stopped = once(second, "exit", { signal: exitSignal() });
       second.send("stop");
-      await stopped;
+      try {
+        const [code, signal] = await stopped;
+        assert.equal(code, 0);
+        assert.equal(signal, null);
+      } catch (cause) {
+        throw new Error(
+          `Replacement worker did not stop cleanly: ${JSON.stringify(messages.filter((m) => m.pid === second.pid))}`,
+          { cause },
+        );
+      }
     } finally {
       for (const child of children)
         if (child.exitCode === null && child.signalCode === null) {
-          const exited = once(child, "exit");
+          const exited = once(child, "exit", {
+            signal: AbortSignal.timeout(5000),
+          });
           child.kill("SIGKILL");
           await exited;
         }
+      t.signal.removeEventListener("abort", killChildren);
     }
   },
 );

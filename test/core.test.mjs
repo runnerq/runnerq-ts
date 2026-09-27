@@ -5,6 +5,12 @@ import { json, businessKey, checkpointId } from "../dist/codec.js";
 import { executionOptions } from "../dist/options.js";
 
 test("activity options are immutable, composable and last wins without losing defaults", () => {
+  assert.equal(executionOptions([]).maxAttempts, "unlimited");
+  assert.equal(
+    executionOptions([runner.priority("high")]).maxAttempts,
+    "unlimited",
+  );
+  assert.equal(executionOptions([runner.maxAttempts(1)]).maxAttempts, 1);
   const base = [runner.priority("low"), runner.maxAttempts(5)];
   const o = executionOptions([...base, runner.priority("high")]);
   assert.equal(o.priority, "high");
