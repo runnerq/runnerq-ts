@@ -248,28 +248,21 @@ Worker events are local observations, emitted after corresponding commits where 
 
 Retention is disabled by default. It deletes complete terminal trees and their inputs, results, checkpoints, events, keys and dependencies atomically. Live consumer trees pin shared producer results. Completion/failure retention clocks are separate; zero keeps that class forever.
 
-## Inspection
+## Reading state
+
+The PostgreSQL storage has read methods for scripts and tests. They aren't
+part of the `Storage` contract, so a custom backend needn't provide them.
 
 ```ts
-import { Inspector } from "runnerq";
-
-const inspector = new Inspector({ storage });
-const waiting = await inspector.list({ rootsOnly: true, status: "waiting" });
-const steps = await inspector.steps(activityId);
-const history = await inspector.history(activityId);
-const input = await inspector.input(activityId);
-if (input.decoded) {
-  useInput(input.data);
-} else {
-  reportUnreadable(input.serialization, input.rawData, input.decodeError);
-}
-
-await inspector.close();
+const waiting = await storage.list({ rootsOnly: true, status: "waiting" });
+const activity = await storage.getActivity(activityId);
+const input = await storage.getInput(activityId);
+const steps = await storage.steps(activityId);
+const history = await storage.events(activityId);
 ```
 
-The inspector uses camelCase and canonical lowercase statuses. List responses intentionally omit payloads; use `inspector.input(activityId)` to fetch an activity's input separately. Input, result, and step payloads have a `decoded` discriminator: successful reads expose `data`; failed decoding exposes `rawData`, `serialization`, and structured `decodeError`, with `data` set to undefined. A bad checkpoint does not prevent inspection of the others. `result()` still returns null when no result exists. Database errors and missing inputs still throw. Callers upgrading from the previous input API must read `input.data` after checking `input.decoded`.
-
-`inspector.events({ signal, bufferSize })` is a bounded async iterable; `inspector.on("event", listener)` is also available. A shared tailer runs while subscribers exist. Slow iterators receive an overflow error and should refresh current state. The live feed is best-effort: PostgreSQL sequence order is not commit order. Fetch persisted per-activity history for authoritative inspection. `inspector.close()` stops the tailer without closing storage.
+List responses omit payloads. Inputs, results and steps come back as stored:
+JSON data together with its `serialization` format, not decoded.
 
 ## Serialization and compatibility
 
@@ -299,9 +292,9 @@ Portable values must be plain JSON: convert dates to ISO strings and big integer
 
 `ctx.run()` always uses native serialization for successful checkpoints, even inside portable activities. It decodes the captured value before returning it on the first execution, just as on replay. Step parsers receive decoded values. Internal deadlines and failure records remain portable protocol data. Go workers must not resume TS-owned native checkpoints; sharing activity boundaries requires both SDKs to implement the same schema and portable format contract.
 
-Each input and result row records `serialization` separately from user data: `superjson-v1` or `json-v1`. Output serialization follows the persisted input format, so changing a definition's default does not change an already submitted activity. Clients and inspectors decode using the row's format. Unknown formats fail explicitly. There is no guessing from payload fields or automatic legacy fallback. Inspectors return rich values, which consumers must encode themselves if serving them over JSON HTTP APIs.
+Each input and result row records `serialization` separately from user data: `superjson-v1` or `json-v1`. Output serialization follows the persisted input format, so changing a definition's default does not change an already submitted activity. Clients decode using the row's format. Unknown formats fail explicitly. There is no guessing from payload fields or automatic legacy fallback.
 
-For custom types, register a versioned recipe in every client, worker and inspector process before the first native serialization operation:
+For custom types, register a versioned recipe in every client and worker process before the first native serialization operation:
 
 ```ts
 import { registerSerialization } from "runnerq";

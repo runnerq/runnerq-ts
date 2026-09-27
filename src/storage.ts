@@ -105,14 +105,6 @@ export interface StepRecord extends StoredResult {
   name: string;
   createdAt: string;
 }
-export interface QueueStats {
-  counts: Record<ActivityStatus, number>;
-  roots: Record<ActivityStatus, number>;
-  byPriority: Record<string, number>;
-  activeWorkers: number;
-  maxWorkers: number;
-}
-
 /** Required durable guarantees. A backend must implement all fencing/dependency operations. */
 export interface Storage {
   readonly queue: string;
@@ -145,20 +137,5 @@ export interface Storage {
   lookupKey(key: string): Promise<string>;
   reap(limit: number): Promise<number>;
   cleanup(retention: Retention): Promise<number>;
-  registerPool(
-    id: string,
-    concurrency: number,
-    types: readonly string[],
-  ): Promise<void>;
-  heartbeatPool(id: string): Promise<void>;
-  deregisterPool(id: string): Promise<void>;
-  list(options?: ListOptions): Promise<ActivitySnapshot[]>;
-  getActivity(id: string): Promise<ActivitySnapshot | null>;
-  getInput(id: string): Promise<SerializedValue>;
-  steps(id: string): Promise<StepRecord[]>;
-  events(id: string, limit?: number): Promise<ActivityEvent[]>;
-  readEvents(after: string, limit?: number): Promise<ActivityEvent[]>;
-  latestEventId(): Promise<string>;
-  stats(): Promise<QueueStats>;
   close(): Promise<void>;
 }

@@ -23,8 +23,6 @@ import type {
   ListOptions,
   StepRecord,
   ActivityEvent,
-  QueueStats,
-  ActivityStatus,
 } from "../storage.js";
 import { schema, schemaLock, tableNames, indexNames } from "./schema.js";
 import { Notifications } from "./notifications.js";
@@ -38,16 +36,6 @@ export interface PostgresConfig {
 }
 type Row = QueryResultRow;
 const terminal = ["completed", "failed", "dead_letter"];
-const statuses: ActivityStatus[] = [
-  "pending",
-  "scheduled",
-  "processing",
-  "retrying",
-  "waiting",
-  "completed",
-  "failed",
-  "dead_letter",
-];
 const lost = () =>
   new RunnerQError("claim_lost", "Execution no longer owns this activity");
 const iso = (v: Date | string | null): string | null =>
@@ -322,7 +310,6 @@ export class PostgresStorage
     );
   }
   private hints(id?: string, work = true): void {
-    this.notifications.hint("events");
     if (id) this.notifications.hint("result", id);
     if (work) this.notifications.hint("work");
   }
@@ -1036,29 +1023,6 @@ export class PostgresStorage
       return removed;
     });
   }
-  async registerPool(
-    id: string,
-    concurrency: number,
-    types: readonly string[],
-  ): Promise<void> {
-    await this.query(
-      `INSERT INTO runnerq_worker_pools(pool_id,queue_name,max_workers,activity_types) VALUES($1,$2,$3,$4)
-      ON CONFLICT(pool_id) DO UPDATE SET last_seen_at=NOW(),max_workers=excluded.max_workers,activity_types=excluded.activity_types`,
-      [id, this.queue, concurrency, types],
-    );
-  }
-  async heartbeatPool(id: string): Promise<void> {
-    await this.query(
-      "UPDATE runnerq_worker_pools SET last_seen_at=NOW() WHERE queue_name=$1 AND pool_id=$2",
-      [this.queue, id],
-    );
-  }
-  async deregisterPool(id: string): Promise<void> {
-    await this.query(
-      "DELETE FROM runnerq_worker_pools WHERE queue_name=$1 AND pool_id=$2",
-      [this.queue, id],
-    );
-  }
   private snapshot(a: Row): ActivitySnapshot {
     return {
       id: a.id,
@@ -1166,60 +1130,6 @@ export class PostgresStorage
         [this.queue, id, integer(limit, "limit", 1, 1000)],
       )
     ).map((r) => this.toEvent(r));
-  }
-  async readEvents(after: string, limit = 500): Promise<ActivityEvent[]> {
-    return (
-      await this.query(
-        "SELECT * FROM runnerq_events WHERE queue_name=$1 AND id>$2::bigint ORDER BY id LIMIT $3",
-        [this.queue, after, integer(limit, "limit", 1, 1000)],
-      )
-    ).map((r) => this.toEvent(r));
-  }
-  async latestEventId(): Promise<string> {
-    return String(
-      (
-        await this.query(
-          "SELECT COALESCE(MAX(id),0)::text AS id FROM runnerq_events WHERE queue_name=$1",
-          [this.queue],
-        )
-      )[0]!.id,
-    );
-  }
-  async stats(): Promise<QueueStats> {
-    const rows = await this.query(
-      `SELECT status,count(*)::text AS count,count(*) FILTER(WHERE parent_activity_id IS NULL)::text AS roots
-      FROM runnerq_activities WHERE queue_name=$1 GROUP BY status`,
-      [this.queue],
-    );
-    const counts = Object.fromEntries(statuses.map((s) => [s, 0])) as Record<
-      ActivityStatus,
-      number
-    >;
-    const roots = { ...counts };
-    for (const row of rows) {
-      counts[row.status as ActivityStatus] = Number(row.count);
-      roots[row.status as ActivityStatus] = Number(row.roots);
-    }
-    const priorities = await this.query(
-      "SELECT priority,count(*)::text AS count FROM runnerq_activities WHERE queue_name=$1 AND status IN ('pending','scheduled','retrying','waiting') GROUP BY priority",
-      [this.queue],
-    );
-    const pools = await this.query(
-      "SELECT COALESCE(SUM(max_workers),0)::text AS total FROM runnerq_worker_pools WHERE queue_name=$1 AND last_seen_at>NOW()-INTERVAL '60 seconds'",
-      [this.queue],
-    );
-    return {
-      counts,
-      roots,
-      byPriority: Object.fromEntries(
-        priorities.map((r) => [
-          ["", "low", "normal", "high", "critical"][r.priority],
-          Number(r.count),
-        ]),
-      ),
-      activeWorkers: counts.processing,
-      maxWorkers: Number(pools[0]!.total),
-    };
   }
   close(): Promise<void> {
     return (this.closing ??= (async () => {

@@ -3,7 +3,6 @@ import {
   runner,
   RunnerQClient,
   Worker,
-  Inspector,
   RecordedError,
   ActivityFailedError,
   type ActivityHandle,
@@ -104,28 +103,7 @@ activity("InvalidFormat", { serialization: "superjson-v1" });
 client.execute(native, { at: "2026-01-01", amount: 1n });
 void nativeResult;
 
-async function inspectionTypes() {
-  const inspector = new Inspector({ storage });
-  const input = await inspector.input("id");
-  if (!input.decoded) {
-    const name: string = input.decodeError.name;
-    const absent: undefined = input.data;
-    void [name, absent, input.rawData];
-  } else {
-    // @ts-expect-error successfully decoded values have no decoding error
-    input.decodeError;
-  }
-  const result = await inspector.result("id");
-  if (result && !result.decoded) {
-    const absent: undefined = result.data;
-    void [absent, result.decodeError.message];
-  }
-  for (const step of await inspector.steps("id")) {
-    if (!step.decoded) {
-      const absent: undefined = step.data;
-      void [absent, step.rawData];
-    }
-  }
+async function failureTypes() {
   try {
     await client.handle(signup, "id").result();
   } catch (error) {
@@ -138,4 +116,4 @@ async function inspectionTypes() {
     }
   }
 }
-void inspectionTypes;
+void failureTypes;

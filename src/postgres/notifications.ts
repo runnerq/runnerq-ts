@@ -11,7 +11,6 @@ export class Notifications {
   private flushTimer?: NodeJS.Timeout;
   private flushing?: Promise<void>;
   private work = false;
-  private events = false;
   private results = new Set<string>();
   constructor(
     private readonly config: ClientConfig,
@@ -40,7 +39,6 @@ export class Notifications {
       client.on("end", disconnected);
       client.on("notification", (notification) => {
         if (notification.channel === this.channel("w")) this.bus.emit("work");
-        if (notification.channel === this.channel("e")) this.bus.emit("events");
         if (notification.channel === this.channel("r")) {
           for (const id of (notification.payload ?? "").split(","))
             this.bus.emit(`result:${id}`);
@@ -55,7 +53,7 @@ export class Notifications {
             throw new Error("Notification connection ended during startup");
           }),
         ]);
-        for (const kind of ["w", "r", "e"])
+        for (const kind of ["w", "r"])
           await client.query(`LISTEN "${this.channel(kind)}"`);
         retry = 100;
         this.bus.emit("reconnect");
@@ -70,31 +68,32 @@ export class Notifications {
       retry = Math.min(retry * 2, 5_000);
     }
   }
-  hint(kind: "work" | "events" | "result", id?: string): void {
+  hint(kind: "work" | "result", id?: string): void {
     if (this.lifetime.signal.aborted) return;
     if (kind === "work") this.work = true;
-    if (kind === "events") this.events = true;
     if (kind === "result" && id && this.results.size < 4096)
       this.results.add(id);
     this.bus.emit(kind === "result" ? `result:${id}` : kind);
+    this.scheduleFlush();
+  }
+  // One flush at a time; hints that arrive during a flush get the next one.
+  private scheduleFlush(): void {
     if (!this.flushTimer && !this.flushing)
       this.flushTimer = setTimeout(() => {
         this.flushTimer = undefined;
         this.flushing = this.flush().finally(() => {
           this.flushing = undefined;
-          if (this.work || this.events || this.results.size)
-            this.hint("events");
+          if (this.work || this.results.size) this.scheduleFlush();
         });
       }, 50).unref();
   }
   private async flush(): Promise<void> {
     const jobs: [string, string][] = [];
     if (this.work) jobs.push([this.channel("w"), ""]);
-    if (this.events) jobs.push([this.channel("e"), ""]);
     const ids = [...this.results];
     for (let i = 0; i < ids.length; i += 200)
       jobs.push([this.channel("r"), ids.slice(i, i + 200).join(",")]);
-    this.work = this.events = false;
+    this.work = false;
     this.results.clear();
     // These transactions never contain activity writes.
     for (const job of jobs)
