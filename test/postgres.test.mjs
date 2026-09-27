@@ -6,6 +6,61 @@ import { dsn, setup, submission, claim } from "./helpers.mjs";
 const integration = (name, fn) =>
   test(name, { skip: !dsn, timeout: 30000 }, fn);
 
+for (const expiry of [false, true]) {
+  integration(
+    `attempt budgets apply to ${expiry ? "lease expiry" : "retryable failure"}: default unlimited, explicit one and three`,
+    async (t) => {
+      const { storage, pool, queue } = await setup(t);
+      for (const limit of [undefined, "unlimited", 1, 3]) {
+        const a = submission(
+          ...(limit === undefined ? [] : [runner.maxAttempts(limit)]),
+        );
+        let fence = await claim(storage, a);
+        const unlimited = limit === undefined || limit === "unlimited";
+        const attempts = unlimited ? 5 : limit;
+        assert.equal(
+          (await storage.getActivity(a.id)).maxAttempts,
+          unlimited ? "unlimited" : limit,
+        );
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          const terminal = !unlimited && attempt === limit;
+          if (expiry) {
+            await pool.query(
+              "UPDATE runnerq_activities SET lease_deadline_ms=0 WHERE queue_name=$1 AND id=$2",
+              [queue, a.id],
+            );
+            assert.equal(await storage.reap(1), 1);
+          } else {
+            assert.equal(
+              await storage.fail(fence, "retryable error", true),
+              terminal ? "dead_letter" : "retrying",
+            );
+          }
+          assert.equal(
+            (await storage.getActivity(a.id)).status,
+            terminal ? "dead_letter" : expiry ? "pending" : "retrying",
+          );
+          if (terminal) {
+            assert.equal((await storage.getResult(a.id)).state, "Err");
+            assert.equal((await storage.claim(1, [a.type], 60000)).length, 0);
+          } else {
+            assert.equal(await storage.getResult(a.id), null);
+            // Advance only the retry schedule so the test exercises multiple real claims without sleeping.
+            await pool.query(
+              "UPDATE runnerq_activities SET scheduled_at=NOW() WHERE queue_name=$1 AND id=$2",
+              [queue, a.id],
+            );
+            const [next] = await storage.claim(1, [a.type], 60000);
+            assert.equal(next.id, a.id);
+            fence = { ownerId: next.id, token: next.token };
+          }
+        }
+        if (unlimited) await storage.complete(fence, "eventually succeeds");
+      }
+    },
+  );
+}
+
 integration(
   "schema initialization is concurrent, inputs are separate, and connect does not need DDL",
   async (t) => {
@@ -19,6 +74,11 @@ integration(
       ])
     ).rows[0];
     assert.equal("payload" in row, false);
+    assert.equal(row.max_retries, 0);
+    const defaults = await pool.query(
+      "SELECT column_default FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='runnerq_activities' AND column_name='max_retries'",
+    );
+    assert.equal(defaults.rows[0].column_default, "0");
     const { PostgresStorage } = await import("../dist/postgres/index.js");
     await Promise.all(
       Array.from({ length: 4 }, () =>

@@ -6,7 +6,7 @@ CREATE TABLE runnerq_activities (
  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), scheduled_at TIMESTAMPTZ,
  started_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, lease_deadline_ms BIGINT,
  current_worker_id TEXT, last_worker_id TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
- max_retries INTEGER NOT NULL DEFAULT 3, timeout_seconds BIGINT NOT NULL DEFAULT 300,
+ max_retries INTEGER NOT NULL DEFAULT 0, timeout_seconds BIGINT NOT NULL DEFAULT 300,
  retry_delay_seconds BIGINT NOT NULL DEFAULT 60, max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0,
  last_error TEXT, last_error_at TIMESTAMPTZ, metadata JSONB, idempotency_key TEXT,
  parent_activity_id UUID, root_activity_id UUID, depth SMALLINT NOT NULL DEFAULT 0,

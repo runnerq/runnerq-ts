@@ -108,7 +108,7 @@ export function executionOptions(
 ): ExecutionOptions {
   const result: ExecutionOptions = {
     priority: "normal",
-    maxAttempts: 3,
+    maxAttempts: "unlimited",
     timeoutMs: 300_000,
     maxRetryDelayMs: 3_600_000,
     delayMs: 0,
