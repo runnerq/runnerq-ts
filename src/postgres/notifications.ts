@@ -47,7 +47,14 @@ export class Notifications {
         }
       });
       try {
-        await client.connect();
+        // pg can leave connect() pending when end() is called during the
+        // handshake. Observe disconnection too so close() can join this loop.
+        await Promise.race([
+          client.connect(),
+          ended.then(() => {
+            throw new Error("Notification connection ended during startup");
+          }),
+        ]);
         for (const kind of ["w", "r", "e"])
           await client.query(`LISTEN "${this.channel(kind)}"`);
         retry = 100;

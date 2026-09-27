@@ -20,7 +20,9 @@ w.on("workerError", (error) =>
 process.on("message", async (message) => {
   if (message === "stop") {
     await w.stop();
+    process.send?.({ type: "worker-stopped" });
     await storage.close();
+    process.send?.({ type: "storage-closed" });
     process.disconnect();
   }
 });
