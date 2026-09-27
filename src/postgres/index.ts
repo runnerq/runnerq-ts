@@ -1,0 +1,1193 @@
+import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import {
+  Pool,
+  type PoolClient,
+  type PoolConfig,
+  type QueryResultRow,
+} from "pg";
+import { checkpointId, json, nonempty, type JsonValue } from "../codec.js";
+import { databaseError, RunnerQError } from "../errors.js";
+import { integer } from "../options.js";
+import { pause } from "../async.js";
+import type {
+  Storage,
+  Submission,
+  Fence,
+  Claim,
+  StoredResult,
+  Park,
+  Retention,
+  ActivitySnapshot,
+  ListOptions,
+  StepRecord,
+  ActivityEvent,
+  QueueStats,
+  ActivityStatus,
+} from "../storage.js";
+import { schema, schemaLock, tableNames, indexNames } from "./schema.js";
+import { Notifications } from "./notifications.js";
+
+export interface PostgresConfig {
+  connectionString: string;
+  queue: string;
+  poolSize?: number;
+  statementTimeoutMs?: number;
+  ssl?: PoolConfig["ssl"];
+}
+type Row = QueryResultRow;
+const terminal = ["completed", "failed", "dead_letter"];
+const statuses: ActivityStatus[] = [
+  "pending",
+  "scheduled",
+  "processing",
+  "retrying",
+  "waiting",
+  "completed",
+  "failed",
+  "dead_letter",
+];
+const lost = () =>
+  new RunnerQError("claim_lost", "Execution no longer owns this activity");
+const iso = (v: Date | string | null): string | null =>
+  v === null ? null : new Date(v).toISOString();
+function poolConfig(config: Omit<PostgresConfig, "queue">): PoolConfig {
+  return {
+    connectionString: config.connectionString,
+    ssl: config.ssl,
+    max: integer(config.poolSize ?? 10, "poolSize", 1),
+    connectionTimeoutMillis: 5_000,
+    statement_timeout: integer(
+      config.statementTimeoutMs ?? 5_000,
+      "statementTimeoutMs",
+      1,
+    ),
+    application_name: "runnerq-ts",
+    idle_in_transaction_session_timeout: 10_000,
+  };
+}
+function canonicalIndex(sql: string): string {
+  return sql
+    .toLowerCase()
+    .replace(/\bon\s+(?:"(?:[^"]|"")+"|[a-z_]\w*)\./g, "on ")
+    .replace(/::text(?:\[\])?/g, "")
+    .replace(/=\s*any\s*\(\s*array\s*\[/g, "in(")
+    .replace(/using\s+btree/g, "")
+    .replace(/\s+asc\b/g, "")
+    .replace(/[\s"()[\];]/g, "");
+}
+async function verifySchema(client: PoolClient): Promise<void> {
+  const columns = await client.query(
+    `SELECT table_name,column_name,udt_name,is_nullable,column_default FROM information_schema.columns
+    WHERE table_schema=current_schema() AND table_name=ANY($1)`,
+    [tableNames],
+  );
+  const actual = new Map(
+    columns.rows.map((r) => [`${r.table_name}.${r.column_name}`, r]),
+  );
+  const types: Record<string, string> = {
+    UUID: "uuid",
+    TEXT: "text",
+    JSONB: "jsonb",
+    INTEGER: "int4",
+    SMALLINT: "int2",
+    BIGINT: "int8",
+    BIGSERIAL: "int8",
+    TIMESTAMPTZ: "timestamptz",
+  };
+  for (const table of schema.matchAll(
+    /CREATE TABLE (\w+) \(([\s\S]*?)\n\);/g,
+  )) {
+    for (const col of table[2]!.matchAll(
+      /\b(\w+) (UUID|TEXT|JSONB|INTEGER|SMALLINT|BIGINT|BIGSERIAL|TIMESTAMPTZ)(\[\])?([^,\n]*)/g,
+    )) {
+      const row = actual.get(`${table[1]}.${col[1]}`);
+      const expectedDefault = col[4]!.match(/DEFAULT\s+(.+)$/)?.[1] ?? null;
+      const normalizeDefault = (value: string | null) =>
+        value
+          ?.toLowerCase()
+          .replace(/::(?:text|integer|bigint|smallint)/g, "")
+          .replace(/[\s()]/g, "") ?? null;
+      const defaultMatches =
+        col[2] === "BIGSERIAL"
+          ? String(row?.column_default).startsWith("nextval(")
+          : normalizeDefault(row?.column_default ?? null) ===
+            normalizeDefault(expectedDefault);
+      if (
+        !row ||
+        row.udt_name !== (col[3] ? "_" : "") + types[col[2]!] ||
+        row.is_nullable !==
+          (/NOT NULL|PRIMARY KEY/.test(col[4]!) ? "NO" : "YES") ||
+        !defaultMatches
+      ) {
+        throw new RunnerQError(
+          "configuration",
+          `Incompatible schema: ${table[1]}.${col[1]}; initialize the separate-input RunnerQ schema before connecting`,
+        );
+      }
+    }
+  }
+  if (actual.has("runnerq_activities.payload"))
+    throw new RunnerQError(
+      "configuration",
+      "Inline-payload schemas are unsupported; migrate Go and the database to the separate-input contract first",
+    );
+  const indexes = await client.query(
+    `SELECT c.relname,i.indisvalid,pg_get_indexdef(c.oid) AS definition
+    FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname=current_schema() AND c.relname=ANY($1)`,
+    [indexNames],
+  );
+  for (const expected of schema.matchAll(/CREATE INDEX (\w+)[\s\S]*?;/g)) {
+    const row = indexes.rows.find((r) => r.relname === expected[1]);
+    if (
+      !row?.indisvalid ||
+      canonicalIndex(row.definition) !== canonicalIndex(expected[0])
+    )
+      throw new RunnerQError(
+        "configuration",
+        `Missing or incompatible index ${expected[1]}`,
+      );
+  }
+  const keys = await client.query(
+    `SELECT c.relname,array_agg(a.attname::text ORDER BY k.ordinality) AS columns FROM pg_constraint p
+    JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    CROSS JOIN LATERAL unnest(p.conkey) WITH ORDINALITY k(num,ordinality)
+    JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.num
+    WHERE p.contype='p' AND n.nspname=current_schema() AND c.relname=ANY($1) GROUP BY c.relname`,
+    [tableNames],
+  );
+  const expectedKeys: Record<string, string[]> = {
+    runnerq_activities: ["id"],
+    runnerq_inputs: ["activity_id"],
+    runnerq_results: ["activity_id"],
+    runnerq_events: ["id"],
+    runnerq_worker_pools: ["pool_id"],
+    runnerq_idempotency: ["queue_name", "idempotency_key"],
+    runnerq_dependencies: ["queue_name", "waiter_activity_id", "result_id"],
+  };
+  for (const [name, columns] of Object.entries(expectedKeys))
+    if (
+      JSON.stringify(keys.rows.find((r) => r.relname === name)?.columns) !==
+      JSON.stringify(columns)
+    )
+      throw new RunnerQError(
+        "configuration",
+        `Incompatible primary key on ${name}`,
+      );
+}
+
+export class PostgresStorage
+  extends EventEmitter<{ storageError: [error: Error] }>
+  implements Storage
+{
+  readonly queue: string;
+  private readonly pool: Pool;
+  private readonly notifications: Notifications;
+  private closing?: Promise<void>;
+  private constructor(config: PostgresConfig) {
+    super();
+    this.queue = config.queue;
+    this.pool = new Pool(poolConfig(config));
+    this.pool.on("error", (error) => {
+      for (const listener of this.rawListeners("storageError")) {
+        try {
+          void Promise.resolve(listener.call(this, error)).catch(() => {});
+        } catch {
+          /* An observer cannot affect storage or other observers. */
+        }
+      }
+    });
+    this.notifications = new Notifications(
+      poolConfig({ ...config, poolSize: 1 }),
+      this.pool,
+      config.queue,
+    );
+  }
+  static async initialize(
+    config: Omit<PostgresConfig, "queue">,
+  ): Promise<void> {
+    const pool = new Pool(poolConfig(config));
+    try {
+      const client = await pool.connect();
+      try {
+        const deadline = Date.now() + 30_000;
+        while (
+          !(
+            await client.query(
+              "SELECT pg_try_advisory_lock($1::bigint) AS locked",
+              [schemaLock],
+            )
+          ).rows[0].locked
+        ) {
+          if (Date.now() > deadline)
+            throw new RunnerQError(
+              "timeout",
+              "Timed out acquiring schema initialization lock",
+            );
+          await pause(50);
+        }
+        const present = await client.query(
+          "SELECT tablename FROM pg_tables WHERE schemaname=current_schema() AND tablename=ANY($1)",
+          [tableNames],
+        );
+        if (present.rowCount === 0) {
+          await client.query("BEGIN");
+          try {
+            await client.query(schema);
+            await client.query("COMMIT");
+          } catch (error) {
+            await client.query("ROLLBACK");
+            throw error;
+          }
+        }
+        await verifySchema(client);
+      } finally {
+        // Destroy the dedicated setup session so locks cannot leak into a pool on errors.
+        client.release(true);
+      }
+    } finally {
+      await pool.end();
+    }
+  }
+  static async connect(config: PostgresConfig): Promise<PostgresStorage> {
+    nonempty(config.queue, "Queue");
+    if (
+      Buffer.byteLength(config.queue) > 48 ||
+      !/^[\p{L}_][\p{L}\p{N}_]*$/u.test(config.queue)
+    )
+      throw new RunnerQError(
+        "configuration",
+        "Queue must be at most 48 UTF-8 bytes, start with a letter or underscore, and contain only letters, numbers or underscores",
+      );
+    const storage = new PostgresStorage(config);
+    try {
+      const client = await storage.pool.connect();
+      try {
+        await verifySchema(client);
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      await storage.close();
+      throw databaseError(error);
+    }
+    return storage;
+  }
+  private async query(sql: string, values: unknown[] = []): Promise<Row[]> {
+    try {
+      return (await this.pool.query(sql, values)).rows;
+    } catch (error) {
+      throw databaseError(error);
+    }
+  }
+  private async tx<T>(body: (c: PoolClient) => Promise<T>): Promise<T> {
+    let c: PoolClient | undefined;
+    let destroy = false;
+    try {
+      c = await this.pool.connect();
+      await c.query("BEGIN");
+      const value = await body(c);
+      await c.query("COMMIT");
+      return value;
+    } catch (error) {
+      try {
+        await c?.query("ROLLBACK");
+      } catch {
+        destroy = true;
+      }
+      throw databaseError(error);
+    } finally {
+      c?.release(destroy);
+    }
+  }
+  private async fence(c: PoolClient, f: Fence): Promise<void> {
+    const r = await c.query(
+      "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 FOR UPDATE",
+      [this.queue, f.ownerId, f.token],
+    );
+    if (!r.rowCount) throw lost();
+  }
+  private async event(
+    c: PoolClient,
+    id: string,
+    type: string,
+    token: string | null = null,
+    detail: unknown = null,
+  ): Promise<void> {
+    await c.query(
+      "INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)",
+      [this.queue, id, type, token, JSON.stringify(detail)],
+    );
+  }
+  private hints(id?: string, work = true): void {
+    this.notifications.hint("events");
+    if (id) this.notifications.hint("result", id);
+    if (work) this.notifications.hint("work");
+  }
+  private async dependency(
+    c: PoolClient,
+    waiter: string,
+    result: string,
+    producer: string | null,
+  ): Promise<void> {
+    await c.query(
+      "INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+      [this.queue, waiter, result, producer],
+    );
+  }
+  private async lockProducer(c: PoolClient, id: string): Promise<void> {
+    const r = await c.query(
+      `SELECT producer.id FROM runnerq_activities producer JOIN runnerq_activities root
+      ON root.id=producer.root_activity_id AND root.queue_name=producer.queue_name
+      WHERE producer.queue_name=$1 AND producer.id=$2 FOR SHARE OF producer FOR KEY SHARE OF root`,
+      [this.queue, id],
+    );
+    if (!r.rowCount)
+      throw new RunnerQError(
+        "not_found",
+        "Result producer no longer exists in this queue",
+      );
+  }
+  private async wake(c: PoolClient, id: string): Promise<void> {
+    await c.query(
+      `UPDATE runnerq_activities a SET status='pending',scheduled_at=NULL,waiting_result_id=NULL
+      WHERE a.queue_name=$1 AND a.status='waiting' AND a.waiting_result_id=$2
+      AND EXISTS(SELECT 1 FROM runnerq_dependencies d WHERE d.queue_name=$1 AND d.waiter_activity_id=a.id AND d.result_id=$2)`,
+      [this.queue, id],
+    );
+  }
+  async submit(a: Submission): Promise<string> {
+    const id = await this.tx(async (c) => {
+      if (a.fence) await this.fence(c, a.fence);
+      // Stable caller-generated IDs reconcile a lost commit reply, including allowReuse.
+      const committed = await c.query(
+        "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND id=$2",
+        [this.queue, a.id],
+      );
+      if (committed.rowCount) return a.id;
+      if (a.key) {
+        // Loop only when concurrent retention removed a key between conflict detection and locking.
+        for (;;) {
+          const fresh = await c.query(
+            "INSERT INTO runnerq_idempotency(queue_name,idempotency_key,activity_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING activity_id",
+            [this.queue, a.key, a.id],
+          );
+          if (fresh.rowCount) break;
+          const r = await c.query(
+            `SELECT i.activity_id,a.status,a.parent_activity_id FROM runnerq_idempotency i
+            LEFT JOIN runnerq_activities a ON a.id=i.activity_id AND a.queue_name=i.queue_name
+            WHERE i.queue_name=$1 AND i.idempotency_key=$2 FOR UPDATE OF i`,
+            [this.queue, a.key],
+          );
+          const existing = r.rows[0];
+          if (!existing) continue;
+          if (!existing.status)
+            throw new RunnerQError(
+              "internal",
+              "Idempotency key points to a missing activity",
+            );
+          const policy = a.options.idempotency?.onDuplicate ?? "returnExisting";
+          if (policy === "returnExisting") {
+            if (a.parentId) {
+              await this.dependency(
+                c,
+                a.parentId,
+                existing.activity_id,
+                existing.activity_id,
+              );
+              if (existing.parent_activity_id !== a.parentId)
+                await this.event(c, existing.activity_id, "SpawnLinked", null, {
+                  parent_activity_id: a.parentId,
+                });
+            }
+            return existing.activity_id as string;
+          }
+          if (policy === "noReuse")
+            throw new RunnerQError(
+              "duplicate",
+              "Idempotency key already exists",
+            );
+          if (
+            policy === "allowReuseOnFailure" &&
+            !["failed", "dead_letter"].includes(existing.status)
+          )
+            throw new RunnerQError(
+              "idempotency_conflict",
+              "Previous activity has not failed",
+            );
+          await c.query(
+            "UPDATE runnerq_idempotency SET activity_id=$3,updated_at=NOW() WHERE queue_name=$1 AND idempotency_key=$2",
+            [this.queue, a.key, a.id],
+          );
+          break;
+        }
+      }
+      const o = a.options;
+      const priority =
+        ["low", "normal", "high", "critical"].indexOf(o.priority) + 1;
+      await c.query(
+        `INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
+        timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)
+        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)`,
+        [
+          a.id,
+          this.queue,
+          a.type,
+          priority,
+          o.delayMs > 0 ? "scheduled" : "pending",
+          o.delayMs,
+          o.maxAttempts === "unlimited" ? 0 : o.maxAttempts,
+          o.timeoutMs / 1000,
+          o.maxRetryDelayMs / 1000,
+          JSON.stringify(o.metadata),
+          a.key ?? null,
+          a.parentId,
+          a.rootId,
+          a.depth,
+        ],
+      );
+      await c.query(
+        "INSERT INTO runnerq_inputs(activity_id,queue_name,payload) VALUES($1,$2,$3::jsonb)",
+        [a.id, this.queue, JSON.stringify(a.payload)],
+      );
+      if (a.parentId) await this.dependency(c, a.parentId, a.id, a.id);
+      await this.event(
+        c,
+        a.id,
+        o.delayMs > 0 ? "Scheduled" : "Enqueued",
+        null,
+        { activity_type: a.type, priority },
+      );
+      return a.id;
+    });
+    this.hints(undefined, a.options.delayMs === 0);
+    return id;
+  }
+  async claim(
+    limit: number,
+    types: readonly string[],
+    leaseMs: number,
+  ): Promise<Claim[]> {
+    integer(limit, "claim limit", 1);
+    integer(leaseMs, "leaseMs", 1);
+    if (!types.length) return [];
+    const prefix = randomUUID();
+    const claims = await this.tx(async (c) => {
+      const filter =
+        types.length === 1
+          ? "activity_type=$5"
+          : "activity_type=ANY($5::text[])";
+      const r = await c.query(
+        `WITH picked AS (SELECT id FROM runnerq_activities
+        WHERE queue_name=$1 AND status IN ('pending','scheduled','retrying','waiting')
+        AND (status='pending' OR scheduled_at<=NOW()) AND ${filter}
+        ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC
+        LIMIT $2 FOR UPDATE SKIP LOCKED)
+        UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
+        started_at=NOW(),waiting_result_id=NULL,
+        lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
+        FROM picked WHERE a.id=picked.id RETURNING a.*`,
+        [
+          this.queue,
+          limit,
+          prefix,
+          leaseMs,
+          types.length === 1 ? types[0] : types,
+        ],
+      );
+      if (!r.rowCount) return [];
+      const inputs = await c.query(
+        "SELECT activity_id,payload FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
+        [this.queue, r.rows.map((a) => a.id)],
+      );
+      const payloads = new Map(
+        inputs.rows.map((row) => [row.activity_id, row.payload]),
+      );
+      // UPDATE RETURNING has no guaranteed order; restore the claim ordering.
+      r.rows.sort(
+        (a, b) =>
+          b.priority - a.priority ||
+          b.retry_count - a.retry_count ||
+          new Date(a.scheduled_at ?? a.created_at).getTime() -
+            new Date(b.scheduled_at ?? b.created_at).getTime(),
+      );
+      const result: Claim[] = [];
+      for (const a of r.rows) {
+        if (!payloads.has(a.id))
+          throw new RunnerQError(
+            "internal",
+            `Missing input for activity ${a.id}`,
+          );
+        await this.event(c, a.id, "Dequeued", a.current_worker_id, {
+          activity_type: a.activity_type,
+        });
+        result.push({
+          id: a.id,
+          type: a.activity_type,
+          payload: payloads.get(a.id),
+          token: a.current_worker_id,
+          retryCount: a.retry_count,
+          timeoutMs: Number(a.timeout_seconds) * 1000,
+          parentId: a.parent_activity_id,
+          rootId: a.root_activity_id,
+          depth: a.depth,
+          metadata: a.metadata ?? {},
+          leaseDeadlineMs: Number(a.lease_deadline_ms),
+        });
+      }
+      return result;
+    });
+    if (claims.length) this.hints(undefined, false);
+    return claims;
+  }
+  async renew(f: Fence, leaseMs: number): Promise<boolean> {
+    const rows = await this.query(
+      `UPDATE runnerq_activities SET lease_deadline_ms=GREATEST(lease_deadline_ms,(EXTRACT(EPOCH FROM NOW())*1000)::bigint+$4)
+      WHERE queue_name=$1 AND id=$2 AND current_worker_id=$3 AND status='processing' RETURNING id`,
+      [this.queue, f.ownerId, f.token, leaseMs],
+    );
+    return rows.length > 0;
+  }
+  private async putResult(
+    c: PoolClient,
+    id: string,
+    owner: string,
+    result: StoredResult,
+    step: string | null,
+  ): Promise<void> {
+    await c.query(
+      `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step) VALUES($1,$2,$3,$4::jsonb,$5,$6)
+      ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,created_at=NOW(),step=excluded.step
+      WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id`,
+      [id, this.queue, result.state, JSON.stringify(result.data), owner, step],
+    );
+    await this.wake(c, id);
+  }
+  async complete(f: Fence, data: JsonValue): Promise<void> {
+    await this.tx(async (c) => {
+      const r = await c.query(
+        `UPDATE runnerq_activities SET status='completed',completed_at=NOW(),last_worker_id=$3,
+        current_worker_id=NULL,lease_deadline_ms=NULL,waiting_result_id=NULL
+        WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 RETURNING id`,
+        [this.queue, f.ownerId, f.token],
+      );
+      if (!r.rowCount) {
+        const previous = await c.query(
+          `SELECT r.data IS NOT DISTINCT FROM $4::jsonb AS same FROM runnerq_activities a
+          JOIN runnerq_results r ON r.activity_id=a.id AND r.queue_name=a.queue_name
+          WHERE a.queue_name=$1 AND a.id=$2 AND a.status='completed' AND a.last_worker_id=$3 AND r.state='Ok'`,
+          [this.queue, f.ownerId, f.token, JSON.stringify(data)],
+        );
+        if (previous.rows[0]?.same) return;
+        if (previous.rowCount)
+          throw new RunnerQError(
+            "checkpoint_conflict",
+            "Execution completed with a different result",
+          );
+        throw lost();
+      }
+      await this.putResult(
+        c,
+        f.ownerId,
+        f.ownerId,
+        { state: "Ok", data },
+        null,
+      );
+      await this.event(c, f.ownerId, "Completed", f.token, {
+        result_stored: true,
+      });
+    });
+    this.hints(f.ownerId);
+  }
+  async fail(
+    f: Fence,
+    reason: string,
+    retry: boolean,
+  ): Promise<"failed" | "retrying" | "dead_letter"> {
+    const status = await this.tx(async (c) => {
+      const r = await c.query(
+        "SELECT * FROM runnerq_activities WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 FOR UPDATE",
+        [this.queue, f.ownerId, f.token],
+      );
+      const a = r.rows[0];
+      if (!a) {
+        const previous = await c.query(
+          `SELECT event_type FROM runnerq_events WHERE queue_name=$1 AND activity_id=$2 AND worker_id=$3
+          AND detail->>'error'=$4 AND event_type=ANY($5::text[]) ORDER BY id DESC LIMIT 1`,
+          [
+            this.queue,
+            f.ownerId,
+            f.token,
+            reason,
+            retry ? ["Retrying", "DeadLetter"] : ["Failed"],
+          ],
+        );
+        const event = previous.rows[0]?.event_type;
+        if (event)
+          return event === "Retrying"
+            ? "retrying"
+            : event === "DeadLetter"
+              ? "dead_letter"
+              : "failed";
+        throw lost();
+      }
+      const again =
+        retry && (a.max_retries === 0 || a.retry_count + 1 < a.max_retries);
+      const status = again ? "retrying" : retry ? "dead_letter" : "failed";
+      const delay = Math.min(
+        Number(a.max_retry_delay_seconds) || 3600,
+        Number(a.retry_delay_seconds) * 2 ** Math.min(a.retry_count + 1, 52),
+      );
+      await c.query(
+        `UPDATE runnerq_activities SET status=$4,last_error=$5,last_error_at=NOW(),last_worker_id=$3,
+        current_worker_id=NULL,lease_deadline_ms=NULL,waiting_result_id=NULL,
+        retry_count=retry_count+CASE WHEN $4='retrying' THEN 1 ELSE 0 END,
+        scheduled_at=CASE WHEN $4='retrying' THEN NOW()+$6*INTERVAL '1 second' ELSE scheduled_at END,
+        started_at=CASE WHEN $4='retrying' THEN NULL ELSE started_at END,
+        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2`,
+        [this.queue, f.ownerId, f.token, status, reason, delay],
+      );
+      if (!again)
+        await this.putResult(
+          c,
+          f.ownerId,
+          f.ownerId,
+          {
+            state: "Err",
+            data: {
+              error: reason,
+              type: retry ? "dead_letter" : "non_retryable",
+              failed_at: new Date().toISOString(),
+            },
+          },
+          null,
+        );
+      await this.event(
+        c,
+        f.ownerId,
+        again ? "Retrying" : retry ? "DeadLetter" : "Failed",
+        f.token,
+        { error: reason, retryable: retry },
+      );
+      return status;
+    });
+    this.hints(status === "retrying" ? undefined : f.ownerId);
+    return status;
+  }
+  async checkpoint(
+    f: Fence,
+    id: string,
+    result: StoredResult,
+    step: string,
+  ): Promise<void> {
+    await this.tx(async (c) => {
+      await this.fence(c, f);
+      const r = await c.query(
+        `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step)
+        VALUES($1,$2,$3,$4::jsonb,$5,NULLIF($6,'')) ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id`,
+        [
+          id,
+          this.queue,
+          result.state,
+          JSON.stringify(result.data),
+          f.ownerId,
+          step,
+        ],
+      );
+      if (!r.rowCount) {
+        const same = await c.query(
+          `SELECT 1 FROM runnerq_results WHERE activity_id=$1 AND queue_name=$2 AND state=$3
+          AND data IS NOT DISTINCT FROM $4::jsonb AND owner_activity_id=$5 AND COALESCE(step,'')=$6`,
+          [
+            id,
+            this.queue,
+            result.state,
+            JSON.stringify(result.data),
+            f.ownerId,
+            step,
+          ],
+        );
+        if (!same.rowCount)
+          throw new RunnerQError(
+            "checkpoint_conflict",
+            "Checkpoint already contains a different outcome",
+          );
+        return;
+      }
+      await this.event(c, id, "ResultStored", f.token, { state: result.state });
+      await this.wake(c, id);
+    });
+    this.hints(id);
+  }
+  async getResult(id: string): Promise<StoredResult | null> {
+    const r = await this.query(
+      "SELECT state,data FROM runnerq_results WHERE queue_name=$1 AND activity_id=$2",
+      [this.queue, id],
+    );
+    if (r[0] && !["Ok", "Err"].includes(r[0].state))
+      throw new RunnerQError("serialization", "Invalid stored result state");
+    return r[0] ? { state: r[0].state, data: json(r[0].data) } : null;
+  }
+  async waitResult(id: string, signal?: AbortSignal): Promise<StoredResult> {
+    const sub = this.notifications.subscribe(`result:${id}`, signal);
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
+        const value = await this.getResult(id);
+        if (value) return value;
+        await sub.wait(5_000);
+      }
+    } finally {
+      sub.close();
+    }
+  }
+  async waitForWork(signal: AbortSignal, timeoutMs = 2_000): Promise<void> {
+    const sub = this.notifications.subscribe("work", signal);
+    try {
+      await sub.wait(timeoutMs);
+    } finally {
+      sub.close();
+    }
+  }
+  async registerDependency(f: Fence, id: string): Promise<void> {
+    if (id === f.ownerId)
+      throw new RunnerQError(
+        "configuration",
+        "An activity cannot await itself",
+      );
+    await this.tx(async (c) => {
+      await this.lockProducer(c, id);
+      await this.fence(c, f);
+      await this.dependency(c, f.ownerId, id, id);
+    });
+  }
+  async park(f: Fence, wait: Park): Promise<void> {
+    await this.tx(async (c) => {
+      try {
+        await this.fence(c, f);
+      } catch (error) {
+        if (!(error instanceof RunnerQError) || error.code !== "claim_lost")
+          throw error;
+        const prior = await c.query(
+          `SELECT 1 FROM runnerq_events WHERE queue_name=$1 AND activity_id=$2 AND worker_id=$3 AND event_type='Yielded'
+          AND detail->>'kind'=$4 AND detail->>'step'=$5 AND detail->>'wake_at'=$6
+          AND COALESCE(detail->>'result_id','')=$7 LIMIT 1`,
+          [
+            this.queue,
+            f.ownerId,
+            f.token,
+            wait.kind,
+            wait.step,
+            wait.wakeAt,
+            wait.resultId ?? "",
+          ],
+        );
+        if (prior.rowCount) return;
+        throw error;
+      }
+      if (wait.producerId) await this.lockProducer(c, wait.producerId);
+      let ready = false;
+      if (wait.resultId) {
+        await this.dependency(
+          c,
+          f.ownerId,
+          wait.resultId,
+          wait.producerId ?? null,
+        );
+        ready = !!(
+          await c.query(
+            "SELECT 1 FROM runnerq_results WHERE queue_name=$1 AND activity_id=$2",
+            [this.queue, wait.resultId],
+          )
+        ).rowCount;
+      }
+      await c.query(
+        `UPDATE runnerq_activities SET status=CASE WHEN $4 THEN 'pending' ELSE 'waiting' END,
+        scheduled_at=CASE WHEN $4 THEN NULL ELSE $5::timestamptz END,waiting_result_id=CASE WHEN $4 THEN NULL ELSE $6::uuid END,
+        last_worker_id=$3,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL WHERE queue_name=$1 AND id=$2`,
+        [
+          this.queue,
+          f.ownerId,
+          f.token,
+          ready,
+          wait.wakeAt,
+          wait.resultId ?? null,
+        ],
+      );
+      await this.event(c, f.ownerId, "Yielded", f.token, {
+        kind: wait.kind,
+        step: wait.step,
+        wake_at: wait.wakeAt,
+        result_id: wait.resultId ?? null,
+        ready,
+      });
+    });
+    this.hints();
+  }
+  async signal(id: string, name: string, payload: JsonValue): Promise<void> {
+    const result = checkpointId(id, "signal", name);
+    await this.tx(async (c) => {
+      if (
+        !(
+          await c.query(
+            "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND id=$2 FOR NO KEY UPDATE",
+            [this.queue, id],
+          )
+        ).rowCount
+      )
+        throw new RunnerQError("not_found", "Signal target does not exist");
+      await this.putResult(
+        c,
+        result,
+        id,
+        { state: "Ok", data: payload },
+        `signal:${name}`,
+      );
+      const wake = await c.query(
+        "UPDATE runnerq_activities SET status='pending',scheduled_at=NULL,waiting_result_id=NULL WHERE queue_name=$1 AND id=$2 AND status='waiting' RETURNING id",
+        [this.queue, id],
+      );
+      await this.event(c, id, "Signaled", null, {
+        name,
+        signal_id: result,
+        woke: !!wake.rowCount,
+      });
+    });
+    this.hints(result);
+  }
+  async lookupKey(key: string): Promise<string> {
+    const r = await this.query(
+      "SELECT activity_id FROM runnerq_idempotency WHERE queue_name=$1 AND idempotency_key=$2",
+      [this.queue, key],
+    );
+    if (!r[0]) throw new RunnerQError("not_found", "No activity owns this key");
+    return r[0].activity_id;
+  }
+  async reap(limit: number): Promise<number> {
+    const ids = await this.tx(async (c) => {
+      const rows = await c.query(
+        `UPDATE runnerq_activities SET retry_count=retry_count+1,
+        status=CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN 'dead_letter' ELSE 'pending' END,
+        completed_at=CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN NOW() ELSE NULL END,
+        last_error='lease expired before completion; worker presumed crashed or wedged',last_error_at=NOW(),
+        last_worker_id=current_worker_id,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL,waiting_result_id=NULL
+        WHERE id IN (SELECT id FROM runnerq_activities WHERE queue_name=$1 AND status='processing'
+          AND lease_deadline_ms<(EXTRACT(EPOCH FROM NOW())*1000)::bigint LIMIT $2 FOR UPDATE SKIP LOCKED)
+        RETURNING id,status,last_error`,
+        [this.queue, integer(limit, "reaper limit", 1)],
+      );
+      for (const a of rows.rows) {
+        if (a.status === "dead_letter")
+          await this.putResult(
+            c,
+            a.id,
+            a.id,
+            {
+              state: "Err",
+              data: {
+                error: a.last_error,
+                type: "dead_letter",
+                failed_at: new Date().toISOString(),
+              },
+            },
+            null,
+          );
+        await this.event(
+          c,
+          a.id,
+          a.status === "dead_letter" ? "DeadLetter" : "Requeued",
+          null,
+          { reason: "lease_expired", error: a.last_error },
+        );
+      }
+      return rows.rows;
+    });
+    for (const a of ids)
+      this.hints(a.status === "dead_letter" ? a.id : undefined);
+    return ids.length;
+  }
+  async cleanup(policy: Retention): Promise<number> {
+    const completed = integer(policy.completedMs ?? 0, "completedMs"),
+      failed = integer(policy.failedMs ?? 0, "failedMs");
+    const batch = integer(policy.batchSize ?? 100, "batchSize", 1);
+    if (!completed && !failed) return 0;
+    return this.tx(async (c) => {
+      if (
+        !(
+          await c.query(
+            "SELECT pg_try_advisory_xact_lock(1381913428,hashtext($1)) AS locked",
+            [this.queue],
+          )
+        ).rows[0].locked
+      )
+        return 0;
+      const skipped: string[] = [];
+      let removed = 0;
+      // Bound examined roots as well as deleted roots, so pinned trees cannot create unbounded transactions.
+      for (
+        let examined = 0;
+        removed < batch && examined < batch * 10;
+        examined++
+      ) {
+        await c.query("SAVEPOINT candidate");
+        const r = await c.query(
+          `SELECT r.id FROM runnerq_activities r WHERE r.queue_name=$1 AND r.parent_activity_id IS NULL
+          AND r.id<>ALL($4::uuid[]) AND ((r.status='completed' AND $2::bigint>0 AND r.completed_at<NOW()-$2*INTERVAL '1 millisecond')
+          OR (r.status IN ('failed','dead_letter') AND $3::bigint>0 AND r.completed_at<NOW()-$3*INTERVAL '1 millisecond'))
+          AND NOT EXISTS(SELECT 1 FROM runnerq_activities a WHERE a.queue_name=$1 AND a.root_activity_id=r.id AND a.status NOT IN ('completed','failed','dead_letter'))
+          ORDER BY r.completed_at LIMIT 1 FOR UPDATE SKIP LOCKED`,
+          [this.queue, completed, failed, skipped],
+        );
+        const root = r.rows[0]?.id;
+        if (!root) {
+          await c.query("RELEASE SAVEPOINT candidate");
+          break;
+        }
+        await c.query(
+          `SELECT 1 FROM runnerq_idempotency WHERE queue_name=$1 AND activity_id IN
+          (SELECT id FROM runnerq_activities WHERE queue_name=$1 AND root_activity_id=$2) FOR UPDATE`,
+          [this.queue, root],
+        );
+        const pinned = await c.query(
+          `SELECT 1 FROM runnerq_dependencies d
+          JOIN runnerq_activities producer ON producer.id=d.producer_activity_id AND producer.queue_name=d.queue_name
+          JOIN runnerq_activities waiter ON waiter.id=d.waiter_activity_id AND waiter.queue_name=d.queue_name
+          WHERE d.queue_name=$1 AND producer.root_activity_id=$2 AND waiter.root_activity_id<>$2
+          AND EXISTS(SELECT 1 FROM runnerq_activities live WHERE live.queue_name=$1 AND live.root_activity_id=waiter.root_activity_id
+            AND live.status NOT IN ('completed','failed','dead_letter')) LIMIT 1`,
+          [this.queue, root],
+        );
+        if (pinned.rowCount) {
+          skipped.push(root);
+          await c.query("ROLLBACK TO SAVEPOINT candidate");
+          await c.query("RELEASE SAVEPOINT candidate");
+          continue;
+        }
+        // Materialize the IDs once, then explicitly delete each payload/history table in this transaction.
+        const tree = (
+          await c.query(
+            "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND root_activity_id=$2",
+            [this.queue, root],
+          )
+        ).rows.map((x) => x.id);
+        await c.query(
+          "DELETE FROM runnerq_dependencies WHERE queue_name=$1 AND (waiter_activity_id=ANY($2::uuid[]) OR producer_activity_id=ANY($2::uuid[]))",
+          [this.queue, tree],
+        );
+        const resultIds = (
+          await c.query(
+            "DELETE FROM runnerq_results WHERE queue_name=$1 AND (owner_activity_id=ANY($2::uuid[]) OR activity_id=ANY($2::uuid[])) RETURNING activity_id",
+            [this.queue, tree],
+          )
+        ).rows.map((x) => x.activity_id);
+        await c.query(
+          "DELETE FROM runnerq_events WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
+          [this.queue, [...tree, ...resultIds]],
+        );
+        await c.query(
+          "DELETE FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
+          [this.queue, tree],
+        );
+        await c.query(
+          "DELETE FROM runnerq_idempotency WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
+          [this.queue, tree],
+        );
+        await c.query(
+          "DELETE FROM runnerq_activities WHERE queue_name=$1 AND id=ANY($2::uuid[])",
+          [this.queue, tree],
+        );
+        await c.query("RELEASE SAVEPOINT candidate");
+        removed++;
+      }
+      return removed;
+    });
+  }
+  async registerPool(
+    id: string,
+    concurrency: number,
+    types: readonly string[],
+  ): Promise<void> {
+    await this.query(
+      `INSERT INTO runnerq_worker_pools(pool_id,queue_name,max_workers,activity_types) VALUES($1,$2,$3,$4)
+      ON CONFLICT(pool_id) DO UPDATE SET last_seen_at=NOW(),max_workers=excluded.max_workers,activity_types=excluded.activity_types`,
+      [id, this.queue, concurrency, types],
+    );
+  }
+  async heartbeatPool(id: string): Promise<void> {
+    await this.query(
+      "UPDATE runnerq_worker_pools SET last_seen_at=NOW() WHERE queue_name=$1 AND pool_id=$2",
+      [this.queue, id],
+    );
+  }
+  async deregisterPool(id: string): Promise<void> {
+    await this.query(
+      "DELETE FROM runnerq_worker_pools WHERE queue_name=$1 AND pool_id=$2",
+      [this.queue, id],
+    );
+  }
+  private snapshot(a: Row): ActivitySnapshot {
+    return {
+      id: a.id,
+      type: a.activity_type,
+      status: a.status,
+      priority: a.priority,
+      createdAt: iso(a.created_at)!,
+      scheduledAt: iso(a.scheduled_at),
+      startedAt: iso(a.started_at),
+      completedAt: iso(a.completed_at),
+      retryCount: a.retry_count,
+      maxAttempts: a.max_retries === 0 ? "unlimited" : a.max_retries,
+      timeoutMs: Number(a.timeout_seconds) * 1000,
+      currentWorkerId: a.current_worker_id,
+      lastWorkerId: a.last_worker_id,
+      leaseDeadlineMs:
+        a.lease_deadline_ms === null ? null : Number(a.lease_deadline_ms),
+      parentId: a.parent_activity_id,
+      rootId: a.root_activity_id,
+      depth: a.depth,
+      metadata: a.metadata ?? {},
+      lastError: a.last_error,
+      lastErrorAt: iso(a.last_error_at),
+      idempotencyKey: a.idempotency_key,
+      waitingResultId: a.waiting_result_id,
+    };
+  }
+  async list(options: ListOptions = {}): Promise<ActivitySnapshot[]> {
+    const values: unknown[] = [this.queue];
+    const predicates = ["queue_name=$1"];
+    if (options.rootsOnly) predicates.push("parent_activity_id IS NULL");
+    for (const [column, value] of [
+      ["status", options.status],
+      ["parent_activity_id", options.parentId],
+      ["root_activity_id", options.rootId],
+      ["metadata->>'source'", options.source],
+    ]) {
+      if (value !== undefined) {
+        values.push(value);
+        predicates.push(`${column}=$${values.length}`);
+      }
+    }
+    values.push(
+      integer(options.limit ?? 50, "limit", 1, 1000),
+      integer(options.offset ?? 0, "offset"),
+    );
+    const rows = await this.query(
+      `SELECT * FROM runnerq_activities WHERE ${predicates.join(" AND ")} ORDER BY created_at DESC,id LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values,
+    );
+    return rows.map((a) => this.snapshot(a));
+  }
+  async getActivity(id: string): Promise<ActivitySnapshot | null> {
+    const rows = await this.query(
+      "SELECT * FROM runnerq_activities WHERE queue_name=$1 AND id=$2",
+      [this.queue, id],
+    );
+    return rows[0] ? this.snapshot(rows[0]) : null;
+  }
+  async getInput(id: string): Promise<JsonValue> {
+    const rows = await this.query(
+      "SELECT payload FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=$2",
+      [this.queue, id],
+    );
+    if (!rows[0])
+      throw new RunnerQError("not_found", "Activity input not found");
+    return rows[0].payload;
+  }
+  async steps(id: string): Promise<StepRecord[]> {
+    return (
+      await this.query(
+        "SELECT * FROM runnerq_results WHERE queue_name=$1 AND owner_activity_id=$2 AND step IS NOT NULL ORDER BY created_at,activity_id",
+        [this.queue, id],
+      )
+    ).map((r) => {
+      const colon = r.step.indexOf(":");
+      return {
+        id: r.activity_id,
+        kind: r.step.slice(0, colon),
+        name: r.step.slice(colon + 1),
+        state: r.state,
+        data: r.data,
+        createdAt: iso(r.created_at)!,
+      };
+    });
+  }
+  private toEvent(r: Row): ActivityEvent {
+    return {
+      id: String(r.id),
+      activityId: r.activity_id,
+      type: r.event_type,
+      timestamp: iso(r.created_at)!,
+      workerId: r.worker_id,
+      detail: r.detail,
+    };
+  }
+  async events(id: string, limit = 100): Promise<ActivityEvent[]> {
+    return (
+      await this.query(
+        "SELECT * FROM runnerq_events WHERE queue_name=$1 AND activity_id=$2 ORDER BY id DESC LIMIT $3",
+        [this.queue, id, integer(limit, "limit", 1, 1000)],
+      )
+    ).map((r) => this.toEvent(r));
+  }
+  async readEvents(after: string, limit = 500): Promise<ActivityEvent[]> {
+    return (
+      await this.query(
+        "SELECT * FROM runnerq_events WHERE queue_name=$1 AND id>$2::bigint ORDER BY id LIMIT $3",
+        [this.queue, after, integer(limit, "limit", 1, 1000)],
+      )
+    ).map((r) => this.toEvent(r));
+  }
+  async latestEventId(): Promise<string> {
+    return String(
+      (
+        await this.query(
+          "SELECT COALESCE(MAX(id),0)::text AS id FROM runnerq_events WHERE queue_name=$1",
+          [this.queue],
+        )
+      )[0]!.id,
+    );
+  }
+  async stats(): Promise<QueueStats> {
+    const rows = await this.query(
+      `SELECT status,count(*)::text AS count,count(*) FILTER(WHERE parent_activity_id IS NULL)::text AS roots
+      FROM runnerq_activities WHERE queue_name=$1 GROUP BY status`,
+      [this.queue],
+    );
+    const counts = Object.fromEntries(statuses.map((s) => [s, 0])) as Record<
+      ActivityStatus,
+      number
+    >;
+    const roots = { ...counts };
+    for (const row of rows) {
+      counts[row.status as ActivityStatus] = Number(row.count);
+      roots[row.status as ActivityStatus] = Number(row.roots);
+    }
+    const priorities = await this.query(
+      "SELECT priority,count(*)::text AS count FROM runnerq_activities WHERE queue_name=$1 AND status IN ('pending','scheduled','retrying','waiting') GROUP BY priority",
+      [this.queue],
+    );
+    const pools = await this.query(
+      "SELECT COALESCE(SUM(max_workers),0)::text AS total FROM runnerq_worker_pools WHERE queue_name=$1 AND last_seen_at>NOW()-INTERVAL '60 seconds'",
+      [this.queue],
+    );
+    return {
+      counts,
+      roots,
+      byPriority: Object.fromEntries(
+        priorities.map((r) => [
+          ["", "low", "normal", "high", "critical"][r.priority],
+          Number(r.count),
+        ]),
+      ),
+      activeWorkers: counts.processing,
+      maxWorkers: Number(pools[0]!.total),
+    };
+  }
+  close(): Promise<void> {
+    return (this.closing ??= (async () => {
+      await this.notifications.close();
+      await this.pool.end();
+    })());
+  }
+}
