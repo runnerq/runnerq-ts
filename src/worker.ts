@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter, captureRejectionSymbol } from "node:events";
 import type { ActivityDefinition } from "./activity.js";
 import { ActivityContext } from "./context.js";
-import { json } from "./codec.js";
-import { message, retryable, RunnerQError } from "./errors.js";
+import { encode, decode } from "./serialization.js";
+import { message, retryable, RunnerQError, captureFailure } from "./errors.js";
 import { integer } from "./options.js";
 import { pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
@@ -346,7 +346,10 @@ export class Worker extends EventEmitter<WorkerEvents> {
       const registration = this.handlers.get(claim.type)!;
       let input: unknown;
       try {
-        const payload = json(claim.payload);
+        const payload = decode({
+          data: claim.payload,
+          serialization: claim.serialization,
+        });
         input = registration.input ? registration.input(payload) : payload;
       } catch (cause) {
         throw new RunnerQError("serialization", "Invalid activity input", {
@@ -403,7 +406,7 @@ export class Worker extends EventEmitter<WorkerEvents> {
       if (!failed) {
         let data;
         try {
-          data = json(output);
+          data = encode(output, claim.serialization);
         } catch (cause) {
           error = cause;
           failed = true;
@@ -418,8 +421,9 @@ export class Worker extends EventEmitter<WorkerEvents> {
         this.publish("claimLost", event);
         return;
       }
+      const failure = captureFailure(error);
       const status = await scope.recover(
-        () => storage.fail(fence, message(error), retryable(error)),
+        () => storage.fail(fence, failure.message, retryable(error), failure),
         true,
       );
       this.publish(

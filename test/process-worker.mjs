@@ -8,7 +8,12 @@ const w = new Worker({ storage, concurrency: 1 });
 w.register(activity("ProcessCrash"), async (ctx) => {
   const result = await ctx.run("effect", () => {
     process.send?.({ type: "effect" });
-    return { receipt: "recorded" };
+    return {
+      receipt: "recorded",
+      at: new Date("2026-01-01T00:00:00Z"),
+      amount: 9007199254740993n,
+      bytes: Buffer.from("receipt"),
+    };
   });
   process.send?.({ type: "checkpointed" });
   if (process.argv[3] === "stall") await new Promise(() => {});

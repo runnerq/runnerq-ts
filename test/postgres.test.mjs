@@ -1,3 +1,4 @@
+import { encode } from "../dist/serialization.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runner } from "../dist/index.js";
@@ -55,7 +56,11 @@ for (const expiry of [false, true]) {
             fence = { ownerId: next.id, token: next.token };
           }
         }
-        if (unlimited) await storage.complete(fence, "eventually succeeds");
+        if (unlimited)
+          await storage.complete(
+            fence,
+            encode("eventually succeeds", "json-v1"),
+          );
       }
     },
   );
@@ -67,7 +72,7 @@ integration(
     const { storage, pool, queue } = await setup(t);
     const a = submission();
     await storage.submit(a);
-    assert.deepEqual(await storage.getInput(a.id), a.payload);
+    assert.deepEqual((await storage.getInput(a.id)).data, a.payload);
     const row = (
       await pool.query("SELECT * FROM runnerq_activities WHERE queue_name=$1", [
         queue,
@@ -147,15 +152,19 @@ integration(
     const { storage } = await setup(t);
     const a = submission(),
       f = await claim(storage, a);
-    await storage.complete(f, null);
-    await storage.complete(f, null);
+    await storage.complete(f, encode(null, "json-v1"));
+    await storage.complete(f, encode(null, "json-v1"));
     assert.deepEqual(await storage.getResult(a.id), {
       state: "Ok",
+      serialization: "json-v1",
       data: null,
     });
-    await assert.rejects(storage.complete(f, { changed: true }), {
-      code: "checkpoint_conflict",
-    });
+    await assert.rejects(
+      storage.complete(f, encode({ changed: true }, "json-v1")),
+      {
+        code: "checkpoint_conflict",
+      },
+    );
     assert.equal(
       (await storage.events(a.id)).filter((e) => e.type === "Completed").length,
       1,
@@ -165,9 +174,12 @@ integration(
     assert.equal(await storage.fail(bf, "oops", true), "retrying");
     assert.equal(await storage.fail(bf, "oops", true), "retrying");
     assert.equal((await storage.getActivity(b.id)).retryCount, 1);
-    await assert.rejects(storage.complete({ ...bf, token: "stale" }, null), {
-      code: "claim_lost",
-    });
+    await assert.rejects(
+      storage.complete({ ...bf, token: "stale" }, encode(null, "json-v1")),
+      {
+        code: "claim_lost",
+      },
+    );
   },
 );
 integration(
@@ -177,11 +189,20 @@ integration(
     const a = submission(),
       f = await claim(storage, a),
       id = checkpointId(a.id, "run", "charge");
-    const result = { state: "Ok", data: { paid: true } };
+    const result = {
+      state: "Ok",
+      serialization: "json-v1",
+      data: { paid: true },
+    };
     await storage.checkpoint(f, id, result, "run:charge");
     await storage.checkpoint(f, id, result, "run:charge");
     await assert.rejects(
-      storage.checkpoint(f, id, { state: "Ok", data: false }, "run:charge"),
+      storage.checkpoint(
+        f,
+        id,
+        { state: "Ok", serialization: "json-v1", data: false },
+        "run:charge",
+      ),
       { code: "checkpoint_conflict" },
     );
     await pool.query(
@@ -228,12 +249,15 @@ integration(
       };
       await Promise.all([
         storage.park(pf, wait),
-        other.complete(cf, { ok: true }),
+        other.complete(cf, encode({ ok: true }, "json-v1")),
       ]);
       assert.equal((await storage.getActivity(parent.id)).status, "pending");
       await storage.park(pf, wait); // lost park reply reconciles after wake
       const [p] = await storage.claim(1, ["test"], 60000);
-      await storage.complete({ ownerId: p.id, token: p.token }, null);
+      await storage.complete(
+        { ownerId: p.id, token: p.token },
+        encode(null, "json-v1"),
+      );
     }
   },
 );
@@ -243,8 +267,8 @@ integration(
     const { storage } = await setup(t);
     const a = submission(),
       f = await claim(storage, a);
-    await storage.signal(a.id, "approve", { yes: false });
-    await storage.signal(a.id, "approve", { yes: true });
+    await storage.signal(a.id, "approve", encode({ yes: false }, "json-v1"));
+    await storage.signal(a.id, "approve", encode({ yes: true }, "json-v1"));
     assert.deepEqual(
       (await storage.getResult(checkpointId(a.id, "signal", "approve"))).data,
       { yes: true },
@@ -258,7 +282,7 @@ integration(
     assert.equal((await storage.getActivity(a.id)).status, "pending");
     const delayed = submission(runner.delayMs(60000));
     await storage.submit(delayed);
-    await storage.signal(delayed.id, "hello", null);
+    await storage.signal(delayed.id, "hello", encode(null, "json-v1"));
     assert.equal((await storage.getActivity(delayed.id)).status, "scheduled");
   },
 );
@@ -286,13 +310,13 @@ integration(
       consumer = submission(),
       cf = await claim(storage, consumer);
     await storage.registerDependency(cf, producer.id);
-    await storage.complete(pf, { value: 1 });
+    await storage.complete(pf, encode({ value: 1 }, "json-v1"));
     await pool.query(
       "UPDATE runnerq_activities SET completed_at=NOW()-INTERVAL '1 day' WHERE queue_name=$1 AND id=$2",
       [queue, producer.id],
     );
     assert.equal(await storage.cleanup({ completedMs: 1 }), 0);
-    await storage.complete(cf, null);
+    await storage.complete(cf, encode(null, "json-v1"));
     await pool.query(
       "UPDATE runnerq_activities SET completed_at=NOW()-INTERVAL '1 day' WHERE queue_name=$1",
       [queue],

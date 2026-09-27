@@ -2,7 +2,7 @@
 
 Durable activities and workflows for Node.js, backed by PostgreSQL. The runtime uses bounded async concurrency, native event emitters and cooperative cancellation. There is no separate orchestration service.
 
-This SDK uses **separate activity inputs**: `runnerq_inputs.payload`, not `runnerq_activities.payload`. It cannot share a schema with the current Go SDK until Go adopts this layout. Existing Go databases require a coordinated migration; this package deliberately contains no legacy schema or key-encoding fallback.
+This SDK uses **separate activity inputs**: `runnerq_inputs.payload`, not `runnerq_activities.payload`. It cannot share a schema with the current Go SDK until Go adopts this layout and the serialization format columns. Existing Go databases require a coordinated migration; this package deliberately contains no legacy schema or key-encoding fallback.
 
 ## Quick start
 
@@ -182,6 +182,30 @@ try {
 
 The runtime remembers suspension even if caught and will not incorrectly complete the activity. It cannot stop arbitrary application side effects after a catch or in a finally block.
 
+## Persisted failures
+
+Terminal handler failures and permanent `ctx.run()` failures retain a portable `failure` record containing `name`, `message`, `stack`, string/integer `code`, optional plain-JSON `data`, and nested `cause`. Retry events retain the same diagnostics. Cause capture stops at eight errors and marks cycles or excessive depth explicitly. Non-JSON error data is replaced with an explanatory string; arbitrary custom properties and custom exception prototypes are not persisted.
+
+`handle.result()` throws `ActivityFailedError` with the recorded exception as a `RecordedError` in `cause`. Replayed permanent steps throw `NonRetryableError` with a `RecordedError` cause. These wrappers preserve SDK failure semantics; the recorded cause exposes the original name, stack, code, data, and cause chain without invoking user constructors. This is separate from returning an `Error` as a successful native value.
+
+```ts
+import { ActivityFailedError, RecordedError } from "runnerq";
+
+try {
+  await handle.result();
+} catch (error) {
+  if (
+    error instanceof ActivityFailedError &&
+    error.cause instanceof RecordedError
+  ) {
+    reportFailure(error.cause.name, error.cause.code, error.cause.data);
+  }
+  throw error;
+}
+```
+
+Worker-captured diagnostics live in result/checkpoint records and failure events; `lastError` remains a compact message. Lease expiry cannot capture an exception from a process that is no longer running. No additional schema migration is required for these diagnostics.
+
 ## Cancellation and lifecycle
 
 `ctx.signal` aborts on execution timeout, claim loss, or exhausted shutdown grace. Pass it to fetch, cancellable database clients and other I/O. Cancellation cannot terminate synchronous JavaScript or force an uncooperative Promise to settle. Such handlers remain tracked; the SDK does not release local execution capacity by merely racing a timeout Promise. CPU-heavy work belongs in isolated worker processes.
@@ -233,17 +257,67 @@ const inspector = new Inspector({ storage });
 const waiting = await inspector.list({ rootsOnly: true, status: "waiting" });
 const steps = await inspector.steps(activityId);
 const history = await inspector.history(activityId);
+const input = await inspector.input(activityId);
+if (input.decoded) {
+  useInput(input.data);
+} else {
+  reportUnreadable(input.serialization, input.rawData, input.decodeError);
+}
 
 await inspector.close();
 ```
 
-The inspector uses camelCase and canonical lowercase statuses. List responses intentionally omit payloads; use `inspector.input(activityId)` to fetch an activity's input separately.
+The inspector uses camelCase and canonical lowercase statuses. List responses intentionally omit payloads; use `inspector.input(activityId)` to fetch an activity's input separately. Input, result, and step payloads have a `decoded` discriminator: successful reads expose `data`; failed decoding exposes `rawData`, `serialization`, and structured `decodeError`, with `data` set to undefined. A bad checkpoint does not prevent inspection of the others. `result()` still returns null when no result exists. Database errors and missing inputs still throw. Callers upgrading from the previous input API must read `input.data` after checking `input.decoded`.
 
 `inspector.events({ signal, bufferSize })` is a bounded async iterable; `inspector.on("event", listener)` is also available. A shared tailer runs while subscribers exist. Slow iterators receive an overflow error and should refresh current state. The live feed is best-effort: PostgreSQL sequence order is not commit order. Fetch persisted per-activity history for authoritative inspection. `inspector.close()` stops the tailer without closing storage.
 
 ## Serialization and compatibility
 
-Inputs, results and signal values must be portable JSON. Unsupported values, cycles, nested undefined, non-finite numbers, and integers outside JavaScript's safe range are rejected. A top-level void result becomes JSON null. Encode dates as ISO strings and large integers as decimal strings. Event sequence IDs remain strings.
+Activities use native SuperJSON serialization by default. Inputs, outputs, and signals can contain `Date`, `bigint`, `Map`, `Set`, `Buffer`, `RegExp`, `URL`, `Error`, and `undefined`, including shared references and cycles. Native void results remain `undefined`, distinct from `null`. Functions, symbols, unregistered custom classes, and unsafe integer numbers are rejected; use `bigint` for large integers. Event sequence IDs remain strings.
+
+```ts
+const Checkout = activity<{ orderedAt: Date }, { total: bigint }>("Checkout");
+const handle = await client.execute(Checkout, { orderedAt: new Date() });
+const { total } = await handle.result(); // bigint, including after a restart
+
+// Portable contracts for another SDK: use plain JSON values explicitly.
+const ShipOrder = activity<{ orderId: string }, { shippedAt: string }>(
+  "ShipOrder",
+  { serialization: "portable" },
+);
+await client.signal(
+  shippingId,
+  "approval",
+  { approved: true },
+  {
+    serialization: "portable",
+  },
+);
+```
+
+Portable values must be plain JSON: convert dates to ISO strings and big integers to decimal strings yourself. Portable mode rejects nested undefined, cycles, special objects, non-finite numbers and unsafe integers; top-level void becomes JSON null. `client.signal()` defaults to native serialization; `signalByKey()` uses the supplied activity definition's mode. A signal's own recorded format determines how it is decoded.
+
+`ctx.run()` always uses native serialization for successful checkpoints, even inside portable activities. It decodes the captured value before returning it on the first execution, just as on replay. Step parsers receive decoded values. Internal deadlines and failure records remain portable protocol data. Go workers must not resume TS-owned native checkpoints; sharing activity boundaries requires both SDKs to implement the same schema and portable format contract.
+
+Each input and result row records `serialization` separately from user data: `superjson-v1` or `json-v1`. Output serialization follows the persisted input format, so changing a definition's default does not change an already submitted activity. Clients and inspectors decode using the row's format. Unknown formats fail explicitly. There is no guessing from payload fields or automatic legacy fallback. Inspectors return rich values, which consumers must encode themselves if serving them over JSON HTTP APIs.
+
+For custom types, register a versioned recipe in every client, worker and inspector process before the first native serialization operation:
+
+```ts
+import { registerSerialization } from "runnerq";
+
+class Money {
+  constructor(readonly cents: bigint) {}
+}
+registerSerialization<Money, string>({
+  name: "myapp.Money.v1",
+  isApplicable: (value): value is Money => value instanceof Money,
+  serialize: (value) => value.cents.toString(),
+  deserialize: (value) => new Money(BigInt(value)),
+});
+```
+
+Recipe output must be portable JSON. Names are unique and the registry locks on first native use. Keep existing recipe names and decoders available for recorded work; changing their meaning breaks replay. RunnerQ uses an isolated SuperJSON instance, so unrelated application registrations do not change the SDK's format. See [serialization storage and upgrades](docs/architecture.md#serialization) before upgrading an existing database.
 
 The schema contains exactly seven tables: activities, inputs, results, idempotency, dependencies, events and worker pools. Checkpoint identity is UUIDv5 of `(activityId, "kind:name")`; business keys use the final `rq:key:v2:` UTF-8 length-prefixed encoding; named children use `rq:step:<root>:<parent>:<name>`. There are no legacy key readers, inline-payload compatibility paths or unfenced fallback backends. `runnerq/storage` exports the required storage contract for custom backends.
 

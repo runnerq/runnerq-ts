@@ -1,3 +1,4 @@
+import { decode } from "../dist/serialization.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
@@ -281,7 +282,7 @@ integration(
   },
 );
 integration(
-  "nonretryable errors and invalid JSON are terminal, and failed steps stay checkpointed",
+  "nonretryable errors and unserializable values are terminal, and failed steps stay checkpointed",
   async (t) => {
     const { storage } = await setup(t),
       client = new RunnerQClient({ storage }),
@@ -293,7 +294,7 @@ integration(
         throw new NonRetryableError("declined");
       }),
     );
-    w.register(Bad, (ctx) => ctx.run("bad", () => ({ value: undefined })));
+    w.register(Bad, (ctx) => ctx.run("bad", () => ({ value: () => {} })));
     await w.start();
     try {
       for (const definition of [Task, Bad]) {
@@ -328,7 +329,7 @@ integration(
     const stop = w.stop();
     assert.equal(w.stop(), stop);
     assert.equal((await stop).drained, true);
-    assert.equal((await storage.getResult(h.id)).data, "done");
+    assert.equal(decode(await storage.getResult(h.id)), "done");
   },
 );
 integration(

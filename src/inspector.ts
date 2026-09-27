@@ -1,7 +1,8 @@
 import { EventEmitter } from "node:events";
+import { decode, type SerializedValue } from "./serialization.js";
 import { pause } from "./async.js";
 import { integer } from "./options.js";
-import { RunnerQError } from "./errors.js";
+import { RunnerQError, captureFailure, type FailureDetails } from "./errors.js";
 import type {
   Storage,
   ListOptions,
@@ -9,6 +10,32 @@ import type {
   ActivitySnapshot,
   QueueStats,
 } from "./storage.js";
+export type InspectedValue = { serialization: string } & (
+  | { decoded: true; data: unknown }
+  | {
+      decoded: false;
+      data: undefined;
+      rawData: SerializedValue["data"];
+      decodeError: FailureDetails;
+    }
+);
+function inspect(value: SerializedValue): InspectedValue {
+  try {
+    return {
+      serialization: value.serialization,
+      decoded: true,
+      data: decode(value),
+    };
+  } catch (error) {
+    return {
+      serialization: value.serialization,
+      decoded: false,
+      data: undefined,
+      rawData: value.data,
+      decodeError: captureFailure(error),
+    };
+  }
+}
 interface Subscriber {
   queue: ActivityEvent[];
   capacity: number;
@@ -38,14 +65,18 @@ export class Inspector extends EventEmitter<{
   get(id: string) {
     return this.storage.getActivity(id);
   }
-  input(id: string) {
-    return this.storage.getInput(id);
+  async input(id: string): Promise<InspectedValue> {
+    return inspect(await this.storage.getInput(id));
   }
-  result(id: string) {
-    return this.storage.getResult(id);
+  async result(id: string) {
+    const result = await this.storage.getResult(id);
+    return result ? { ...result, ...inspect(result) } : null;
   }
-  steps(id: string) {
-    return this.storage.steps(id);
+  async steps(id: string) {
+    return (await this.storage.steps(id)).map((step) => ({
+      ...step,
+      ...inspect(step),
+    }));
   }
   history(id: string, limit = 100) {
     return this.storage.events(id, limit);

@@ -1,3 +1,4 @@
+import { encode } from "../dist/serialization.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
@@ -204,7 +205,7 @@ integration(
     const hint = storage.notifications.hint.bind(storage.notifications);
     storage.notifications.hint = () => {};
     try {
-      await storage.complete(f, { recovered: true });
+      await storage.complete(f, encode({ recovered: true }, "json-v1"));
       assert.deepEqual((await waiting).data, { recovered: true });
     } finally {
       storage.notifications.hint = hint;

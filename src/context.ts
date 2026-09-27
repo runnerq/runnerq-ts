@@ -1,8 +1,10 @@
 import type { ActivityDefinition, Parser } from "./activity.js";
-import { checkpointId, json, nonempty, type JsonValue } from "./codec.js";
+import { checkpointId, nonempty, type JsonValue } from "./codec.js";
 import { submit, type ChildActivityHandle } from "./client.js";
 import {
   message,
+  captureFailure,
+  recordedFailure,
   NonRetryableError,
   retryable,
   RunnerQError,
@@ -16,6 +18,7 @@ import {
   track,
   type AttemptScope,
 } from "./scope.js";
+import { encode, decode, type SerializedValue } from "./serialization.js";
 import { pause } from "./async.js";
 import type { StoredResult } from "./storage.js";
 
@@ -76,19 +79,24 @@ export class ActivityContext {
       try {
         const stored = await s.recover(() => s.storage.getResult(id));
         if (stored) {
-          if (stored.state === "Err")
-            throw new NonRetryableError(messageFromData(stored.data));
-          return parse(stored.data, options.parse, `step ${name}`);
+          if (stored.state === "Err") {
+            const data = decode(stored);
+            throw new NonRetryableError(messageFromData(data), {
+              cause: recordedFailure(data),
+            });
+          }
+          return parse(decode(stored), options.parse, `step ${name}`);
         }
         guard(s);
-        let data: JsonValue;
+        let data: SerializedValue;
+        let decoded: T;
         try {
           const value = await executionScope.run({ ...s, inStep: true }, () =>
             fn({ signal: s.signal }),
           );
           guard(s, false);
-          data = json(value);
-          if (options.parse) parse(data, options.parse, `step ${name}`);
+          data = encode(value);
+          decoded = parse(decode(data), options.parse, `step ${name}`);
         } catch (error) {
           if (
             !retryable(error) &&
@@ -99,12 +107,19 @@ export class ActivityContext {
               ["claim_lost", "configuration"].includes(error.code)
             )
           ) {
+            const failure = encode(
+              { error: message(error), failure: captureFailure(error) },
+              "json-v1",
+            );
             await s.recover(
               () =>
                 s.storage.checkpoint(
                   s.fence,
                   id,
-                  { state: "Err", data: { error: message(error) } },
+                  {
+                    state: "Err",
+                    ...failure,
+                  },
                   `run:${name}`,
                 ),
               true,
@@ -118,12 +133,12 @@ export class ActivityContext {
             s.storage.checkpoint(
               s.fence,
               id,
-              { state: "Ok", data },
+              { state: "Ok", ...data },
               `run:${name}`,
             ),
           true,
         );
-        return parse(data, options.parse, `step ${name}`);
+        return decoded;
       } finally {
         s.activeEffects--;
       }
@@ -139,6 +154,7 @@ export class ActivityContext {
         if (!stored) {
           stored = {
             state: "Ok",
+            serialization: "json-v1",
             data: { wake_at: new Date(Date.now() + durationMs).toISOString() },
           };
           const value = stored;
@@ -147,7 +163,7 @@ export class ActivityContext {
             true,
           );
         }
-        const wake = timestamp(stored.data, "wake_at");
+        const wake = timestamp(decode(stored), "wake_at");
         if (wake <= Date.now()) return;
         if (wake > this.budget())
           suspend(s, {
@@ -178,6 +194,7 @@ export class ActivityContext {
         if (!checkpoint) {
           checkpoint = {
             state: "Ok",
+            serialization: "json-v1",
             data: {
               deadline: timeout
                 ? new Date(Date.now() + timeout).toISOString()
@@ -190,13 +207,15 @@ export class ActivityContext {
             true,
           );
         }
-        const deadline = timestamp(checkpoint.data, "deadline", true);
+        const deadline = timestamp(decode(checkpoint), "deadline", true);
         for (;;) {
           const ready = await s.recover(() => s.storage.getResult(resultId));
-          if (ready) return parse(ready.data, options.parse, `signal ${name}`);
+          if (ready)
+            return parse(decode(ready), options.parse, `signal ${name}`);
           if (deadline <= Date.now()) {
             const last = await s.recover(() => s.storage.getResult(resultId));
-            if (last) return parse(last.data, options.parse, `signal ${name}`);
+            if (last)
+              return parse(decode(last), options.parse, `signal ${name}`);
             throw new SignalTimeoutError(name);
           }
           if (deadline > this.budget())
@@ -218,7 +237,7 @@ export class ActivityContext {
               false,
               signal,
             );
-            return parse(result.data, options.parse, `signal ${name}`);
+            return parse(decode(result), options.parse, `signal ${name}`);
           } catch (error) {
             if (!signal.aborted || s.signal.aborted) throw error;
           }
@@ -322,13 +341,13 @@ export class ActivityContext {
     }
   }
 }
-function messageFromData(data: JsonValue): string {
+function messageFromData(data: unknown): string {
   return data && typeof data === "object" && "error" in data
     ? String(data.error)
     : "Step failed";
 }
 function parse<T>(
-  value: JsonValue,
+  value: unknown,
   parser: Parser<T> | undefined,
   label: string,
 ): T {
@@ -340,7 +359,7 @@ function parse<T>(
     });
   }
 }
-function timestamp(value: JsonValue, key: string, nullable = false): number {
+function timestamp(value: unknown, key: string, nullable = false): number {
   if (value && typeof value === "object" && key in value) {
     const raw = (value as Record<string, JsonValue>)[key];
     if (nullable && raw === null) return Infinity;

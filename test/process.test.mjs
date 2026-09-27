@@ -53,6 +53,9 @@ test(
       );
       assert.deepEqual(await h.result({ signal: AbortSignal.timeout(10000) }), {
         receipt: "recorded",
+        at: new Date("2026-01-01T00:00:00Z"),
+        amount: 9007199254740993n,
+        bytes: Buffer.from("receipt"),
       });
       assert.equal(messages.filter((m) => m.type === "effect").length, 1);
       const stopped = once(second, "exit", { signal: exitSignal() });

@@ -3,6 +3,9 @@ import {
   runner,
   RunnerQClient,
   Worker,
+  Inspector,
+  RecordedError,
+  ActivityFailedError,
   type ActivityHandle,
   type ActivityContext,
   type ChildActivityHandle,
@@ -79,3 +82,60 @@ async function handleTypes(ctx: ActivityContext) {
   ];
 }
 void handleTypes;
+
+const native = activity<{ at: Date; amount: bigint }, Map<string, bigint>>(
+  "Native",
+);
+const nativeResult: Promise<ActivityHandle<Map<string, bigint>>> =
+  client.execute(native, { at: new Date(), amount: 1n });
+const portable = activity<{ at: string }, string>("Portable", {
+  serialization: "portable",
+});
+client.execute(portable, { at: new Date().toISOString() });
+client.signal(
+  "id",
+  "event",
+  { at: "2026-01-01" },
+  { serialization: "portable" },
+);
+// @ts-expect-error only explicit native/portable formats are public modes
+activity("InvalidFormat", { serialization: "superjson-v1" });
+// @ts-expect-error native values still follow the input type contract
+client.execute(native, { at: "2026-01-01", amount: 1n });
+void nativeResult;
+
+async function inspectionTypes() {
+  const inspector = new Inspector({ storage });
+  const input = await inspector.input("id");
+  if (!input.decoded) {
+    const name: string = input.decodeError.name;
+    const absent: undefined = input.data;
+    void [name, absent, input.rawData];
+  } else {
+    // @ts-expect-error successfully decoded values have no decoding error
+    input.decodeError;
+  }
+  const result = await inspector.result("id");
+  if (result && !result.decoded) {
+    const absent: undefined = result.data;
+    void [absent, result.decodeError.message];
+  }
+  for (const step of await inspector.steps("id")) {
+    if (!step.decoded) {
+      const absent: undefined = step.data;
+      void [absent, step.rawData];
+    }
+  }
+  try {
+    await client.handle(signup, "id").result();
+  } catch (error) {
+    if (
+      error instanceof ActivityFailedError &&
+      error.cause instanceof RecordedError
+    ) {
+      const code: string | number | undefined = error.cause.code;
+      void code;
+    }
+  }
+}
+void inspectionTypes;

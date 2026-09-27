@@ -44,6 +44,7 @@ export function submission(...options) {
     id,
     type: "test",
     payload: { hello: "world" },
+    serialization: "json-v1",
     options: executionOptions(options),
     parentId: null,
     rootId: id,

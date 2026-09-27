@@ -6,6 +6,8 @@ export { ActivityContext } from "./context.js";
 export type { StepContext } from "./context.js";
 export { Worker } from "./worker.js";
 export { Inspector } from "./inspector.js";
+export type { InspectedValue } from "./inspector.js";
+export type { FailureDetails } from "./errors.js";
 export type {
   WorkerConfig,
   WorkerEvents,
@@ -21,6 +23,7 @@ export {
   NonRetryableError,
   SignalTimeoutError,
   ActivityFailedError,
+  RecordedError,
 } from "./errors.js";
 export { isControlFlow } from "./scope.js";
 export type { JsonValue } from "./codec.js";
@@ -32,3 +35,11 @@ export type {
   QueueStats,
   ListOptions,
 } from "./storage.js";
+
+export { registerSerialization } from "./serialization.js";
+export type {
+  SerializationMode,
+  SerializationFormat,
+  SerializedValue,
+  SerializationRecipe,
+} from "./serialization.js";

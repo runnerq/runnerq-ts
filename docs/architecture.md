@@ -18,6 +18,33 @@ Inputs are immutable rows in `runnerq_inputs`. Submission writes activity state,
 
 The default attempt budget is unlimited, stored as `max_retries = 0`; a positive value is the total attempt limit. Existing separate-input TS databases created with the earlier column default need `ALTER TABLE runnerq_activities ALTER COLUMN max_retries SET DEFAULT 0` before connecting with this version. This changes the default only; existing activities retain their configured budgets. Initialization does not perform this change automatically.
 
+## Serialization
+
+User data is encoded before entering the storage contract. `Submission` and `Claim` carry raw JSON payload plus its format. `StoredResult` and `SerializedValue` pair JSON data with a required serialization identifier. Custom storage backends must preserve that identifier in submit/claim, checkpoint/complete/signal, input/result reads and inspection; immutable-write reconciliation compares both data and format.
+
+`runnerq_inputs.serialization` and `runnerq_results.serialization` are non-null text columns, defaulting to `json-v1` for protocol writers. The TS API explicitly writes `superjson-v1` for native values. Their JSONB columns hold SuperJSON's `{ json, meta? }` representation for native values and the raw application JSON for portable values. Encoding metadata stays in the separate input/result tables. Activity scheduling state and event details remain portable JSON.
+
+The input row selects the activity's output format for its entire lifetime, independently of later handler registration defaults. Every checkpoint and signal records its own format. Successful `ctx.run` results are encoded once, decoded before returning, and decoded identically on replay. Persistence retries reuse the captured representation instead of rerunning callbacks or custom serialization recipes. Native checkpoints remain owned by TS handlers even when their activity input/output contract is portable.
+
+An existing separate-input TS database without these columns must be explicitly upgraded before connecting. Existing rows from the JSON-only SDK are correctly labeled portable by this metadata-only change:
+
+```sql
+BEGIN;
+ALTER TABLE runnerq_inputs ADD COLUMN serialization TEXT NOT NULL DEFAULT 'json-v1';
+ALTER TABLE runnerq_results ADD COLUMN serialization TEXT NOT NULL DEFAULT 'json-v1';
+COMMIT;
+```
+
+Coordinate the change with clients and workers; old readers cannot decode new native values. The initializer does not apply migrations, and missing/unknown formats do not trigger decoder inference. This SQL only upgrades the previous TS layout; it does not migrate inline-input Go schemas.
+
+## Failure diagnostics and inspection
+
+Failure records remain portable protocol JSON, independent of native recipes. Workers capture `FailureDetails` once before retrying a failed activity transition; permanent step failures likewise capture their representation before checkpoint persistence. `Storage.fail` accepts optional diagnostics, which PostgreSQL writes to terminal results and failure/retry events in the same transaction. Lost-reply reconciliation compares the captured diagnostics as well as the message and event type. `last_error` remains a short message; no new columns are needed.
+
+Clients and replayed failed steps wrap reconstructed `RecordedError` causes in the existing SDK error types. Custom exception constructors are never called. Only named fields (`name`, `message`, `stack`, `code`, `data`, `cause`) are retained, with bounded cause depth and explicit placeholders for unsupported data.
+
+Raw storage reads do not decode user payloads. Execution decoders continue to reject invalid payloads. Inspector payload reads instead return a discriminated `InspectedValue`: either `decoded: true` with `data`, or `decoded: false` with `rawData` and `decodeError`. Per-record decoding keeps other checkpoints visible; storage and lookup failures still propagate. The raw data is the database driver's JSON representation, not the original JSON text.
+
 ## Atomic transitions
 
 | Transition       | Transaction invariants                                                                                     |
