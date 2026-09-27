@@ -1,7 +1,12 @@
 import { nonempty } from "./codec.js";
+import {
+  serializationFormat,
+  type SerializationMode,
+} from "./serialization.js";
 export type Parser<T> = (value: unknown) => T;
 export interface ActivityDefinition<I, O> {
   readonly name: string;
+  readonly serialization: SerializationMode;
   readonly input?: Parser<I>;
   readonly output?: Parser<O>;
   /** Type-only invariant markers: definitions with incompatible contracts cannot be substituted. */
@@ -10,8 +15,14 @@ export interface ActivityDefinition<I, O> {
 }
 export function activity<I, O>(
   name: string,
-  parsers: { input?: Parser<I>; output?: Parser<O> } = {},
+  parsers: {
+    input?: Parser<I>;
+    output?: Parser<O>;
+    serialization?: SerializationMode;
+  } = {},
 ): ActivityDefinition<I, O> {
   nonempty(name, "Activity name");
-  return Object.freeze({ name, ...parsers });
+  const serialization = parsers.serialization ?? "native";
+  serializationFormat(serialization);
+  return Object.freeze({ name, ...parsers, serialization });
 }

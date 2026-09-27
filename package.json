@@ -38,7 +38,8 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "superjson": "2.2.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

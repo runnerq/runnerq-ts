@@ -1,5 +1,6 @@
 import type { JsonValue } from "./codec.js";
 import type { ExecutionOptions } from "./options.js";
+import type { SerializedValue, SerializationFormat } from "./serialization.js";
 export type ActivityStatus =
   | "pending"
   | "scheduled"
@@ -9,7 +10,7 @@ export type ActivityStatus =
   | "completed"
   | "failed"
   | "dead_letter";
-export interface StoredResult {
+export interface StoredResult extends SerializedValue {
   state: "Ok" | "Err";
   data: JsonValue;
 }
@@ -18,6 +19,7 @@ export interface Fence {
   token: string;
 }
 export interface Submission {
+  serialization: SerializationFormat;
   id: string;
   type: string;
   payload: JsonValue;
@@ -29,6 +31,7 @@ export interface Submission {
   fence?: Fence;
 }
 export interface Claim {
+  serialization: SerializationFormat;
   id: string;
   type: string;
   payload: JsonValue;
@@ -119,7 +122,7 @@ export interface Storage {
     leaseMs: number,
   ): Promise<Claim[]>;
   renew(fence: Fence, leaseMs: number): Promise<boolean>;
-  complete(fence: Fence, data: JsonValue): Promise<void>;
+  complete(fence: Fence, value: SerializedValue): Promise<void>;
   fail(
     fence: Fence,
     reason: string,
@@ -136,7 +139,7 @@ export interface Storage {
   waitForWork(signal: AbortSignal, timeoutMs?: number): Promise<void>;
   registerDependency(fence: Fence, producerId: string): Promise<void>;
   park(fence: Fence, wait: Park): Promise<void>;
-  signal(id: string, name: string, payload: JsonValue): Promise<void>;
+  signal(id: string, name: string, payload: SerializedValue): Promise<void>;
   lookupKey(key: string): Promise<string>;
   reap(limit: number): Promise<number>;
   cleanup(retention: Retention): Promise<number>;
@@ -149,7 +152,7 @@ export interface Storage {
   deregisterPool(id: string): Promise<void>;
   list(options?: ListOptions): Promise<ActivitySnapshot[]>;
   getActivity(id: string): Promise<ActivitySnapshot | null>;
-  getInput(id: string): Promise<JsonValue>;
+  getInput(id: string): Promise<SerializedValue>;
   steps(id: string): Promise<StepRecord[]>;
   events(id: string, limit?: number): Promise<ActivityEvent[]>;
   readEvents(after: string, limit?: number): Promise<ActivityEvent[]>;

@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { ActivityDefinition } from "./activity.js";
-import { businessKey, json, uuid } from "./codec.js";
+import { businessKey, uuid } from "./codec.js";
 import { ActivityFailedError, RunnerQError } from "./errors.js";
+import {
+  encode,
+  decode,
+  serializationFormat,
+  type SerializationMode,
+} from "./serialization.js";
 import { executionOptions, type ActivityOption } from "./options.js";
 import type { Storage, StoredResult, Submission } from "./storage.js";
 import { executionScope, guard, track, type AttemptScope } from "./scope.js";
@@ -16,8 +22,8 @@ export interface ChildActivityHandle<O> {
   result(): Promise<O>;
 }
 export function unwrap<T>(id: string, result: StoredResult): T {
-  if (result.state === "Err") throw new ActivityFailedError(id, result.data);
-  return result.data as T;
+  if (result.state === "Err") throw new ActivityFailedError(id, decode(result));
+  return decode(result) as T;
 }
 export class ActivityHandle<O> {
   constructor(
@@ -97,7 +103,10 @@ export async function submit<I, O>(
     throw new RunnerQError("configuration", "Maximum activity depth exceeded");
   let payload;
   try {
-    payload = json(definition.input ? definition.input(input) : input);
+    payload = encode(
+      definition.input ? definition.input(input) : input,
+      serializationFormat(definition.serialization),
+    );
   } catch (error) {
     throw new RunnerQError("serialization", "Invalid activity input", {
       cause: error,
@@ -112,7 +121,8 @@ export async function submit<I, O>(
   const activity: Submission = {
     id,
     type: definition.name,
-    payload,
+    payload: payload.data,
+    serialization: payload.serialization,
     options: config,
     parentId: linked ? scope.claim.id : null,
     rootId,
@@ -167,8 +177,13 @@ export class RunnerQClient {
     id: string,
     name: string,
     payload: unknown = null,
+    options: { serialization?: SerializationMode } = {},
   ): Promise<void> {
-    await this.storage.signal(uuid(id), name, json(payload));
+    await this.storage.signal(
+      uuid(id),
+      name,
+      encode(payload, serializationFormat(options.serialization ?? "native")),
+    );
   }
   async signalByKey<I, O>(
     definition: ActivityDefinition<I, O>,
@@ -180,6 +195,7 @@ export class RunnerQClient {
       await this.storage.lookupKey(businessKey(key, definition.name)),
       name,
       payload,
+      { serialization: definition.serialization },
     );
   }
 }

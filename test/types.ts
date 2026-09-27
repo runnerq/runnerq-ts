@@ -79,3 +79,24 @@ async function handleTypes(ctx: ActivityContext) {
   ];
 }
 void handleTypes;
+
+const native = activity<{ at: Date; amount: bigint }, Map<string, bigint>>(
+  "Native",
+);
+const nativeResult: Promise<ActivityHandle<Map<string, bigint>>> =
+  client.execute(native, { at: new Date(), amount: 1n });
+const portable = activity<{ at: string }, string>("Portable", {
+  serialization: "portable",
+});
+client.execute(portable, { at: new Date().toISOString() });
+client.signal(
+  "id",
+  "event",
+  { at: "2026-01-01" },
+  { serialization: "portable" },
+);
+// @ts-expect-error only explicit native/portable formats are public modes
+activity("InvalidFormat", { serialization: "superjson-v1" });
+// @ts-expect-error native values still follow the input type contract
+client.execute(native, { at: "2026-01-01", amount: 1n });
+void nativeResult;

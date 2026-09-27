@@ -32,3 +32,11 @@ export type {
   QueueStats,
   ListOptions,
 } from "./storage.js";
+
+export { registerSerialization } from "./serialization.js";
+export type {
+  SerializationMode,
+  SerializationFormat,
+  SerializedValue,
+  SerializationRecipe,
+} from "./serialization.js";

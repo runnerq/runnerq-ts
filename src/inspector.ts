@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { decode } from "./serialization.js";
 import { pause } from "./async.js";
 import { integer } from "./options.js";
 import { RunnerQError } from "./errors.js";
@@ -38,14 +39,18 @@ export class Inspector extends EventEmitter<{
   get(id: string) {
     return this.storage.getActivity(id);
   }
-  input(id: string) {
-    return this.storage.getInput(id);
+  async input(id: string): Promise<unknown> {
+    return decode(await this.storage.getInput(id));
   }
-  result(id: string) {
-    return this.storage.getResult(id);
+  async result(id: string) {
+    const result = await this.storage.getResult(id);
+    return result ? { ...result, data: decode(result) } : null;
   }
-  steps(id: string) {
-    return this.storage.steps(id);
+  async steps(id: string) {
+    return (await this.storage.steps(id)).map((step) => ({
+      ...step,
+      data: decode(step),
+    }));
   }
   history(id: string, limit = 100) {
     return this.storage.events(id, limit);

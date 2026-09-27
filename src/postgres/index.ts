@@ -8,6 +8,7 @@ import {
 } from "pg";
 import { checkpointId, json, nonempty, type JsonValue } from "../codec.js";
 import { databaseError, RunnerQError } from "../errors.js";
+import type { SerializedValue } from "../serialization.js";
 import { integer } from "../options.js";
 import { pause } from "../async.js";
 import type {
@@ -448,8 +449,8 @@ export class PostgresStorage
         ],
       );
       await c.query(
-        "INSERT INTO runnerq_inputs(activity_id,queue_name,payload) VALUES($1,$2,$3::jsonb)",
-        [a.id, this.queue, JSON.stringify(a.payload)],
+        "INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$3::jsonb,$4)",
+        [a.id, this.queue, JSON.stringify(a.payload), a.serialization],
       );
       if (a.parentId) await this.dependency(c, a.parentId, a.id, a.id);
       await this.event(
@@ -498,11 +499,11 @@ export class PostgresStorage
       );
       if (!r.rowCount) return [];
       const inputs = await c.query(
-        "SELECT activity_id,payload FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
+        "SELECT activity_id,payload,serialization FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
         [this.queue, r.rows.map((a) => a.id)],
       );
       const payloads = new Map(
-        inputs.rows.map((row) => [row.activity_id, row.payload]),
+        inputs.rows.map((row) => [row.activity_id, row]),
       );
       // UPDATE RETURNING has no guaranteed order; restore the claim ordering.
       r.rows.sort(
@@ -525,7 +526,8 @@ export class PostgresStorage
         result.push({
           id: a.id,
           type: a.activity_type,
-          payload: payloads.get(a.id),
+          payload: payloads.get(a.id)!.payload,
+          serialization: payloads.get(a.id)!.serialization,
           token: a.current_worker_id,
           retryCount: a.retry_count,
           timeoutMs: Number(a.timeout_seconds) * 1000,
@@ -557,14 +559,22 @@ export class PostgresStorage
     step: string | null,
   ): Promise<void> {
     await c.query(
-      `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step) VALUES($1,$2,$3,$4::jsonb,$5,$6)
-      ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,created_at=NOW(),step=excluded.step
+      `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization) VALUES($1,$2,$3,$4::jsonb,$5,$6,$7)
+      ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
       WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id`,
-      [id, this.queue, result.state, JSON.stringify(result.data), owner, step],
+      [
+        id,
+        this.queue,
+        result.state,
+        JSON.stringify(result.data),
+        owner,
+        step,
+        result.serialization,
+      ],
     );
     await this.wake(c, id);
   }
-  async complete(f: Fence, data: JsonValue): Promise<void> {
+  async complete(f: Fence, value: SerializedValue): Promise<void> {
     await this.tx(async (c) => {
       const r = await c.query(
         `UPDATE runnerq_activities SET status='completed',completed_at=NOW(),last_worker_id=$3,
@@ -574,10 +584,16 @@ export class PostgresStorage
       );
       if (!r.rowCount) {
         const previous = await c.query(
-          `SELECT r.data IS NOT DISTINCT FROM $4::jsonb AS same FROM runnerq_activities a
+          `SELECT (r.data IS NOT DISTINCT FROM $4::jsonb AND r.serialization=$5) AS same FROM runnerq_activities a
           JOIN runnerq_results r ON r.activity_id=a.id AND r.queue_name=a.queue_name
           WHERE a.queue_name=$1 AND a.id=$2 AND a.status='completed' AND a.last_worker_id=$3 AND r.state='Ok'`,
-          [this.queue, f.ownerId, f.token, JSON.stringify(data)],
+          [
+            this.queue,
+            f.ownerId,
+            f.token,
+            JSON.stringify(value.data),
+            value.serialization,
+          ],
         );
         if (previous.rows[0]?.same) return;
         if (previous.rowCount)
@@ -591,7 +607,7 @@ export class PostgresStorage
         c,
         f.ownerId,
         f.ownerId,
-        { state: "Ok", data },
+        { state: "Ok", ...value },
         null,
       );
       await this.event(c, f.ownerId, "Completed", f.token, {
@@ -655,6 +671,7 @@ export class PostgresStorage
           f.ownerId,
           {
             state: "Err",
+            serialization: "json-v1",
             data: {
               error: reason,
               type: retry ? "dead_letter" : "non_retryable",
@@ -684,8 +701,8 @@ export class PostgresStorage
     await this.tx(async (c) => {
       await this.fence(c, f);
       const r = await c.query(
-        `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step)
-        VALUES($1,$2,$3,$4::jsonb,$5,NULLIF($6,'')) ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id`,
+        `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        VALUES($1,$2,$3,$4::jsonb,$5,NULLIF($6,''),$7) ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id`,
         [
           id,
           this.queue,
@@ -693,12 +710,13 @@ export class PostgresStorage
           JSON.stringify(result.data),
           f.ownerId,
           step,
+          result.serialization,
         ],
       );
       if (!r.rowCount) {
         const same = await c.query(
           `SELECT 1 FROM runnerq_results WHERE activity_id=$1 AND queue_name=$2 AND state=$3
-          AND data IS NOT DISTINCT FROM $4::jsonb AND owner_activity_id=$5 AND COALESCE(step,'')=$6`,
+          AND data IS NOT DISTINCT FROM $4::jsonb AND owner_activity_id=$5 AND COALESCE(step,'')=$6 AND serialization=$7`,
           [
             id,
             this.queue,
@@ -706,6 +724,7 @@ export class PostgresStorage
             JSON.stringify(result.data),
             f.ownerId,
             step,
+            result.serialization,
           ],
         );
         if (!same.rowCount)
@@ -722,12 +741,18 @@ export class PostgresStorage
   }
   async getResult(id: string): Promise<StoredResult | null> {
     const r = await this.query(
-      "SELECT state,data FROM runnerq_results WHERE queue_name=$1 AND activity_id=$2",
+      "SELECT state,data,serialization FROM runnerq_results WHERE queue_name=$1 AND activity_id=$2",
       [this.queue, id],
     );
     if (r[0] && !["Ok", "Err"].includes(r[0].state))
       throw new RunnerQError("serialization", "Invalid stored result state");
-    return r[0] ? { state: r[0].state, data: json(r[0].data) } : null;
+    return r[0]
+      ? {
+          state: r[0].state,
+          data: json(r[0].data),
+          serialization: r[0].serialization,
+        }
+      : null;
   }
   async waitResult(id: string, signal?: AbortSignal): Promise<StoredResult> {
     const sub = this.notifications.subscribe(`result:${id}`, signal);
@@ -825,7 +850,11 @@ export class PostgresStorage
     });
     this.hints();
   }
-  async signal(id: string, name: string, payload: JsonValue): Promise<void> {
+  async signal(
+    id: string,
+    name: string,
+    payload: SerializedValue,
+  ): Promise<void> {
     const result = checkpointId(id, "signal", name);
     await this.tx(async (c) => {
       if (
@@ -841,7 +870,7 @@ export class PostgresStorage
         c,
         result,
         id,
-        { state: "Ok", data: payload },
+        { state: "Ok", ...payload },
         `signal:${name}`,
       );
       const wake = await c.query(
@@ -885,6 +914,7 @@ export class PostgresStorage
             a.id,
             {
               state: "Err",
+              serialization: "json-v1",
               data: {
                 error: a.last_error,
                 type: "dead_letter",
@@ -1085,14 +1115,17 @@ export class PostgresStorage
     );
     return rows[0] ? this.snapshot(rows[0]) : null;
   }
-  async getInput(id: string): Promise<JsonValue> {
+  async getInput(id: string): Promise<SerializedValue> {
     const rows = await this.query(
-      "SELECT payload FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=$2",
+      "SELECT payload,serialization FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=$2",
       [this.queue, id],
     );
     if (!rows[0])
       throw new RunnerQError("not_found", "Activity input not found");
-    return rows[0].payload;
+    return {
+      data: json(rows[0].payload),
+      serialization: rows[0].serialization,
+    };
   }
   async steps(id: string): Promise<StepRecord[]> {
     return (
@@ -1108,6 +1141,7 @@ export class PostgresStorage
         name: r.step.slice(colon + 1),
         state: r.state,
         data: r.data,
+        serialization: r.serialization,
         createdAt: iso(r.created_at)!,
       };
     });

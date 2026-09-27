@@ -1,3 +1,4 @@
+import { encode } from "../dist/serialization.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Inspector } from "../dist/index.js";
@@ -10,7 +11,7 @@ test(
       inspector = new Inspector({ storage });
     const a = submission(),
       f = await claim(storage, a);
-    await storage.complete(f, { ok: true });
+    await storage.complete(f, encode({ ok: true }, "json-v1"));
     try {
       assert.equal("payload" in (await inspector.list())[0], false);
       assert.deepEqual(await inspector.input(a.id), a.payload);

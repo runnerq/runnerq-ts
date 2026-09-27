@@ -13,7 +13,8 @@ CREATE TABLE runnerq_activities (
  waiting_result_id UUID
 );
 CREATE TABLE runnerq_inputs (
- activity_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, payload JSONB NOT NULL
+ activity_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, payload JSONB NOT NULL,
+ serialization TEXT NOT NULL DEFAULT 'json-v1'
 );
 CREATE TABLE runnerq_idempotency (
  queue_name TEXT NOT NULL, idempotency_key TEXT NOT NULL, activity_id UUID NOT NULL,
@@ -27,7 +28,7 @@ CREATE TABLE runnerq_events (
 );
 CREATE TABLE runnerq_results (
  activity_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, state TEXT NOT NULL,
- data JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), owner_activity_id UUID, step TEXT
+ data JSONB, serialization TEXT NOT NULL DEFAULT 'json-v1', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), owner_activity_id UUID, step TEXT
 );
 CREATE TABLE runnerq_worker_pools (
  pool_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, max_workers INTEGER NOT NULL,
