@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { hostname as osHostname } from "node:os";
-import { pause } from "./async.js";
+import { maxTimerMs, pause } from "./async.js";
 
 /** Who an executor (a started worker) is. */
 export interface ExecutorInfo {
@@ -113,27 +113,45 @@ export interface ReportOptions {
  */
 export async function reportExecutor(options: ReportOptions): Promise<void> {
   const { signal, source } = options;
+  // One reaction per change promise: racing it on every wait instead would pile reactions
+  // onto an unchanged one for as long as the source stays idle.
+  let watched: Promise<void> | undefined,
+    changed = false,
+    wake: (() => void) | undefined;
   while (!signal.aborted) {
     // Taken before the send, so a change during it isn't missed.
-    const changed = source.changed?.();
+    const next = source.changed?.();
+    if (next !== watched) {
+      watched = next;
+      changed = false;
+      void next?.then(() => {
+        if (watched !== next) return;
+        changed = true;
+        wake?.();
+      });
+    }
     try {
       await options.send();
     } catch {
       /* the next report retries */
     }
     const sent = Date.now();
-    // Each wait cancels its own timer, so a change doesn't leave one behind.
-    const wait = new AbortController();
-    const waiting = AbortSignal.any([signal, wait.signal]);
-    let byChange = false;
-    await Promise.race([
-      pause(options.intervalMs(), waiting).catch(() => {}),
-      changed?.then(() => {
-        byChange = true;
-      }) ?? new Promise<never>(() => {}),
-    ]);
-    wait.abort();
-    if (byChange && !signal.aborted)
+    if (!changed && !signal.aborted)
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", done);
+          wake = undefined;
+          resolve();
+        };
+        const timer = setTimeout(
+          done,
+          Math.min(options.intervalMs(), maxTimerMs),
+        );
+        wake = done;
+        signal.addEventListener("abort", done, { once: true });
+      });
+    if (changed && !signal.aborted)
       await pause(sent + options.minGapMs - Date.now(), signal).catch(() => {});
   }
 }
