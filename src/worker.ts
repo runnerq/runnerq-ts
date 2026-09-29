@@ -94,6 +94,7 @@ export class Worker
     WorkerConfig;
   private readonly handlers = new Map<string, Registration>();
   private readonly inFlight = new Set<Promise<void>>();
+  private readonly slotFreed = new ChangeSignal();
   /** Running attempts' controllers, aborted when the shutdown budget runs out. */
   private readonly attempts = new Set<AbortController>();
   private intake = new AbortController();
@@ -302,8 +303,10 @@ export class Worker
   private async dispatcher(types: readonly string[]): Promise<void> {
     while (!this.intake.signal.aborted) {
       try {
+        // Not Promise.race(inFlight): each race would leave a reaction on every
+        // long-running activity's promise until it settles.
         if (this.inFlight.size >= this.config.concurrency) {
-          await Promise.race(this.inFlight);
+          await this.slotFreed.changed();
           continue;
         }
         const claims = await this.config.storage.claim(
@@ -314,11 +317,13 @@ export class Worker
         );
         // A claim already committed during shutdown still executes under the drain budget.
         for (const claim of claims) {
-          const promise = this.process(claim).catch((error) =>
-            this.report(error),
-          );
+          const promise: Promise<void> = this.process(claim)
+            .catch((error) => this.report(error))
+            .finally(() => {
+              this.inFlight.delete(promise);
+              this.slotFreed.notify();
+            });
           this.inFlight.add(promise);
-          void promise.finally(() => this.inFlight.delete(promise));
         }
         if (!claims.length)
           await this.config.storage.waitForWork(this.intake.signal);
