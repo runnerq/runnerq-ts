@@ -1,5 +1,6 @@
 import http from "node:http";
 import { WebSocketServer } from "ws";
+import { until } from "./helpers.mjs";
 
 export const key = "rqk_test";
 // fakeGateway is RunnerQ Cloud's side of an agent session.
@@ -14,7 +15,6 @@ export async function fakeGateway(
     events: [],
     sockets: [],
     replies: new Map(),
-    waiters: [],
     rejected: 0,
     nextId: 0,
   };
@@ -55,23 +55,13 @@ export async function fakeGateway(
         } else if (env.kind === "evt") {
           g.events.push(env);
         }
-        for (const w of g.waiters.splice(0)) w();
       });
     });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   g.url = `http://127.0.0.1:${server.address().port}`;
   g.socket = () => g.sockets.at(-1);
-  g.until = async (fn, what, ms = 5_000) => {
-    const end = Date.now() + ms;
-    while (!fn()) {
-      if (Date.now() > end) throw new Error(`no ${what}`);
-      await new Promise((r) => {
-        g.waiters.push(r);
-        setTimeout(r, 20);
-      });
-    }
-  };
+  g.until = (fn, what, ms = 5_000) => until(fn, ms, what);
   g.call = (type, data, meta) =>
     new Promise((resolve, reject) => {
       const id = String(++g.nextId);

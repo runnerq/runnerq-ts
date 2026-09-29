@@ -21,6 +21,7 @@ import {
   plainJson,
   toResult,
   toActivity,
+  Queries,
 } from "../dist/conductor/queries.js";
 import { WireError } from "../dist/conductor/index.js";
 
@@ -699,4 +700,82 @@ test("stored values reach the wire as plain JSON", () => {
     created_at: "1970-01-01T00:00:00.000Z",
     updated_at: "1970-01-01T00:00:00.000Z",
   });
+});
+
+test("the agent's query handlers check requests and advertise capabilities", async () => {
+  const empty = async () => ({ items: [], nextCursor: "" });
+  const qs = {
+    queryCapabilities,
+    queryActivities: empty,
+    queryEvents: empty,
+    aggregateActivities: async () => ({ rows: [], truncated: false }),
+  };
+  const routes = new Queries(qs, {}, () => false).routes();
+  const fails = (type, data, code, field) =>
+    assert.rejects(
+      async () => routes[type].handler(data),
+      (e) => {
+        assert.ok(e instanceof WireError, `not a WireError: ${e}`);
+        assert.equal(e.code, code, e.message);
+        assert.equal(e.details?.field, field);
+        return true;
+      },
+    );
+  await fails(
+    "activities.list",
+    { include: ["secrets"] },
+    "unsupported",
+    "include",
+  );
+  await fails(
+    "activities.list",
+    { sort: [{ field: "created_at" }, { field: "priority" }] },
+    "unsupported",
+    "sort",
+  );
+  await fails(
+    "activities.list",
+    { sort: [{ field: "created_at", order: "sideways" }] },
+    "invalid_argument",
+    "sort",
+  );
+  await fails(
+    "events.list",
+    { sort: [{ field: "type" }] },
+    "unsupported",
+    "sort",
+  );
+  await fails(
+    "activities.aggregate",
+    { metrics: [{ name: "vibes" }] },
+    "unsupported",
+    "metrics",
+  );
+  await fails(
+    "activities.list",
+    { filter: null, surprise: 1 },
+    "invalid_argument",
+  );
+
+  const caps = Object.fromEntries(
+    Object.entries(routes).map(([type, r]) => [type, r.capability]),
+  );
+  assert.deepEqual(caps["activities.list"].include, [
+    "last_error",
+    "payload",
+    "result",
+  ]);
+  assert.ok(caps["activities.list"].filters.includes("metadata"));
+  assert.deepEqual(caps["activities.aggregate"].metrics, [
+    "count",
+    "duration.queue",
+    "duration.run",
+    "duration.total",
+  ]);
+  // Stream requests are advertised here but served by the session.
+  assert.equal(routes["events.subscribe"].handler, undefined);
+  assert.deepEqual(
+    caps["events.subscribe"].filters,
+    queryCapabilities().eventFilters,
+  );
 });

@@ -11,11 +11,10 @@ import {
 } from "../dist/index.js";
 import { startAgent } from "../dist/conductor/index.js";
 import { fakeGateway, key } from "./gateway.mjs";
-import { dsn, setup, submission, until } from "./helpers.mjs";
+import { dsn, quiet, setup, submission, until } from "./helpers.mjs";
 
 const integration = (name, fn) =>
   test(name, { skip: !dsn, timeout: 60_000 }, fn);
-const quiet = { info() {}, warn() {} };
 const created = "activity.created";
 
 /** An agent for a worker on `storage`, connected to a fake gateway. */
@@ -112,15 +111,6 @@ integration("queries are answered from storage", async (t) => {
     "events.unsubscribe",
   ])
     assert.ok(hello.capabilities[type], `capability ${type}`);
-  const listCap = hello.capabilities["activities.list"];
-  assert.ok(listCap.filters.includes("metadata") && listCap.sorts.length);
-  assert.deepEqual(listCap.include, ["last_error", "payload", "result"]);
-  assert.deepEqual(hello.capabilities["activities.aggregate"].metrics, [
-    "count",
-    "duration.queue",
-    "duration.run",
-    "duration.total",
-  ]);
 
   const id = await enqueue(storage, { payload: { n: 1 } });
   const child = await enqueue(storage, { payload: { n: 2 }, parent: id });
@@ -195,7 +185,8 @@ integration("queries are answered from storage", async (t) => {
   });
   await g.fails("trees.get", { id: "nope" }, "not_found");
 
-  // Errors carry the offending field.
+  // Errors reach the wire with the offending field (every case is unit-tested in
+  // query-compiler.test.mjs).
   const colour = await g.fails(
     "activities.list",
     { filter: { field: "colour", op: "eq", value: "red" } },
@@ -208,35 +199,6 @@ integration("queries are answered from storage", async (t) => {
     "invalid_argument",
   );
   assert.deepEqual(status.details, { field: "status" });
-  const secrets = await g.fails(
-    "activities.list",
-    { include: ["secrets"] },
-    "unsupported",
-  );
-  assert.deepEqual(secrets.details, { field: "include" });
-  await g.fails(
-    "activities.list",
-    { sort: [{ field: "created_at" }, { field: "priority" }] },
-    "unsupported",
-  );
-  await g.fails(
-    "activities.list",
-    { sort: [{ field: "created_at", order: "sideways" }] },
-    "invalid_argument",
-  );
-  const surprise = await g.fails(
-    "activities.list",
-    { filter: null, surprise: 1 },
-    "invalid_argument",
-  );
-  assert.match(surprise.message, /^decode request: .*surprise/);
-  await g.fails(
-    "activities.aggregate",
-    { metrics: [{ name: "vibes" }] },
-    "unsupported",
-  );
-  await g.fails("events.list", { sort: [{ field: "type" }] }, "unsupported");
-  await g.fails("activities.list", { cursor: "garbage!" }, "invalid_argument");
 });
 
 integration(

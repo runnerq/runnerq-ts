@@ -3,43 +3,10 @@ import assert from "node:assert/strict";
 import { activity, Worker } from "../dist/index.js";
 import { startAgent } from "../dist/conductor/index.js";
 import { fakeGateway, key } from "./gateway.mjs";
+import { fakeStorage, quiet } from "./helpers.mjs";
 
-const quiet = { info() {}, warn() {} };
-
-function storage() {
-  const claims = [];
-  let wake;
-  return {
-    queue: "q1",
-    push(c) {
-      claims.push(c);
-      wake?.();
-    },
-    async claim(limit) {
-      return claims.splice(0, limit);
-    },
-    async waitForWork(signal) {
-      await new Promise((r) => {
-        wake = r;
-        signal.addEventListener("abort", r, { once: true });
-        setTimeout(r, 20);
-      });
-    },
-    async renew() {
-      return true;
-    },
-    async complete() {},
-    async fail() {
-      return "failed";
-    },
-    async reap() {
-      return 0;
-    },
-    async close() {},
-  };
-}
 async function worker(t, labels) {
-  const s = storage();
+  const s = fakeStorage({ queue: "q1" });
   const w = new Worker({ storage: s, concurrency: 3, labels });
   let release;
   const gate = new Promise((r) => (release = r));
