@@ -28,8 +28,8 @@ export function json(value: unknown): JsonValue {
         throw new RunnerQError("serialization", `Symbol keys at ${path}`);
       for (const [k, x] of Object.entries(v)) {
         const item = visit(x, `${path}.${k}`);
-        // Assignment is ~2x faster than defineProperty and makes the same own property,
-        // except for keys Object.prototype has (its __proto__ setter, or any polluter's).
+        // Assignment (twice as fast) makes the same own property, except for keys on
+        // Object.prototype: its __proto__ setter, or a polluter's.
         if (k in Object.prototype)
           Object.defineProperty(copy, k, {
             value: item,

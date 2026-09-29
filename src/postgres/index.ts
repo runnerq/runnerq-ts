@@ -431,7 +431,7 @@ export class PostgresStorage
       const o = a.options;
       const priority =
         ["low", "normal", "high", "critical"].indexOf(o.priority) + 1;
-      // The activity, its input, the parent link and the event: one statement, one round trip.
+      // One statement for the activity, its input, the parent link and the event.
       await c.query(
         `WITH activity AS (INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
         timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)

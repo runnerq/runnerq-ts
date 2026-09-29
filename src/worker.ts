@@ -203,7 +203,6 @@ export class Worker
   get storage(): Storage {
     return this.config.storage;
   }
-  /** Who the worker is, what it runs now and what it has done since it was built. */
   snapshot(): ExecutorSnapshot {
     return {
       info: {

@@ -410,7 +410,10 @@ export class Agent {
     ws.close(1000, "shutdown");
   }
 
-  /** Writes one frame, with `data` as its JSON data when given; false when the connection can't take it. */
+  /**
+   * Writes one frame, splicing in `data` (JSON text) when given; false when the connection
+   * can't take it.
+   */
   private send(ws: WebSocket, env: Envelope, data?: string): boolean {
     if (ws.readyState !== WebSocket.OPEN) return false;
     try {
