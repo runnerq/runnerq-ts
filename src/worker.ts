@@ -200,6 +200,10 @@ export class Worker
     });
     return this;
   }
+  /** The storage this worker runs activities on. */
+  get storage(): Storage {
+    return this.config.storage;
+  }
   /**
    * The worker as it is now: who it is, what it's running, and what it has done since it
    * was built. RunnerQ Cloud's agent and storage adapter report it.
@@ -315,6 +319,7 @@ export class Worker
           this.config.concurrency - this.inFlight.size,
           types,
           this.config.leaseMs,
+          this.id,
         );
         // A claim already committed during shutdown still executes under the drain budget.
         for (const claim of claims) {

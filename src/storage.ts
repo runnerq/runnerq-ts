@@ -111,10 +111,15 @@ export interface StepRecord extends StoredResult {
 export interface Storage {
   readonly queue: string;
   submit(activity: Submission): Promise<string>;
+  /**
+   * `executorId` is the claiming worker's id: a backend that can should record it with the
+   * claim, so queries can say which executor runs an activity.
+   */
   claim(
     limit: number,
     types: readonly string[],
     leaseMs: number,
+    executorId?: string,
   ): Promise<Claim[]>;
   renew(fence: Fence, leaseMs: number): Promise<boolean>;
   complete(fence: Fence, value: SerializedValue): Promise<void>;
@@ -141,3 +146,6 @@ export interface Storage {
   cleanup(retention: Retention): Promise<number>;
   close(): Promise<void>;
 }
+
+export { QueryError, RecordEvent, isQueryStorage } from "./query.js";
+export type * from "./query.js";

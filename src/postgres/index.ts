@@ -25,6 +25,21 @@ import type {
   ActivityEvent,
 } from "../storage.js";
 import { schema, schemaLock, tableNames, indexNames } from "./schema.js";
+import { PostgresQueries, queryCapabilities } from "./query.js";
+import type {
+  QueryStorage,
+  QueryCapabilities,
+  QueryFilter,
+  ActivityQuery,
+  ActivityRecordPage,
+  AggregateQuery,
+  AggregateRows,
+  EventQuery,
+  EventRecordPage,
+  StepEntryPage,
+  RecordInclude,
+  ActivityTree,
+} from "../query.js";
 import { Notifications } from "./notifications.js";
 
 export interface PostgresConfig {
@@ -168,12 +183,15 @@ async function verifySchema(client: PoolClient): Promise<void> {
 
 export class PostgresStorage
   extends EventEmitter<{ storageError: [error: Error] }>
-  implements Storage
+  implements Storage, QueryStorage
 {
   readonly queue: string;
   private readonly pool: Pool;
   private readonly notifications: Notifications;
   private closing?: Promise<void>;
+  private readonly queries = new PostgresQueries((sql, values) =>
+    this.query(sql, values),
+  );
   private constructor(config: PostgresConfig) {
     super();
     this.queue = config.queue;
@@ -456,11 +474,17 @@ export class PostgresStorage
     limit: number,
     types: readonly string[],
     leaseMs: number,
+    executorId?: string,
   ): Promise<Claim[]> {
     integer(limit, "claim limit", 1);
     integer(leaseMs, "leaseMs", 1);
     if (!types.length) return [];
-    const prefix = randomUUID();
+    // Tokens are "<executor>:batch:<uuid>:<activity>", as Go's: unique per claim, and the
+    // part before the first colon names the executor running it (queries' executor_id).
+    const prefix =
+      executorId && !executorId.includes(":")
+        ? `${executorId}:batch:${randomUUID()}`
+        : randomUUID();
     const claims = await this.tx(async (c) => {
       const filter =
         types.length === 1
@@ -1131,6 +1155,40 @@ export class PostgresStorage
         [this.queue, id, integer(limit, "limit", 1, 1000)],
       )
     ).map((r) => this.toEvent(r));
+  }
+  // QueryStorage: RunnerQ Cloud's read surface. Queries span every queue in the schema.
+  queryCapabilities(): QueryCapabilities {
+    return queryCapabilities();
+  }
+  queryActivities(query: ActivityQuery): Promise<ActivityRecordPage> {
+    return this.queries.activities(query);
+  }
+  countActivities(
+    filter: QueryFilter | undefined,
+    limit: number,
+  ): Promise<{ count: number; exact: boolean }> {
+    return this.queries.count(filter, limit);
+  }
+  aggregateActivities(query: AggregateQuery): Promise<AggregateRows> {
+    return this.queries.aggregate(query);
+  }
+  queryEvents(query: EventQuery): Promise<EventRecordPage> {
+    return this.queries.events(query);
+  }
+  listStepEntries(
+    activityId: string,
+    includeData: boolean,
+    limit: number,
+    cursor: string,
+  ): Promise<StepEntryPage> {
+    return this.queries.steps(activityId, includeData, limit, cursor);
+  }
+  getActivityTree(
+    activityId: string,
+    include: RecordInclude,
+    maxNodes: number,
+  ): Promise<ActivityTree> {
+    return this.queries.tree(activityId, include, maxNodes);
   }
   close(): Promise<void> {
     return (this.closing ??= (async () => {
