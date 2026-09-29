@@ -8,47 +8,8 @@ import {
   reportExecutor,
   Worker,
 } from "../dist/index.js";
+import { fakeStorage } from "./helpers.mjs";
 
-// fakeStorage hands out queued claims and records outcomes; nothing is durable.
-function fakeStorage(extra = {}) {
-  const queue = [];
-  const outcomes = [];
-  let wake;
-  return {
-    queue: "payments",
-    queued: queue,
-    outcomes,
-    push(claim) {
-      queue.push(claim);
-      wake?.();
-    },
-    async claim(limit) {
-      return queue.splice(0, limit);
-    },
-    async waitForWork(signal) {
-      await new Promise((resolve) => {
-        wake = resolve;
-        signal.addEventListener("abort", resolve, { once: true });
-        setTimeout(resolve, 20);
-      });
-    },
-    async renew() {
-      return true;
-    },
-    async complete(fence) {
-      outcomes.push(["complete", fence.ownerId]);
-    },
-    async fail(fence, reason, retryable) {
-      outcomes.push(["fail", fence.ownerId]);
-      return retryable ? "dead_letter" : "failed";
-    },
-    async reap() {
-      return 0;
-    },
-    async close() {},
-    ...extra,
-  };
-}
 function claimFor(type, due) {
   const id = randomUUID();
   return {

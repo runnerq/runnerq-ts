@@ -297,7 +297,14 @@ await worker.stop();
 - Requests beyond `maxConcurrentRequests` (16) are refused rather than queued; each is
   bounded by `requestTimeoutMs` (30s) or the Cloud's deadline.
 
-This version answers `executor.describe`; querying activities and live events come next.
+### Queries and live events
+
+When the worker's storage implements `QueryStorage` (from `runnerq/storage`;
+`PostgresStorage` does), the agent also answers the Cloud's queries about activities,
+steps, events and trees, and streams live events, across every queue in the database.
+Without it, the agent serves only the executor. Payloads and results are shown as plain
+JSON: a SuperJSON `Date`, `Map` or `bigint` appears as its JSON projection (an ISO
+string, entry pairs, a decimal string).
 
 ## Reading state
 

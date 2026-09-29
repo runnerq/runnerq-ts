@@ -57,12 +57,54 @@ export async function claim(storage, a, token) {
   if (!claims.length) throw new Error("Expected a claim");
   return { ownerId: claims[0].id, token: claims[0].token };
 }
-export async function until(fn, timeout = 10_000) {
+export async function until(fn, timeout = 10_000, what = "Condition") {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const result = await fn();
     if (result) return result;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error("Condition timed out");
+  throw new Error(`${what} timed out`);
+}
+/** A logger that drops everything. */
+export const quiet = { info() {}, warn() {} };
+// fakeStorage hands out queued claims and records outcomes; nothing is durable.
+export function fakeStorage(extra = {}) {
+  const queue = [];
+  const outcomes = [];
+  let wake;
+  return {
+    queue: "payments",
+    queued: queue,
+    outcomes,
+    push(claim) {
+      queue.push(claim);
+      wake?.();
+    },
+    async claim(limit) {
+      return queue.splice(0, limit);
+    },
+    async waitForWork(signal) {
+      await new Promise((resolve) => {
+        wake = resolve;
+        signal.addEventListener("abort", resolve, { once: true });
+        setTimeout(resolve, 20);
+      });
+    },
+    async renew() {
+      return true;
+    },
+    async complete(fence) {
+      outcomes.push(["complete", fence.ownerId]);
+    },
+    async fail(fence, reason, retryable) {
+      outcomes.push(["fail", fence.ownerId]);
+      return retryable ? "dead_letter" : "failed";
+    },
+    async reap() {
+      return 0;
+    },
+    async close() {},
+    ...extra,
+  };
 }

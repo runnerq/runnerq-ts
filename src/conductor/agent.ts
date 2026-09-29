@@ -2,6 +2,9 @@ import { RunnerQError } from "../errors.js";
 import { pause } from "../async.js";
 import { reportExecutor } from "../executor.js";
 import type { Worker } from "../worker.js";
+import { isQueryStorage, QueryError, type QueryStorage } from "../query.js";
+import { Queries } from "./queries.js";
+import { Streams } from "./stream.js";
 import {
   protocolVersion,
   stateOf,
@@ -11,9 +14,11 @@ import {
   typeGoodbye,
   typeHello,
   WireError,
+  frameSlack,
   ts,
   type Capability,
   type Envelope,
+  type Handler,
   type SessionConfig,
   type Welcome,
 } from "./wire.js";
@@ -24,8 +29,6 @@ const maxMessageBytes = 4 << 20;
 const defaultReportIntervalMs = 15_000;
 /** Spaces the reports an executor's changes trigger. */
 const reportMinGapMs = 1_000;
-/** Room for the envelope around a reply's data. */
-const frameSlack = 1_024;
 
 export interface AgentConfig {
   /** The Cloud gateway, e.g. "wss://cloud.runnerq.dev". `/v1/agent` is appended when missing; http(s) maps to ws(s). */
@@ -47,8 +50,6 @@ export interface AgentConfig {
   /** Where connection problems are logged (default: console). */
   logger?: Pick<Console, "info" | "warn">;
 }
-
-type Handler = (data: unknown, signal: AbortSignal) => unknown;
 
 /**
  * Connects a worker to RunnerQ Cloud. It dials out over a WebSocket, describes the worker
@@ -77,6 +78,8 @@ export class Agent {
   private cloudMetadataOnly = false;
   private peerFrameLimit = maxMessageBytes;
   private inFlight = 0;
+  /** The worker's storage when it can be queried; queries and streams are served from it. */
+  private readonly qs?: QueryStorage;
 
   constructor(
     private readonly worker: Worker,
@@ -97,6 +100,16 @@ export class Agent {
     this.handle(typeExecutorDescribe, { v: 1 }, () =>
       stateOf(this.worker.snapshot(), this.started, true),
     );
+    const storage = worker.storage;
+    if (isQueryStorage(storage)) {
+      this.qs = storage;
+      const queries = new Queries(storage, storage, () => this.metadataOnly);
+      for (const [type, route] of Object.entries(queries.routes())) {
+        // Stream requests have no handler: they are bound to a session (see connect).
+        if (route.handler) this.handle(type, route.capability, route.handler);
+        else this.caps[type] = route.capability;
+      }
+    }
     config.signal?.addEventListener("abort", () => void this.close(), {
       once: true,
     });
@@ -166,6 +179,7 @@ export class Agent {
         headers: { Authorization: `Bearer ${this.apiKey}` },
       } as unknown as string[]);
       const session = new AbortController();
+      let streams: Streams | undefined;
       let welcomed = false;
       const handshake = setTimeout(() => {
         reject(new Error("the handshake timed out"));
@@ -174,6 +188,7 @@ export class Agent {
       const end = (code: number) => {
         clearTimeout(handshake);
         session.abort();
+        streams?.close();
         if (this.socket === ws) this.socket = undefined;
         if (welcomed) resolve(code);
         else reject(new Error(`the connection closed (${code})`));
@@ -222,22 +237,32 @@ export class Agent {
           }
           this.socket = ws;
           this.goodbyeSent = false;
+          if (this.qs)
+            streams = new Streams(this.qs, {
+              send: (type, data) =>
+                this.send(ws, { v: protocolVersion, kind: "evt", type, data }),
+              buffered: () => ws.bufferedAmount,
+              frameLimit: () => this.peerFrameLimit,
+              metadataOnly: () => this.metadataOnly,
+              log: this.log,
+            });
           void reportExecutor({
             signal: session.signal,
             source: this.worker,
             intervalMs: () => this.reportEveryMs,
             minGapMs: reportMinGapMs,
-            send: () =>
+            send: () => {
               this.send(ws, {
                 v: protocolVersion,
                 kind: "evt",
                 type: typeExecutorReport,
                 data: stateOf(this.worker.snapshot(), this.started, false),
-              }),
+              });
+            },
           });
           return;
         }
-        this.dispatch(ws, env, session.signal);
+        this.dispatch(ws, env, session.signal, streams);
       });
     });
   }
@@ -289,7 +314,12 @@ export class Agent {
       this.reportEveryMs = Math.max(config.report_interval_ms, 1_000);
   }
 
-  private dispatch(ws: WebSocket, env: Envelope, session: AbortSignal): void {
+  private dispatch(
+    ws: WebSocket,
+    env: Envelope,
+    session: AbortSignal,
+    streams?: Streams,
+  ): void {
     if (env.kind === "evt") {
       if (env.type === typeConfigUpdate)
         this.applyConfig(env.data as SessionConfig);
@@ -314,7 +344,7 @@ export class Agent {
       return;
     }
     this.inFlight++;
-    void this.serve(env, session)
+    void this.serve(env, session, streams)
       .then(
         (data) => reply({ data }),
         (error) => reply({ error: toWireError(error).body() }),
@@ -322,8 +352,12 @@ export class Agent {
       .finally(() => this.inFlight--);
   }
 
-  private async serve(env: Envelope, session: AbortSignal): Promise<unknown> {
-    const handler = this.table.get(env.type);
+  private async serve(
+    env: Envelope,
+    session: AbortSignal,
+    streams?: Streams,
+  ): Promise<unknown> {
+    const handler = this.table.get(env.type) ?? streams?.handler(env.type);
     if (!handler)
       throw new WireError(
         "unsupported",
@@ -384,12 +418,15 @@ export class Agent {
     ws.close(1000, "shutdown");
   }
 
-  private send(ws: WebSocket, env: Envelope): void {
-    if (ws.readyState !== WebSocket.OPEN) return;
+  /** Writes one frame; false when the connection can't take it. */
+  private send(ws: WebSocket, env: Envelope): boolean {
+    if (ws.readyState !== WebSocket.OPEN) return false;
     try {
       ws.send(JSON.stringify(env));
+      return true;
     } catch (error) {
       this.log.warn(`runnerq-conductor: send failed: ${describe(error)}`);
+      return false;
     }
   }
 }
@@ -433,6 +470,12 @@ function describe(error: unknown): string {
 /** Maps a handler's error to the wire. */
 export function toWireError(error: unknown): WireError {
   if (error instanceof WireError) return error;
+  if (error instanceof QueryError)
+    return new WireError(
+      error.kind,
+      error.message,
+      error.field ? { field: error.field } : undefined,
+    );
   if (error instanceof RunnerQError) {
     switch (error.code) {
       case "not_found":
