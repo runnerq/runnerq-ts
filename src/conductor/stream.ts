@@ -1,14 +1,10 @@
-// Event streams: a port of runnerq-go's conductor/stream.go.
+// Event streams (a port of runnerq-go's conductor/stream.go): tail the event log through
+// QueryStorage and push stream.events batches, resumable after a cursor so the Cloud can
+// move a stream to another executor without loss.
 //
-// Streams tail the event log through QueryStorage and push batches to the Cloud as
-// stream.events. They are resumable: a subscription starts after a cursor, so when the
-// Cloud moves the stream to another executor it loses nothing.
-//
-// Event ids grow in insertion order but a transaction can commit late, surfacing an event
-// below ids already delivered. Each poll therefore rescans the `rescan` ids below the
-// cursor and sends only ids it has not sent. A subscription resuming after a cursor treats
-// that window as already sent, so a failover does not replay it. Delivery is at least once
-// in edge cases, so consumers dedupe by event id.
+// Ids grow in insertion order, but a late commit can surface below ids already sent, so
+// each poll rescans `rescan` ids below the cursor and skips ids it sent. A resumed
+// subscription treats that window as sent. Delivery is at least once; consumers dedupe.
 import { randomUUID } from "node:crypto";
 import { pause } from "../async.js";
 import { parseInt64 } from "../codec.js";
@@ -69,7 +65,6 @@ export class Streams {
     private readonly out: StreamOutput,
   ) {}
 
-  /** The session-bound handlers. */
   handler(type: string): Handler | undefined {
     if (type === typeEventsSubscribe)
       return (d, signal) => this.subscribe(d, signal);
@@ -77,7 +72,6 @@ export class Streams {
     return undefined;
   }
 
-  /** Stops every subscription. */
   close(): void {
     this.session.abort();
     for (const sub of this.subs.values()) sub.abort();
@@ -136,8 +130,8 @@ export class Streams {
     const stop = new AbortController();
     this.subs.set(id, stop);
     const t = new Tailer(this.qs, this.out, id, filter, batch, delay, cursor);
-    // What is already in the window below the start was delivered before (or predates
-    // the subscription): only late commits into it are new.
+    // The window below the start was delivered before (or predates the subscription):
+    // only late commits into it are new.
     try {
       for (const ev of await t.window(false)) t.sent.add(BigInt(ev.id));
     } catch {
@@ -237,10 +231,7 @@ export class Tailer {
     );
   }
 
-  /**
-   * Sends late commits found in the rescan window and the next batch past the cursor;
-   * reports whether that batch was full.
-   */
+  /** Sends late commits in the rescan window and the next batch; true when the batch was full. */
   async poll(signal: AbortSignal): Promise<boolean> {
     const late = await this.window(true);
     const fresh = await this.query(this.cursor, 0n, this.batch, true);
@@ -254,11 +245,9 @@ export class Tailer {
   }
 
   /**
-   * Pushes events as stream.events frames that each fit the Cloud's frame limit (an
-   * oversized frame would drop the session, and the resumed stream would read the same
-   * batch again). An event counts as sent, and moves the cursor, only once its frame is
-   * written, so each frame's cursor covers what the Cloud has received. An event too large
-   * for a frame by itself goes without its detail.
+   * Pushes events in frames within the Cloud's limit (an oversized frame drops the session,
+   * and the resumed stream would reread the batch). Events count as sent, and move the
+   * cursor, only once their frame is written. An event too large alone loses its detail.
    */
   async send(signal: AbortSignal, events: EventRecord[]): Promise<void> {
     const budget = this.out.frameLimit() - frameSlack;
@@ -299,10 +288,9 @@ export class Tailer {
   }
 
   /**
-   * Writes one frame for the subscription. A subscription that has ended stops before
-   * writing; a write, once started, is never cut short (the socket takes the whole frame),
-   * so an unsubscribe landing during a push cannot drop the session. While the socket is
-   * backed up, the push waits for it to drain.
+   * Writes one frame, first waiting while the socket is backed up. An ended subscription
+   * stops before writing; a started write is never cut short, so an unsubscribe mid-push
+   * cannot drop the session.
    */
   async push(signal: AbortSignal, type: string, data: unknown): Promise<void> {
     while (this.out.buffered() > maxBuffered) await pause(20, signal);

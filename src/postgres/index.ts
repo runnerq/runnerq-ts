@@ -249,7 +249,7 @@ export class PostgresStorage
         }
         await verifySchema(client);
       } finally {
-        // Destroy the dedicated setup session so locks cannot leak into a pool on errors.
+        // Destroy the setup session so its advisory lock never returns to a pool.
         client.release(true);
       }
     } finally {
@@ -365,14 +365,14 @@ export class PostgresStorage
   async submit(a: Submission): Promise<string> {
     const id = await this.tx(async (c) => {
       if (a.fence) await this.fence(c, a.fence);
-      // Stable caller-generated IDs reconcile a lost commit reply, including allowReuse.
+      // Caller-generated ids make a retry after a lost commit reply idempotent (allowReuse too).
       const committed = await c.query(
         "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND id=$2",
         [this.queue, a.id],
       );
       if (committed.rowCount) return a.id;
       if (a.key) {
-        // Loop only when concurrent retention removed a key between conflict detection and locking.
+        // Loops only when retention deleted the key between the conflict and the lock.
         for (;;) {
           const fresh = await c.query(
             "INSERT INTO runnerq_idempotency(queue_name,idempotency_key,activity_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING activity_id",
@@ -478,8 +478,8 @@ export class PostgresStorage
     integer(limit, "claim limit", 1);
     integer(leaseMs, "leaseMs", 1);
     if (!types.length) return [];
-    // Tokens are "<executor>:batch:<uuid>:<activity>", as Go's: unique per claim, and the
-    // part before the first colon names the executor running it (queries' executor_id).
+    // Tokens are "<executor>:batch:<uuid>:<activity>", as Go's: unique per claim; the part
+    // before the first colon is the executor (queries' executor_id).
     const prefix =
       executorId && !executorId.includes(":")
         ? `${executorId}:batch:${randomUUID()}`
@@ -968,7 +968,7 @@ export class PostgresStorage
         return 0;
       const skipped: string[] = [];
       let removed = 0;
-      // Bound examined roots as well as deleted roots, so pinned trees cannot create unbounded transactions.
+      // Bound examined roots too, so pinned trees cannot make the transaction unbounded.
       for (
         let examined = 0;
         removed < batch && examined < batch * 10;
@@ -1008,7 +1008,6 @@ export class PostgresStorage
           await c.query("RELEASE SAVEPOINT candidate");
           continue;
         }
-        // Materialize the IDs once, then explicitly delete each payload/history table in this transaction.
         const tree = (
           await c.query(
             "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND root_activity_id=$2",
@@ -1155,7 +1154,7 @@ export class PostgresStorage
       )
     ).map((r) => this.toEvent(r));
   }
-  // QueryStorage: RunnerQ Cloud's read surface. Queries span every queue in the schema.
+  // QueryStorage (RunnerQ Cloud's reads) spans every queue in the schema.
   queryCapabilities(): QueryCapabilities {
     return queryCapabilities();
   }

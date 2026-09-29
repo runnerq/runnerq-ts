@@ -52,10 +52,9 @@ export interface AgentConfig {
 }
 
 /**
- * Connects a worker to RunnerQ Cloud. It dials out over a WebSocket, describes the worker
- * (hello), reports it as it changes and on an interval, and answers the Cloud's requests.
- * Start it with the worker; `close()` it before stopping the worker, so the Cloud records
- * a clean shutdown rather than a lost executor.
+ * Connects a worker to RunnerQ Cloud over an outbound WebSocket: describes it, reports it on
+ * change and on an interval, and answers the Cloud's requests. `close()` it before stopping
+ * the worker so the Cloud records a clean shutdown rather than a lost executor.
  */
 export class Agent {
   private readonly url: string;
@@ -78,7 +77,7 @@ export class Agent {
   private cloudMetadataOnly = false;
   private peerFrameLimit = maxMessageBytes;
   private inFlight = 0;
-  /** The worker's storage when it can be queried; queries and streams are served from it. */
+  /** The worker's storage, when queryable; queries and streams read it. */
   private readonly qs?: QueryStorage;
 
   constructor(

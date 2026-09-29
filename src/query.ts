@@ -1,18 +1,13 @@
-// The read surface RunnerQ Cloud queries through (runnerq/conductor): a general query layer
-// over activities, their events and steps (filter, sort, project, paginate, aggregate) in
-// the Cloud's canonical, backend-neutral model. A port of runnerq-go's storage.QueryStorage.
+// The read surface RunnerQ Cloud queries: activities, events and steps (filter, sort,
+// paginate, aggregate) in its backend-neutral model; a port of runnerq-go's QueryStorage.
 import type { JsonValue } from "./codec.js";
 
 /**
- * What a storage backend implements to be queried by RunnerQ Cloud. Optional: a backend
- * without it still runs activities; the agent then serves only executor messages.
- *
- * Scope: queries span every queue in the backend's database; filter on `queue` to narrow.
- * Every executor of an app therefore answers the same way.
- *
- * Backends advertise what they evaluate efficiently through `queryCapabilities()` and must
- * reject anything else with a `QueryError` ("unsupported"): never silently ignore a filter,
- * which would return wrong data.
+ * What a backend implements so RunnerQ Cloud can query it (optional: without it the agent
+ * serves only executor messages). Queries span every queue in the database, so every
+ * executor of an app answers alike. Backends advertise what they evaluate efficiently in
+ * `queryCapabilities()` and reject anything else with a `QueryError` ("unsupported"), never
+ * silently ignoring a filter.
  */
 export interface QueryStorage {
   queryCapabilities(): QueryCapabilities;
@@ -91,7 +86,6 @@ export const RecordEvent = {
   priorityChanged: "activity.priority_changed",
 } as const;
 
-/** Filter operators. */
 export type FilterOp =
   | "eq"
   | "ne"
@@ -254,10 +248,9 @@ export interface AggregateRows {
 }
 
 /**
- * Lists lifecycle events in log order. "seq" is the event's position in the log
- * (`EventRecord.id`), increasing in insertion order, so seq > cursor tails it. A
- * transaction that commits late can surface an event below an already-seen seq; tailers
- * rescan a window below their cursor to catch those.
+ * Lifecycle events in log order. "seq" (`EventRecord.id`) grows in insertion order, so
+ * seq > cursor tails the log; a late commit can land below a seen seq, so tailers rescan
+ * a window below their cursor.
  */
 export interface EventQuery {
   filter?: QueryFilter;

@@ -59,10 +59,7 @@ export interface WorkerConfig {
   maxActivityDepth?: number;
   retention?: Retention;
   metrics?: Metrics;
-  /**
-   * Free-form tags for this worker (region, deploy version). RunnerQ Cloud shows them
-   * in Fleet, whichever way the worker reports.
-   */
+  /** Free-form tags (region, deploy version) that RunnerQ Cloud shows in Fleet. */
   labels?: Readonly<Record<string, string>>;
 }
 export type ActivityHandler<I, O> = (
@@ -79,7 +76,7 @@ export class Worker
   extends EventEmitter<WorkerEvents>
   implements ExecutorSource
 {
-  /** This worker's identity: random, fixed at construction; RunnerQ Cloud's executor id. */
+  /** Random, fixed at construction; RunnerQ Cloud's executor id. */
   readonly id = randomUUID();
   private readonly config: Required<
     Pick<
@@ -204,10 +201,7 @@ export class Worker
   get storage(): Storage {
     return this.config.storage;
   }
-  /**
-   * The worker as it is now: who it is, what it's running, and what it has done since it
-   * was built. RunnerQ Cloud's agent and storage adapter report it.
-   */
+  /** Who the worker is, what it runs now and what it has done since it was built. */
   snapshot(): ExecutorSnapshot {
     return {
       info: {
@@ -232,14 +226,10 @@ export class Worker
       at: new Date(),
     };
   }
-  /** Resolves at the next change: an activity starting or finishing, or a drain beginning. */
   changed(): Promise<void> {
     return this.changes.changed();
   }
-  /**
-   * Tells `observer` when this worker starts and stops, so it can report it. A storage
-   * backend that is an observer is attached without asking. Call before `start()`.
-   */
+  /** Tells `observer` of start and stop (call before `start()`); observer storages join unasked. */
   observe(observer: ExecutorObserver): this {
     if (this.state !== "idle")
       throw new RunnerQError(
@@ -398,7 +388,7 @@ export class Worker
           signal ?? (persistence ? this.lifetime.signal : handlerSignal),
           async () => {
             this.metric(() => metrics?.increment("storage_retry", 1));
-            // For uncertain writes, let the write reconcile before acting on lost ownership.
+            // An uncertain write may have landed: only a failed renew means ownership is lost.
             try {
               const owned = await storage.renew(fence, config.leaseMs);
               if (!owned && !persistence)
@@ -481,7 +471,7 @@ export class Worker
       error = cause;
       failed = true;
     }
-    // Account for SDK calls started but not awaited by user code before transitioning ownership.
+    // Settle SDK calls the handler started but didn't await before giving up ownership.
     const outstanding = await Promise.allSettled([...scope.pending]);
     if (!failed) {
       const rejection = outstanding.find((x) => x.status === "rejected");
@@ -511,8 +501,8 @@ export class Worker
         this.publish("activityYielded", event);
         return;
       }
-      // Checkpoint recovery may have outlived the handler deadline. A successfully captured
-      // handler result is still worth committing under the ownership fence, matching Go.
+      // Checkpoint recovery may outlive the deadline; a captured result still commits under
+      // the fence, as in Go.
       if (!failed) {
         let data;
         try {
@@ -587,9 +577,8 @@ export class Worker
       new RunnerQError("timeout", "Worker shutdown budget expired"),
     );
     this.state = "stopped";
-    // Observers may send a goodbye: wait for them, but never longer than the grace
-    // period (at least a second, so a zero-grace stop can still say goodbye). Each
-    // catches its own error, so none rejects.
+    // Observers may send a goodbye: wait up to the grace period, at least a second so a
+    // zero-grace stop can still say goodbye.
     const observerBudget = Math.max(graceMs, 1_000);
     await Promise.all(
       this.observers.map(async (observer) => {
@@ -641,8 +630,8 @@ export class Worker
   ): void {
     if (name.startsWith("activity") || name === "claimLost")
       this.metric(() => this.config.metrics?.increment(name, 1));
-    // Invoke a snapshot of native listeners, preserving once() wrappers. Each observer is
-    // isolated, so one throw cannot prevent later observers or change committed outcomes.
+    // A copy of the raw listeners keeps once() wrappers; each is isolated so a throw cannot
+    // skip later listeners or change a committed outcome.
     for (const listener of this.rawListeners(name)) {
       try {
         const result = (

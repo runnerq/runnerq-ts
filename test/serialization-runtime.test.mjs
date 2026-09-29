@@ -160,7 +160,7 @@ integration(
     await client.signalByKey(Portable, "order-1", "decision", {
       accepted: true,
     });
-    // The persisted input format, not the worker's current definition default, determines output format.
+    // The stored input's format, not the definition's current default, picks the output's.
     const worker = new Worker({ storage });
     worker.register(activity("PortableBoundary"), async (ctx, input) => {
       const step = await ctx.run(

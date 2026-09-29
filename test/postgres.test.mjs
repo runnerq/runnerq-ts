@@ -46,7 +46,7 @@ for (const expiry of [false, true]) {
             assert.equal((await storage.claim(1, [a.type], 60000)).length, 0);
           } else {
             assert.equal(await storage.getResult(a.id), null);
-            // Advance only the retry schedule so the test exercises multiple real claims without sleeping.
+            // Skip the retry delay: several real claims without sleeping.
             await pool.query(
               "UPDATE runnerq_activities SET scheduled_at=NOW() WHERE queue_name=$1 AND id=$2",
               [queue, a.id],

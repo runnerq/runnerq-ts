@@ -17,7 +17,7 @@ export class Notifications {
     private readonly pool: Pool,
     private readonly queue: string,
   ) {
-    // Waiters explicitly unsubscribe; capacity is bounded by callers, not by a shared listener limit.
+    // Waiters unsubscribe themselves; callers bound how many there are.
     this.bus.setMaxListeners(0);
   }
   private channel(kind: string): string {
@@ -45,8 +45,8 @@ export class Notifications {
         }
       });
       try {
-        // pg can leave connect() pending when end() is called during the
-        // handshake. Observe disconnection too so close() can join this loop.
+        // pg can leave connect() pending when end() interrupts the handshake; racing
+        // the disconnect lets close() join this loop.
         await Promise.race([
           client.connect(),
           ended.then(() => {
@@ -59,7 +59,7 @@ export class Notifications {
         this.bus.emit("reconnect");
         if (!this.lifetime.signal.aborted) await ended;
       } catch {
-        /* fallback probes preserve progress while disconnected */
+        /* waiters' timeouts keep polling while disconnected */
       } finally {
         await client.end().catch(() => {});
       }
@@ -95,7 +95,7 @@ export class Notifications {
       jobs.push([this.channel("r"), ids.slice(i, i + 200).join(",")]);
     this.work = false;
     this.results.clear();
-    // These transactions never contain activity writes.
+    // Outside the activity transactions, so a hint never precedes its commit.
     for (const job of jobs)
       await this.pool.query("SELECT pg_notify($1,$2)", job).catch(() => {});
   }

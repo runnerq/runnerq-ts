@@ -20,7 +20,6 @@ export interface ExecutorSdk {
   version: string;
   language: string;
 }
-/** An activity the executor is running. */
 export interface RunningActivity {
   id: string;
   type: string;
@@ -57,19 +56,17 @@ export interface ExecutorSnapshot {
   counters: ExecutorCounters;
   at: Date;
 }
-/** Anything that can describe an executor: the Worker is one. */
+/** Anything that can describe an executor, such as a Worker. */
 export interface ExecutorSource {
   snapshot(): ExecutorSnapshot;
   /** Resolves at the next change: an activity starting or finishing, or a drain beginning. */
   changed?(): Promise<void>;
 }
 /**
- * Hears a worker start and stop, and reads its snapshots from the source on its own
- * schedule. A worker calls every observer given to `observe()`, and its storage when the
- * storage is an observer (RunnerQ Cloud's storage adapter reports hosted workers this way).
- * Both calls must return promptly; `executorStopped` may return a promise the worker awaits,
- * so a final report can be sent, for up to the stop's grace period (at least a second).
- * Past that, or if it fails, the worker reports a `workerError` and finishes stopping.
+ * Hears a worker start and stop and reads its snapshots on its own schedule: every observer
+ * given to `observe()`, and the storage when it is one (RunnerQ Cloud's hosted adapter).
+ * Both calls must return promptly; the worker awaits `executorStopped`'s promise (for a final
+ * report) up to the stop's grace period, at least a second, then reports a `workerError`.
  */
 export interface ExecutorObserver {
   executorStarted(source: ExecutorSource): void;
@@ -111,10 +108,9 @@ export interface ReportOptions {
   send: () => void | Promise<void>;
 }
 /**
- * Calls `send` now, then every interval until the signal aborts, and soon after each change
- * when the source signals changes, but never sooner than `minGapMs` after the previous
- * send: changes in the meantime go out together in the next report. Errors from `send` are
- * the caller's to handle; they don't stop the loop.
+ * Calls `send` now, then every interval and soon after each change, but never sooner than
+ * `minGapMs` after the previous send, until the signal aborts. Errors from `send` are the
+ * caller's to handle; they don't stop the loop.
  */
 export async function reportExecutor(options: ReportOptions): Promise<void> {
   const { signal, source } = options;
