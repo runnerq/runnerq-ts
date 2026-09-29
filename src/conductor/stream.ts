@@ -1,14 +1,10 @@
-// Event streams: a port of runnerq-go's conductor/stream.go.
+// Event streams (a port of runnerq-go's conductor/stream.go): tail the event log through
+// QueryStorage and push stream.events batches, resumable after a cursor so the Cloud can
+// move a stream to another executor without loss.
 //
-// Streams tail the event log through QueryStorage and push batches to the Cloud as
-// stream.events. They are resumable: a subscription starts after a cursor, so when the
-// Cloud moves the stream to another executor it loses nothing.
-//
-// Event ids grow in insertion order but a transaction can commit late, surfacing an event
-// below ids already delivered. Each poll therefore rescans the `rescan` ids below the
-// cursor and sends only ids it has not sent. A subscription resuming after a cursor treats
-// that window as already sent, so a failover does not replay it. Delivery is at least once
-// in edge cases, so consumers dedupe by event id.
+// Ids grow in insertion order, but a late commit can surface below ids already sent, so
+// each poll rescans `rescan` ids below the cursor and skips ids it sent. A resumed
+// subscription treats that window as sent. Delivery is at least once; consumers dedupe.
 import { randomUUID } from "node:crypto";
 import { pause } from "../async.js";
 import { parseInt64 } from "../codec.js";
@@ -17,6 +13,7 @@ import { decodeRequest, type Spec } from "./decode.js";
 import { filterSpec, toEvent } from "./queries.js";
 import {
   WireError,
+  describe,
   frameSlack,
   typeEventsSubscribe,
   typeEventsUnsubscribe,
@@ -37,11 +34,10 @@ const maxBuffered = 8 << 20;
 
 /** Where a session's streams write. */
 export interface StreamOutput {
-  /** Writes one event frame; false when the connection can't take it. */
-  send(type: string, data: unknown): boolean;
+  /** Writes one event frame with `data` (JSON text); false when the connection can't take it. */
+  send(type: string, data: string): boolean;
   /** Bytes queued on the socket and not yet written. */
   buffered(): number;
-  /** The Cloud's frame limit. */
   frameLimit(): number;
   metadataOnly(): boolean;
   log: Pick<Console, "warn">;
@@ -69,7 +65,6 @@ export class Streams {
     private readonly out: StreamOutput,
   ) {}
 
-  /** The session-bound handlers. */
   handler(type: string): Handler | undefined {
     if (type === typeEventsSubscribe)
       return (d, signal) => this.subscribe(d, signal);
@@ -77,7 +72,6 @@ export class Streams {
     return undefined;
   }
 
-  /** Stops every subscription. */
   close(): void {
     this.session.abort();
     for (const sub of this.subs.values()) sub.abort();
@@ -136,8 +130,8 @@ export class Streams {
     const stop = new AbortController();
     this.subs.set(id, stop);
     const t = new Tailer(this.qs, this.out, id, filter, batch, delay, cursor);
-    // What is already in the window below the start was delivered before (or predates
-    // the subscription): only late commits into it are new.
+    // The window below the start was delivered before (or predates the subscription):
+    // only late commits into it are new.
     try {
       for (const ev of await t.window(false)) t.sent.add(BigInt(ev.id));
     } catch {
@@ -146,10 +140,11 @@ export class Streams {
     void (async () => {
       try {
         if (gap)
-          await t.push(stop.signal, typeStreamGap, {
-            subscription_id: id,
-            since_cursor: after,
-          });
+          await t.push(
+            stop.signal,
+            typeStreamGap,
+            JSON.stringify({ subscription_id: id, since_cursor: after }),
+          );
         await t.run(stop.signal);
       } catch {
         /* the subscription ended */
@@ -200,7 +195,7 @@ export class Tailer {
       } catch (error) {
         if (signal.aborted) return;
         this.out.log.warn(
-          `runnerq-conductor: event stream ${this.id} poll failed; retrying: ${error instanceof Error ? error.message : String(error)}`,
+          `runnerq-conductor: event stream ${this.id} poll failed; retrying: ${describe(error)}`,
         );
       }
       next = full ? 0 : this.delayMs; // catching up: keep reading
@@ -237,10 +232,7 @@ export class Tailer {
     );
   }
 
-  /**
-   * Sends late commits found in the rescan window and the next batch past the cursor;
-   * reports whether that batch was full.
-   */
+  /** Sends late commits in the rescan window and the next batch; true when the batch was full. */
   async poll(signal: AbortSignal): Promise<boolean> {
     const late = await this.window(true);
     const fresh = await this.query(this.cursor, 0n, this.batch, true);
@@ -254,26 +246,25 @@ export class Tailer {
   }
 
   /**
-   * Pushes events as stream.events frames that each fit the Cloud's frame limit (an
-   * oversized frame would drop the session, and the resumed stream would read the same
-   * batch again). An event counts as sent, and moves the cursor, only once its frame is
-   * written, so each frame's cursor covers what the Cloud has received. An event too large
-   * for a frame by itself goes without its detail.
+   * Pushes events in frames within the Cloud's limit (an oversized frame drops the session,
+   * and the resumed stream would reread the batch). Events count as sent, and move the
+   * cursor, only once their frame is written. An event too large alone loses its detail.
    */
   async send(signal: AbortSignal, events: EventRecord[]): Promise<void> {
     const budget = this.out.frameLimit() - frameSlack;
-    let items: Record<string, unknown>[] = [];
+    // Items stay JSON text: each is serialized once, to size it and to send it.
+    let items: string[] = [];
     let ids: bigint[] = [];
     let size = 0;
     const flush = async () => {
       if (!items.length) return;
       let cursor = this.cursor;
       for (const id of ids) if (id > cursor) cursor = id;
-      await this.push(signal, typeStreamEvents, {
-        subscription_id: this.id,
-        items,
-        cursor: cursor.toString(),
-      });
+      await this.push(
+        signal,
+        typeStreamEvents,
+        `{"subscription_id":${JSON.stringify(this.id)},"items":[${items.join(",")}],"cursor":"${cursor}"}`,
+      );
       for (const id of ids) this.sent.add(id);
       this.cursor = cursor;
       items = [];
@@ -282,16 +273,18 @@ export class Tailer {
     };
     for (const ev of events) {
       const item = toEvent(ev);
-      let n = encodedSize(item);
+      let json = JSON.stringify(item);
+      let n = Buffer.byteLength(json);
       if (budget > 0 && n > budget && "detail" in item) {
         this.out.log.warn(
           `runnerq-conductor: event ${ev.id} detail is ${n} bytes, over the ${budget}-byte frame limit; streaming the event without it`,
         );
         delete item.detail;
-        n = encodedSize(item);
+        json = JSON.stringify(item);
+        n = Buffer.byteLength(json);
       }
       if (budget > 0 && items.length && size + n + 1 > budget) await flush();
-      items.push(item);
+      items.push(json);
       ids.push(BigInt(ev.id));
       size += n + 1;
     }
@@ -299,19 +292,14 @@ export class Tailer {
   }
 
   /**
-   * Writes one frame for the subscription. A subscription that has ended stops before
-   * writing; a write, once started, is never cut short (the socket takes the whole frame),
-   * so an unsubscribe landing during a push cannot drop the session. While the socket is
-   * backed up, the push waits for it to drain.
+   * Writes one frame, first waiting while the socket is backed up. An ended subscription
+   * stops before writing; a started write is never cut short, so an unsubscribe mid-push
+   * cannot drop the session.
    */
-  async push(signal: AbortSignal, type: string, data: unknown): Promise<void> {
+  async push(signal: AbortSignal, type: string, data: string): Promise<void> {
     while (this.out.buffered() > maxBuffered) await pause(20, signal);
     signal.throwIfAborted();
     if (!this.out.send(type, data))
       throw new Error("the connection is not open");
   }
-}
-
-function encodedSize(v: unknown): number {
-  return Buffer.byteLength(JSON.stringify(v));
 }

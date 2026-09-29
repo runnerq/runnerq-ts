@@ -1,8 +1,10 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { transient } from "./errors.js";
+/** setTimeout's longest delay. */
+export const maxTimerMs = 2_147_483_647;
 export async function pause(ms: number, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
-  await delay(Math.max(1, Math.min(ms, 2_147_483_647)), undefined, { signal });
+  await delay(Math.max(1, Math.min(ms, maxTimerMs)), undefined, { signal });
 }
 export async function recover<T>(
   operation: () => Promise<T>,
@@ -21,4 +23,44 @@ export async function recover<T>(
       backoff = Math.min(backoff * 2, 30_000);
     }
   }
+}
+/**
+ * `AbortSignal.any(sources)`, plus `AbortSignal.timeout(timeoutMs)` when given, with the
+ * same reasons; `done()` detaches it from the sources and clears its timer at once, where
+ * those stay registered until a source aborts or the deadline passes.
+ */
+export function linkSignal(
+  sources: readonly AbortSignal[],
+  timeoutMs?: number,
+): { signal: AbortSignal; done: () => void } {
+  const link = new AbortController();
+  const aborted = sources.find((source) => source.aborted);
+  if (aborted) {
+    link.abort(aborted.reason);
+    return { signal: link.signal, done: () => {} };
+  }
+  const follow = (event: Event) =>
+    link.abort((event.target as AbortSignal).reason);
+  for (const source of sources)
+    source.addEventListener("abort", follow, { once: true });
+  const timer =
+    timeoutMs === undefined
+      ? undefined
+      : setTimeout(
+          () =>
+            link.abort(
+              new DOMException(
+                "The operation was aborted due to timeout",
+                "TimeoutError",
+              ),
+            ),
+          timeoutMs,
+        ).unref();
+  return {
+    signal: link.signal,
+    done: () => {
+      clearTimeout(timer);
+      for (const source of sources) source.removeEventListener("abort", follow);
+    },
+  };
 }

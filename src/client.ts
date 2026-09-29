@@ -46,8 +46,7 @@ export class ActivityHandle<O> {
         );
       return this.decode(await track(scope, () => scope.wait(this.id)));
     }
-    const stored = await this.storage.waitResult(this.id, options.signal);
-    return this.decode(stored);
+    return this.decode(await this.storage.waitResult(this.id, options.signal));
   }
   decode(stored: StoredResult): O {
     const value = unwrap<O>(this.id, stored);

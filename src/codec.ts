@@ -23,16 +23,23 @@ export function json(value: unknown): JsonValue {
     if (Array.isArray(v))
       out = Array.from(v, (x, i) => visit(x, `${path}[${i}]`));
     else {
-      out = {};
+      const copy: { [key: string]: JsonValue } = {};
       if (Object.getOwnPropertySymbols(v).length)
         throw new RunnerQError("serialization", `Symbol keys at ${path}`);
-      for (const [k, x] of Object.entries(v))
-        Object.defineProperty(out, k, {
-          value: visit(x, `${path}.${k}`),
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        });
+      for (const [k, x] of Object.entries(v)) {
+        const item = visit(x, `${path}.${k}`);
+        // Assignment (twice as fast) makes the same own property, except for keys on
+        // Object.prototype: its __proto__ setter, or a polluter's.
+        if (k in Object.prototype)
+          Object.defineProperty(copy, k, {
+            value: item,
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
+        else copy[k] = item;
+      }
+      out = copy;
     }
     ancestors.delete(v);
     return out;

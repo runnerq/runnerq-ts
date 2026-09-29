@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { Client, type Pool, type ClientConfig } from "pg";
-import { pause } from "../async.js";
+import { linkSignal, pause } from "../async.js";
 
 /** Notifications are bounded, lossy hints. Every consumer must recheck stored data. */
 export class Notifications {
@@ -11,20 +11,18 @@ export class Notifications {
   private flushTimer?: NodeJS.Timeout;
   private flushing?: Promise<void>;
   private work = false;
-  private results = new Set<string>();
+  private readonly results = new Set<string>();
+  private readonly workChannel: string;
+  private readonly resultChannel: string;
   constructor(
     private readonly config: ClientConfig,
     private readonly pool: Pool,
-    private readonly queue: string,
+    queue: string,
   ) {
-    // Waiters explicitly unsubscribe; capacity is bounded by callers, not by a shared listener limit.
+    this.workChannel = `rq_w_${queue}`;
+    this.resultChannel = `rq_r_${queue}`;
+    // Waiters unsubscribe themselves; callers bound how many there are.
     this.bus.setMaxListeners(0);
-  }
-  private channel(kind: string): string {
-    return `rq_${kind}_${this.queue}`;
-  }
-  private start(): void {
-    this.listening ??= this.listen();
   }
   private async listen(): Promise<void> {
     let retry = 100;
@@ -38,28 +36,27 @@ export class Notifications {
       client.on("error", disconnected);
       client.on("end", disconnected);
       client.on("notification", (notification) => {
-        if (notification.channel === this.channel("w")) this.bus.emit("work");
-        if (notification.channel === this.channel("r")) {
+        if (notification.channel === this.workChannel) this.bus.emit("work");
+        else if (notification.channel === this.resultChannel)
           for (const id of (notification.payload ?? "").split(","))
             this.bus.emit(`result:${id}`);
-        }
       });
       try {
-        // pg can leave connect() pending when end() is called during the
-        // handshake. Observe disconnection too so close() can join this loop.
+        // pg can leave connect() pending when end() interrupts the handshake; racing
+        // the disconnect lets close() join this loop.
         await Promise.race([
           client.connect(),
           ended.then(() => {
             throw new Error("Notification connection ended during startup");
           }),
         ]);
-        for (const kind of ["w", "r"])
-          await client.query(`LISTEN "${this.channel(kind)}"`);
+        for (const channel of [this.workChannel, this.resultChannel])
+          await client.query(`LISTEN "${channel}"`);
         retry = 100;
         this.bus.emit("reconnect");
         if (!this.lifetime.signal.aborted) await ended;
       } catch {
-        /* fallback probes preserve progress while disconnected */
+        /* waiters' timeouts keep polling while disconnected */
       } finally {
         await client.end().catch(() => {});
       }
@@ -88,22 +85,34 @@ export class Notifications {
       }, 50).unref();
   }
   private async flush(): Promise<void> {
-    const jobs: [string, string][] = [];
-    if (this.work) jobs.push([this.channel("w"), ""]);
+    const channels: string[] = [],
+      payloads: string[] = [];
+    if (this.work) {
+      channels.push(this.workChannel);
+      payloads.push("");
+    }
     const ids = [...this.results];
-    for (let i = 0; i < ids.length; i += 200)
-      jobs.push([this.channel("r"), ids.slice(i, i + 200).join(",")]);
+    for (let i = 0; i < ids.length; i += 200) {
+      channels.push(this.resultChannel);
+      payloads.push(ids.slice(i, i + 200).join(","));
+    }
     this.work = false;
     this.results.clear();
-    // These transactions never contain activity writes.
-    for (const job of jobs)
-      await this.pool.query("SELECT pg_notify($1,$2)", job).catch(() => {});
+    if (!channels.length) return;
+    // Every pending hint in one statement, outside the activity transactions, so a hint
+    // never precedes its commit.
+    await this.pool
+      .query(
+        "SELECT pg_notify(c,p) FROM unnest($1::text[],$2::text[]) AS n(c,p)",
+        [channels, payloads],
+      )
+      .catch(() => {});
   }
   subscribe(
     name: string,
     signal?: AbortSignal,
   ): { wait: (ms: number) => Promise<void>; close: () => void } {
-    this.start();
+    this.listening ??= this.listen();
     let dirty = false;
     let wake: (() => void) | undefined;
     const listener = () => {
@@ -112,7 +121,7 @@ export class Notifications {
     };
     this.bus.on(name, listener);
     this.bus.on("reconnect", listener);
-    const stop = AbortSignal.any(
+    const { signal: stop, done: unlink } = linkSignal(
       signal ? [signal, this.lifetime.signal] : [this.lifetime.signal],
     );
     return {
@@ -123,26 +132,27 @@ export class Notifications {
           return;
         }
         await new Promise<void>((resolve, reject) => {
-          const done = () => {
+          const settle = () => {
             clearTimeout(timer);
             stop.removeEventListener("abort", abort);
             wake = undefined;
+          };
+          const done = () => {
+            settle();
             dirty = false;
             resolve();
           };
           const abort = () => {
-            clearTimeout(timer);
-            stop.removeEventListener("abort", abort);
-            wake = undefined;
+            settle();
             reject(stop.reason);
           };
           const timer = setTimeout(done, ms);
           wake = done;
           stop.addEventListener("abort", abort, { once: true });
-          if (stop.aborted) abort();
         });
       },
       close: () => {
+        unlink();
         this.bus.off(name, listener);
         this.bus.off("reconnect", listener);
         wake?.();

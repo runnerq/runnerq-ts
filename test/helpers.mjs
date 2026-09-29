@@ -66,7 +66,6 @@ export async function until(fn, timeout = 10_000, what = "Condition") {
   }
   throw new Error(`${what} timed out`);
 }
-/** A logger that drops everything. */
 export const quiet = { info() {}, warn() {} };
 // fakeStorage hands out queued claims and records outcomes; nothing is durable.
 export function fakeStorage(extra = {}) {

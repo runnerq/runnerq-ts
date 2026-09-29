@@ -111,10 +111,7 @@ export interface StepRecord extends StoredResult {
 export interface Storage {
   readonly queue: string;
   submit(activity: Submission): Promise<string>;
-  /**
-   * `executorId` is the claiming worker's id: a backend that can should record it with the
-   * claim, so queries can say which executor runs an activity.
-   */
+  /** Backends that can should record `executorId` (the worker's id) for queries' executor_id. */
   claim(
     limit: number,
     types: readonly string[],

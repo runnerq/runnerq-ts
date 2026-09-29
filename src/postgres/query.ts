@@ -1,7 +1,6 @@
-// QueryStorage for PostgreSQL: a general, cross-queue query layer over the activity, event
-// and result tables, in the canonical model RunnerQ Cloud speaks. A port of runnerq-go's
-// storage/postgres/query.go over the same schema. Filters compile to parameterised SQL;
-// nothing from a query is ever spliced into SQL text except whitelisted expressions.
+// QueryStorage for PostgreSQL across every queue (a port of runnerq-go's
+// storage/postgres/query.go). Filters compile to parameterised SQL: only whitelisted
+// expressions are ever spliced into SQL text.
 import { RunnerQError } from "../errors.js";
 import {
   businessKey,
@@ -88,8 +87,7 @@ const activityFields: Record<string, Field> = {
 };
 
 const eventFields: Record<string, Field> = {
-  // seq is the event's position in the log (its cursor): increasing, so "seq > cursor"
-  // tails the log.
+  // The log position (cursor): increasing, so "seq > cursor" tails the log.
   seq: { expr: "e.id", kind: "int" },
   activity_id: { expr: "e.activity_id", kind: "uuid" },
   queue: { expr: "e.queue_name", kind: "string" },
@@ -160,7 +158,6 @@ export function canonicalEvent(internal: string): string {
     ? canonicalEvents[internal]!
     : "other." + internal.toLowerCase();
 }
-/** The internal event names a canonical type covers. */
 export function internalEvents(canonical: string): string[] {
   const out = Object.entries(canonicalEvents)
     .filter(([, c]) => c === canonical)
@@ -182,16 +179,12 @@ export function queryCapabilities(): QueryCapabilities {
   };
 }
 
-// --- values ---
-
 /** Formats a percentile label as Go does ("p99.9", never exponent notation). */
 function percentileLabel(p: number): string {
   let s = String(p);
   if (/e/i.test(s)) s = p.toFixed(20).replace(/\.?0+$/, "");
   return "p" + s;
 }
-
-// --- filter compilation ---
 
 type Values = { type: string; values: unknown[] } | null;
 
@@ -307,9 +300,9 @@ export class SqlBuilder {
     );
   }
   /**
-   * Matches the application's key (see applicationIdempotencyKey) against how it is
-   * stored: as a v2 business key for the row's own type, or as is. Step-derived keys are not application keys. Encoded keys can't be matched by
-   * prefix or substring.
+   * Matches the application's key (see applicationIdempotencyKey) as stored: a v2 business
+   * key for the row's type, or as is; step-derived keys never match. Encoded keys can't be
+   * matched by prefix or substring.
    */
   private idempotencyKey(f: QueryFilter): string {
     const stored = "a.idempotency_key";
@@ -377,10 +370,7 @@ function list(field: string, op: string, value: unknown): unknown[] {
   return value;
 }
 
-/**
- * Converts decoded JSON values to typed SQL parameters for the field. Returns null when no
- * value can possibly match.
- */
+/** Decoded JSON values as typed SQL parameters for the field; null when none can match. */
 function convertValues(field: string, kind: Kind, raw: unknown[]): Values {
   switch (kind) {
     case "string":
@@ -436,8 +426,6 @@ function convertValues(field: string, kind: Kind, raw: unknown[]): Values {
   }
 }
 
-// --- cursors ---
-
 export function encodeCursor(v: unknown): string {
   return Buffer.from(JSON.stringify(v)).toString("base64url");
 }
@@ -484,8 +472,6 @@ export function clampLimit(
   return Math.min(Math.trunc(limit), max);
 }
 
-// --- idempotency keys ---
-
 const businessKeyPrefix = "rq:key:v2:";
 /** Starts the keys the engine derives for activities spawned by a step. */
 const stepKeyPrefix = "rq:step:";
@@ -510,9 +496,8 @@ function decodeBusinessKey(
   }
 }
 /**
- * The key the application set, from the key as stored and the activity's type. Stored
- * keys are v2 business keys, keys written directly through the storage API (returned as
- * they are), or keys derived for a step's child ("").
+ * The key the application set, from the stored key and the activity's type: a v2 business
+ * key decoded, a key written through the storage API as is, or "" for a step child's key.
  */
 export function applicationIdempotencyKey(
   stored: string,
@@ -522,8 +507,6 @@ export function applicationIdempotencyKey(
   const business = decodeBusinessKey(stored);
   return business?.type === type ? business.key : stored;
 }
-
-// --- activities ---
 
 function activitySelect(inc: RecordInclude): { cols: string; joins: string } {
   let cols = `a.id, a.activity_type, a.queue_name, a.status, a.priority,
@@ -652,7 +635,7 @@ function scanRecord(r: Row, inc: RecordInclude): ActivityRecord {
   return rec;
 }
 
-/** Runs a query and reports storage failures, never a raw driver error. */
+/** The query layer over `run`, which reports storage failures, never raw driver errors. */
 export class PostgresQueries {
   constructor(private readonly run: Run) {}
 
@@ -714,7 +697,6 @@ export class PostgresQueries {
     return page;
   }
 
-  /** Counts matches, stopping at limit. */
   async count(
     filter: QueryFilter | undefined,
     limit: number,
@@ -730,7 +712,6 @@ export class PostgresQueries {
     return n > max ? { count: max, exact: false } : { count: n, exact: true };
   }
 
-  /** Groups activities and computes counts and duration percentiles, optionally bucketed. */
   async aggregate(q: AggregateQuery): Promise<AggregateRows> {
     if (!q.count && !q.durations?.length)
       throw invalid("metrics", "ask for at least one metric");
@@ -841,7 +822,6 @@ export class PostgresQueries {
     return out;
   }
 
-  /** Lifecycle events in log order. */
   async events(q: EventQuery): Promise<EventRecordPage> {
     const limit = clampLimit(q.limit, defaultQueryLimit, maxQueryLimit);
     const sb = new SqlBuilder();
@@ -879,7 +859,6 @@ export class PostgresQueries {
     return page;
   }
 
-  /** An activity's durable steps, oldest first. */
   async steps(
     activityId: string,
     includeData: boolean,
@@ -938,7 +917,6 @@ export class PostgresQueries {
     return page;
   }
 
-  /** The tree the activity belongs to, root first. */
   async tree(
     activityId: string,
     inc: RecordInclude,

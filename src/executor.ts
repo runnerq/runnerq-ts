@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { hostname as osHostname } from "node:os";
-import { pause } from "./async.js";
+import { maxTimerMs, pause } from "./async.js";
 
 /** Who an executor (a started worker) is. */
 export interface ExecutorInfo {
@@ -20,14 +20,12 @@ export interface ExecutorSdk {
   version: string;
   language: string;
 }
-/** An activity the executor is running. */
 export interface RunningActivity {
   id: string;
   type: string;
   attempt: number;
   startedAt: Date;
 }
-/** What the executor is doing now. */
 export interface ExecutorState {
   running: RunningActivity[];
   /** A stop has begun: intake has stopped and running activities finish. */
@@ -57,19 +55,17 @@ export interface ExecutorSnapshot {
   counters: ExecutorCounters;
   at: Date;
 }
-/** Anything that can describe an executor: the Worker is one. */
+/** Anything that can describe an executor, such as a Worker. */
 export interface ExecutorSource {
   snapshot(): ExecutorSnapshot;
   /** Resolves at the next change: an activity starting or finishing, or a drain beginning. */
   changed?(): Promise<void>;
 }
 /**
- * Hears a worker start and stop, and reads its snapshots from the source on its own
- * schedule. A worker calls every observer given to `observe()`, and its storage when the
- * storage is an observer (RunnerQ Cloud's storage adapter reports hosted workers this way).
- * Both calls must return promptly; `executorStopped` may return a promise the worker awaits,
- * so a final report can be sent, for up to the stop's grace period (at least a second).
- * Past that, or if it fails, the worker reports a `workerError` and finishes stopping.
+ * Hears a worker start and stop and reads its snapshots on its own schedule: every observer
+ * given to `observe()`, and the storage when it is one (RunnerQ Cloud's hosted adapter).
+ * Both calls must return promptly; the worker awaits `executorStopped`'s promise (for a final
+ * report) up to the stop's grace period, at least a second, then reports a `workerError`.
  */
 export interface ExecutorObserver {
   executorStarted(source: ExecutorSource): void;
@@ -111,40 +107,56 @@ export interface ReportOptions {
   send: () => void | Promise<void>;
 }
 /**
- * Calls `send` now, then every interval until the signal aborts, and soon after each change
- * when the source signals changes, but never sooner than `minGapMs` after the previous
- * send: changes in the meantime go out together in the next report. Errors from `send` are
- * the caller's to handle; they don't stop the loop.
+ * Calls `send` now, then every interval and soon after each change, but never sooner than
+ * `minGapMs` after the previous send, until the signal aborts. Errors from `send` are the
+ * caller's to handle; they don't stop the loop.
  */
 export async function reportExecutor(options: ReportOptions): Promise<void> {
   const { signal, source } = options;
+  // One reaction per change promise: racing it on every wait instead would pile reactions
+  // onto an unchanged one for as long as the source stays idle.
+  let watched: Promise<void> | undefined,
+    changed = false,
+    wake: (() => void) | undefined;
   while (!signal.aborted) {
     // Taken before the send, so a change during it isn't missed.
-    const changed = source.changed?.();
+    const next = source.changed?.();
+    if (next !== watched) {
+      watched = next;
+      changed = false;
+      void next?.then(() => {
+        if (watched !== next) return;
+        changed = true;
+        wake?.();
+      });
+    }
     try {
       await options.send();
     } catch {
       /* the next report retries */
     }
     const sent = Date.now();
-    // Each wait cancels its own timer, so a change doesn't leave one behind.
-    const wait = new AbortController();
-    const waiting = AbortSignal.any([signal, wait.signal]);
-    let byChange = false;
-    await Promise.race([
-      pause(options.intervalMs(), waiting).catch(() => {}),
-      changed?.then(() => {
-        byChange = true;
-      }) ?? new Promise<never>(() => {}),
-    ]);
-    wait.abort();
-    if (byChange && !signal.aborted)
+    if (!changed && !signal.aborted)
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", done);
+          wake = undefined;
+          resolve();
+        };
+        const timer = setTimeout(
+          done,
+          Math.min(options.intervalMs(), maxTimerMs),
+        );
+        wake = done;
+        signal.addEventListener("abort", done, { once: true });
+      });
+    if (changed && !signal.aborted)
       await pause(sent + options.minGapMs - Date.now(), signal).catch(() => {});
   }
 }
 
 let sdk: ExecutorSdk | undefined;
-/** Names the runnerq SDK in this process. */
 export function thisSdk(): ExecutorSdk {
   if (!sdk) {
     let version = "unknown";

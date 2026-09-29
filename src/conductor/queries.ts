@@ -38,8 +38,6 @@ const countLimit = 100_000;
 const recordIncludes = ["last_error", "payload", "result"];
 const getIncludes = ["events", "last_error", "payload", "result", "steps"];
 
-// --- requests ---
-
 interface WireSort {
   field?: string;
   order?: string;
@@ -132,15 +130,10 @@ function fieldError(
 }
 const quote = (s: string) => JSON.stringify(s);
 
-// --- views ---
-
 /**
- * The plain JSON a stored value shows the user. "json-v1" values are that JSON as stored.
- * "superjson-v1" values are decoded with the SDK's own decoder and, when the result is
- * plain JSON, sent as it is; otherwise (Dates, Maps, bigints, custom recipes...) as
- * SuperJSON's `json` part, its JSON-safe projection (Dates as ISO strings, Maps as entry
- * pairs, bigints as strings), never with SuperJSON's type metadata. A value that won't
- * decode is shown as stored rather than failing the query.
+ * The plain JSON a stored value shows the user: "json-v1" as stored; "superjson-v1" decoded,
+ * or, when that isn't plain JSON (Dates, Maps, bigints, recipes), SuperJSON's JSON-safe
+ * `json` part without its type metadata. A value that won't decode is shown as stored.
  */
 export function plainJson(serialization: string, data: JsonValue): JsonValue {
   if (serialization !== "superjson-v1") return data;
@@ -263,8 +256,6 @@ export function toEvent(e: EventRecord): View {
   return v;
 }
 
-// --- handlers ---
-
 /** A request type's advertised capability and, unless it is bound to a session, its handler. */
 export interface Route {
   capability: Capability;
@@ -279,10 +270,7 @@ export class Queries {
     private readonly metadataOnly: () => boolean,
   ) {}
 
-  /**
-   * Every query and stream request type. Stream requests have no handler here: they are
-   * served by the session's Streams. Empty lists are left undefined, so they are omitted.
-   */
+  /** Every query and stream request type; stream ones have no handler (Streams serve them). */
   routes(): Record<string, Route> {
     const qc = this.qs.queryCapabilities();
     const nonEmpty = (list: string[]) => (list.length ? list : undefined);
@@ -342,10 +330,7 @@ export class Queries {
     };
   }
 
-  /**
-   * Validates an include list against what the message allows. Anything carrying
-   * customer data is refused in metadata-only mode.
-   */
+  /** Checks includes against `allowed`; customer data is refused in metadata-only mode. */
   private includes(list: string[] | undefined, allowed: string[]): Set<string> {
     const out = new Set<string>();
     for (const inc of list ?? []) {

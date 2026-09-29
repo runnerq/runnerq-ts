@@ -63,9 +63,13 @@ export function serializationFormat(
 function validateNative(value: unknown): void {
   const visited = new WeakSet<object>();
   function visit(v: unknown): void {
+    const type = typeof v;
     if (
       v === null ||
-      ["undefined", "string", "boolean", "bigint"].includes(typeof v)
+      type === "undefined" ||
+      type === "string" ||
+      type === "boolean" ||
+      type === "bigint"
     )
       return;
     if (typeof v === "number") {

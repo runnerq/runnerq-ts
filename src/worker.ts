@@ -5,7 +5,7 @@ import { ActivityContext } from "./context.js";
 import { encode, decode } from "./serialization.js";
 import { message, retryable, RunnerQError, captureFailure } from "./errors.js";
 import { integer } from "./options.js";
-import { pause, recover } from "./async.js";
+import { maxTimerMs, pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
 import type { Storage, Claim, Fence, Retention } from "./storage.js";
 import {
@@ -59,10 +59,7 @@ export interface WorkerConfig {
   maxActivityDepth?: number;
   retention?: Retention;
   metrics?: Metrics;
-  /**
-   * Free-form tags for this worker (region, deploy version). RunnerQ Cloud shows them
-   * in Fleet, whichever way the worker reports.
-   */
+  /** Free-form tags (region, deploy version) that RunnerQ Cloud shows in Fleet. */
   labels?: Readonly<Record<string, string>>;
 }
 export type ActivityHandler<I, O> = (
@@ -79,7 +76,7 @@ export class Worker
   extends EventEmitter<WorkerEvents>
   implements ExecutorSource
 {
-  /** This worker's identity: random, fixed at construction; RunnerQ Cloud's executor id. */
+  /** Random, fixed at construction; RunnerQ Cloud's executor id. */
   readonly id = randomUUID();
   private readonly config: Required<
     Pick<
@@ -97,6 +94,9 @@ export class Worker
     WorkerConfig;
   private readonly handlers = new Map<string, Registration>();
   private readonly inFlight = new Set<Promise<void>>();
+  private readonly slotFreed = new ChangeSignal();
+  /** Running attempts' controllers, aborted when the shutdown budget runs out. */
+  private readonly attempts = new Set<AbortController>();
   private intake = new AbortController();
   private lifetime = new AbortController();
   private maintenance: Promise<void>[] = [];
@@ -200,22 +200,17 @@ export class Worker
     });
     return this;
   }
-  /** The storage this worker runs activities on. */
   get storage(): Storage {
     return this.config.storage;
   }
-  /**
-   * The worker as it is now: who it is, what it's running, and what it has done since it
-   * was built. RunnerQ Cloud's agent and storage adapter report it.
-   */
   snapshot(): ExecutorSnapshot {
     return {
       info: {
         id: this.id,
         queue: this.config.storage.queue,
-        activityTypes: [
-          ...(this.servedTypes ?? [...this.handlers.keys()].sort()),
-        ],
+        activityTypes: this.servedTypes
+          ? [...this.servedTypes]
+          : [...this.handlers.keys()].sort(),
         maxConcurrency: this.config.concurrency,
         startedAt: this.startedAt,
         hostname: this.hostname,
@@ -223,23 +218,19 @@ export class Worker
         labels: { ...this.config.labels },
       },
       state: {
-        running: [...this.running.values()]
-          .map((a) => ({ ...a }))
-          .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime()),
+        running: Array.from(this.running.values(), (a) => ({ ...a })).sort(
+          (a, b) => a.startedAt.getTime() - b.startedAt.getTime(),
+        ),
         draining: this.state === "stopping" || this.state === "stopped",
       },
       counters: { ...this.counters },
       at: new Date(),
     };
   }
-  /** Resolves at the next change: an activity starting or finishing, or a drain beginning. */
   changed(): Promise<void> {
     return this.changes.changed();
   }
-  /**
-   * Tells `observer` when this worker starts and stops, so it can report it. A storage
-   * backend that is an observer is attached without asking. Call before `start()`.
-   */
+  /** Tells `observer` of start and stop (call before `start()`); observer storages join unasked. */
   observe(observer: ExecutorObserver): this {
     if (this.state !== "idle")
       throw new RunnerQError(
@@ -311,8 +302,10 @@ export class Worker
   private async dispatcher(types: readonly string[]): Promise<void> {
     while (!this.intake.signal.aborted) {
       try {
+        // Not Promise.race(inFlight): each race would leave a reaction on every
+        // long-running activity's promise until it settles.
         if (this.inFlight.size >= this.config.concurrency) {
-          await Promise.race(this.inFlight);
+          await this.slotFreed.changed();
           continue;
         }
         const claims = await this.config.storage.claim(
@@ -323,11 +316,13 @@ export class Worker
         );
         // A claim already committed during shutdown still executes under the drain budget.
         for (const claim of claims) {
-          const promise = this.process(claim).catch((error) =>
-            this.report(error),
-          );
+          const promise: Promise<void> = this.process(claim)
+            .catch((error) => this.report(error))
+            .finally(() => {
+              this.inFlight.delete(promise);
+              this.slotFreed.notify();
+            });
           this.inFlight.add(promise);
-          void promise.finally(() => this.inFlight.delete(promise));
         }
         if (!claims.length)
           await this.config.storage.waitForWork(this.intake.signal);
@@ -343,30 +338,59 @@ export class Worker
     const config = this.config,
       storage = config.storage,
       fence: Fence = { ownerId: claim.id, token: claim.token };
-    const handlerAbort = new AbortController(),
-      heartbeatStop = new AbortController();
-    const handlerSignal = AbortSignal.any([
-      handlerAbort.signal,
-      this.lifetime.signal,
-    ]);
+    // Aborted by the timeout, a lost claim, or stop() when its budget runs out; any abort
+    // also stops the attempt's two timers.
+    const attempt = new AbortController(),
+      signal = attempt.signal;
+    let beat: NodeJS.Timeout | undefined,
+      expiry: NodeJS.Timeout | undefined,
+      renewing: Promise<void> | undefined,
+      beating = true,
+      timedOut = false;
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(beat);
+        clearTimeout(expiry);
+      },
+      { once: true },
+    );
+    this.attempts.add(attempt);
+    if (this.lifetime.signal.aborted)
+      attempt.abort(this.lifetime.signal.reason);
     const deadline = Date.now() + claim.timeoutMs;
-    const timerSignal = AbortSignal.any([
-      heartbeatStop.signal,
-      this.lifetime.signal,
-    ]);
-    // Large activity timeouts are checked with bounded timer chunks.
-    const timeoutTask = (async () => {
-      while (!timerSignal.aborted) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) {
-          handlerAbort.abort(
-            new RunnerQError("timeout", "Activity execution timed out"),
-          );
-          return;
-        }
-        await pause(remaining, timerSignal);
+    // Timeouts past setTimeout's range re-arm until the deadline.
+    const expire = () => {
+      const remaining = deadline - Date.now();
+      if (remaining > 0)
+        expiry = setTimeout(expire, Math.min(remaining, maxTimerMs));
+      else {
+        timedOut = true;
+        attempt.abort(
+          new RunnerQError("timeout", "Activity execution timed out"),
+        );
       }
-    })().catch(() => {});
+    };
+    const beatMs = Math.min(config.heartbeatMs, maxTimerMs);
+    const heartbeat = () => {
+      renewing = storage.renew(fence, config.leaseMs).then(
+        (owned) => {
+          if (!owned) attempt.abort(reclaimed());
+          else if (beating && !signal.aborted)
+            beat = setTimeout(heartbeat, beatMs);
+        },
+        (error) => {
+          if (!beating || signal.aborted) return;
+          this.counters.heartbeatFailures++;
+          this.report(error);
+          beat = setTimeout(heartbeat, beatMs);
+        },
+      );
+    };
+    if (!signal.aborted) {
+      beat = setTimeout(heartbeat, beatMs);
+      expire();
+    }
     const event: ExecutionEvent = {
       activityId: claim.id,
       activityType: claim.type,
@@ -377,7 +401,7 @@ export class Worker
       storage,
       claim,
       fence,
-      signal: handlerSignal,
+      signal,
       persistence: this.lifetime.signal,
       deadline,
       maxDepth: config.maxActivityDepth,
@@ -391,20 +415,17 @@ export class Worker
       recover: <T>(
         fn: () => Promise<T>,
         persistence = false,
-        signal?: AbortSignal,
+        within?: AbortSignal,
       ) =>
         recover(
           fn,
-          signal ?? (persistence ? this.lifetime.signal : handlerSignal),
+          within ?? (persistence ? this.lifetime.signal : signal),
           async () => {
             this.metric(() => metrics?.increment("storage_retry", 1));
-            // For uncertain writes, let the write reconcile before acting on lost ownership.
+            // An uncertain write may have landed: only a failed renew means ownership is lost.
             try {
               const owned = await storage.renew(fence, config.leaseMs);
-              if (!owned && !persistence)
-                handlerAbort.abort(
-                  new RunnerQError("claim_lost", "Execution was reclaimed"),
-                );
+              if (!owned && !persistence) attempt.abort(reclaimed());
             } catch {
               /* next storage retry classifies the outcome */
             }
@@ -412,25 +433,6 @@ export class Worker
         ),
     };
     const context = new ActivityContext(scope);
-    const beatSignal = AbortSignal.any([heartbeatStop.signal, handlerSignal]);
-    const heartbeat = (async () => {
-      while (!beatSignal.aborted) {
-        try {
-          await pause(config.heartbeatMs, beatSignal);
-          if (!(await storage.renew(fence, config.leaseMs))) {
-            handlerAbort.abort(
-              new RunnerQError("claim_lost", "Execution was reclaimed"),
-            );
-            return;
-          }
-        } catch (error) {
-          if (!beatSignal.aborted) {
-            this.counters.heartbeatFailures++;
-            this.report(error);
-          }
-        }
-      }
-    })();
     const startedAt = new Date();
     this.running.set(claim.id, {
       id: claim.id,
@@ -451,7 +453,7 @@ export class Worker
       error: unknown,
       failed = false;
     try {
-      handlerSignal.throwIfAborted();
+      signal.throwIfAborted();
       const registration = this.handlers.get(claim.type)!;
       let input: unknown;
       try {
@@ -481,7 +483,7 @@ export class Worker
       error = cause;
       failed = true;
     }
-    // Account for SDK calls started but not awaited by user code before transitioning ownership.
+    // Settle SDK calls the handler started but didn't await before giving up ownership.
     const outstanding = await Promise.allSettled([...scope.pending]);
     if (!failed) {
       const rejection = outstanding.find((x) => x.status === "rejected");
@@ -491,11 +493,12 @@ export class Worker
       }
     }
     scope.closed = true;
-    heartbeatStop.abort();
-    await heartbeat;
-    await timeoutTask;
+    beating = false;
+    clearTimeout(beat);
+    clearTimeout(expiry);
+    await renewing;
     try {
-      const reason = handlerSignal.reason;
+      const reason = signal.reason;
       if (reason instanceof RunnerQError && reason.code === "claim_lost") {
         this.counters.claimsLost++;
         this.publish("claimLost", event);
@@ -505,14 +508,13 @@ export class Worker
       if (scope.violation) {
         error = scope.violation;
         failed = true;
-      }
-      if (scope.suspension && !scope.violation) {
+      } else if (scope.suspension) {
         await scope.recover(() => storage.park(fence, scope.suspension!), true);
         this.publish("activityYielded", event);
         return;
       }
-      // Checkpoint recovery may have outlived the handler deadline. A successfully captured
-      // handler result is still worth committing under the ownership fence, matching Go.
+      // Checkpoint recovery may outlive the deadline; a captured result still commits under
+      // the fence, as in Go.
       if (!failed) {
         let data;
         try {
@@ -539,9 +541,7 @@ export class Worker
         true,
       );
       // As Go counts them: a timeout is a timeout, not also a retry.
-      const deadline = handlerAbort.signal.reason;
-      if (deadline instanceof RunnerQError && deadline.code === "timeout")
-        this.counters.timedOut++;
+      if (timedOut) this.counters.timedOut++;
       else if (status === "failed") this.counters.failed++;
       else this.counters.retried++;
       if (status === "dead_letter") this.counters.deadLettered++;
@@ -554,6 +554,7 @@ export class Worker
         event,
       );
     } finally {
+      this.attempts.delete(attempt);
       this.running.delete(claim.id);
       this.changes.notify();
       this.metric(() =>
@@ -583,13 +584,15 @@ export class Worker
       }),
     ]);
     clearTimeout(timer);
-    this.lifetime.abort(
-      new RunnerQError("timeout", "Worker shutdown budget expired"),
+    const expired = new RunnerQError(
+      "timeout",
+      "Worker shutdown budget expired",
     );
+    this.lifetime.abort(expired);
+    for (const attempt of this.attempts) attempt.abort(expired);
     this.state = "stopped";
-    // Observers may send a goodbye: wait for them, but never longer than the grace
-    // period (at least a second, so a zero-grace stop can still say goodbye). Each
-    // catches its own error, so none rejects.
+    // Observers may send a goodbye: wait up to the grace period, at least a second so a
+    // zero-grace stop can still say goodbye.
     const observerBudget = Math.max(graceMs, 1_000);
     await Promise.all(
       this.observers.map(async (observer) => {
@@ -623,10 +626,7 @@ export class Worker
     return summary;
   }
   private report(error: unknown): void {
-    this.publish(
-      "workerError",
-      error instanceof Error ? error : new Error(message(error)),
-    );
+    this.publish("workerError", asError(error));
   }
   private metric(fn: () => void): void {
     try {
@@ -641,8 +641,8 @@ export class Worker
   ): void {
     if (name.startsWith("activity") || name === "claimLost")
       this.metric(() => this.config.metrics?.increment(name, 1));
-    // Invoke a snapshot of native listeners, preserving once() wrappers. Each observer is
-    // isolated, so one throw cannot prevent later observers or change committed outcomes.
+    // A copy of the raw listeners keeps once() wrappers; each is isolated so a throw cannot
+    // skip later listeners or change a committed outcome.
     for (const listener of this.rawListeners(name)) {
       try {
         const result = (
@@ -661,13 +661,13 @@ export class Worker
     }
   }
   private observerError(error: unknown, name: keyof WorkerEvents): void {
-    if (name !== "listenerError")
-      this.publish(
-        "listenerError",
-        error instanceof Error ? error : new Error(message(error)),
-      );
+    if (name !== "listenerError") this.publish("listenerError", asError(error));
   }
   override [captureRejectionSymbol](error: Error, ..._args: unknown[]): void {
     this.observerError(error, "workerError");
   }
 }
+const asError = (error: unknown): Error =>
+  error instanceof Error ? error : new Error(message(error));
+const reclaimed = () =>
+  new RunnerQError("claim_lost", "Execution was reclaimed");

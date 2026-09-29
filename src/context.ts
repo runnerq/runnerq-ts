@@ -19,7 +19,7 @@ import {
   type AttemptScope,
 } from "./scope.js";
 import { encode, decode, type SerializedValue } from "./serialization.js";
-import { pause } from "./async.js";
+import { linkSignal, pause } from "./async.js";
 import type { StoredResult } from "./storage.js";
 
 export interface StepContext {
@@ -293,10 +293,10 @@ export class ActivityContext {
       const ready = await s.recover(() => s.storage.getResult(id));
       if (ready) return ready;
       if (bound > Date.now()) {
-        const signal = AbortSignal.any([
-          s.signal,
-          AbortSignal.timeout(Math.max(1, Math.ceil(bound - Date.now()))),
-        ]);
+        const { signal, done } = linkSignal(
+          [s.signal],
+          Math.max(1, Math.ceil(bound - Date.now())),
+        );
         try {
           return await s.recover(
             () => s.storage.waitResult(id, signal),
@@ -305,6 +305,8 @@ export class ActivityContext {
           );
         } catch (error) {
           if (!signal.aborted || s.signal.aborted) throw error;
+        } finally {
+          done();
         }
       }
       suspend(s, {

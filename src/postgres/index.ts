@@ -249,7 +249,7 @@ export class PostgresStorage
         }
         await verifySchema(client);
       } finally {
-        // Destroy the dedicated setup session so locks cannot leak into a pool on errors.
+        // Destroy the setup session so its advisory lock never returns to a pool.
         client.release(true);
       }
     } finally {
@@ -365,14 +365,14 @@ export class PostgresStorage
   async submit(a: Submission): Promise<string> {
     const id = await this.tx(async (c) => {
       if (a.fence) await this.fence(c, a.fence);
-      // Stable caller-generated IDs reconcile a lost commit reply, including allowReuse.
+      // Caller-generated ids make a retry after a lost commit reply idempotent (allowReuse too).
       const committed = await c.query(
         "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND id=$2",
         [this.queue, a.id],
       );
       if (committed.rowCount) return a.id;
       if (a.key) {
-        // Loop only when concurrent retention removed a key between conflict detection and locking.
+        // Loops only when retention deleted the key between the conflict and the lock.
         for (;;) {
           const fresh = await c.query(
             "INSERT INTO runnerq_idempotency(queue_name,idempotency_key,activity_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING activity_id",
@@ -431,10 +431,15 @@ export class PostgresStorage
       const o = a.options;
       const priority =
         ["low", "normal", "high", "critical"].indexOf(o.priority) + 1;
+      // One statement for the activity, its input, the parent link and the event.
       await c.query(
-        `INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
+        `WITH activity AS (INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
         timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)
-        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)`,
+        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)),
+        input AS (INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$15::jsonb,$16)),
+        link AS (INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
+        SELECT $2,$12,$1,$1 WHERE $12::uuid IS NOT NULL ON CONFLICT DO NOTHING)
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($2,$1,$17,NULL,$18::jsonb)`,
         [
           a.id,
           this.queue,
@@ -450,19 +455,11 @@ export class PostgresStorage
           a.parentId,
           a.rootId,
           a.depth,
+          JSON.stringify(a.payload),
+          a.serialization,
+          o.delayMs > 0 ? "Scheduled" : "Enqueued",
+          JSON.stringify({ activity_type: a.type, priority }),
         ],
-      );
-      await c.query(
-        "INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$3::jsonb,$4)",
-        [a.id, this.queue, JSON.stringify(a.payload), a.serialization],
-      );
-      if (a.parentId) await this.dependency(c, a.parentId, a.id, a.id);
-      await this.event(
-        c,
-        a.id,
-        o.delayMs > 0 ? "Scheduled" : "Enqueued",
-        null,
-        { activity_type: a.type, priority },
       );
       return a.id;
     });
@@ -478,27 +475,37 @@ export class PostgresStorage
     integer(limit, "claim limit", 1);
     integer(leaseMs, "leaseMs", 1);
     if (!types.length) return [];
-    // Tokens are "<executor>:batch:<uuid>:<activity>", as Go's: unique per claim, and the
-    // part before the first colon names the executor running it (queries' executor_id).
+    // Tokens are "<executor>:batch:<uuid>:<activity>", as Go's: unique per claim; the part
+    // before the first colon is the executor (queries' executor_id).
     const prefix =
       executorId && !executorId.includes(":")
         ? `${executorId}:batch:${randomUUID()}`
         : randomUUID();
-    const claims = await this.tx(async (c) => {
+    return this.tx(async (c) => {
       const filter =
         types.length === 1
           ? "activity_type=$5"
           : "activity_type=ANY($5::text[])";
+      // One statement claims, logs Dequeued and reads the inputs (one round trip for the
+      // batch); the order is the claim order, which UPDATE RETURNING alone doesn't keep.
       const r = await c.query(
         `WITH picked AS (SELECT id FROM runnerq_activities
         WHERE queue_name=$1 AND status IN ('pending','scheduled','retrying','waiting')
         AND (status='pending' OR scheduled_at<=NOW()) AND ${filter}
         ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC
-        LIMIT $2 FOR UPDATE SKIP LOCKED)
-        UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
+        LIMIT $2 FOR UPDATE SKIP LOCKED),
+        claimed AS (UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
         started_at=NOW(),waiting_result_id=NULL,
         lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
-        FROM picked WHERE a.id=picked.id RETURNING a.*`,
+        FROM picked WHERE a.id=picked.id RETURNING a.*),
+        dequeued AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
+        SELECT $1,id,'Dequeued',current_worker_id,jsonb_build_object('activity_type',activity_type) FROM claimed
+        ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC)
+        SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
+        c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,
+        i.activity_id AS input_id,i.payload,i.serialization
+        FROM claimed c LEFT JOIN runnerq_inputs i ON i.queue_name=$1 AND i.activity_id=c.id
+        ORDER BY c.priority DESC,c.retry_count DESC,COALESCE(c.scheduled_at,c.created_at) ASC`,
         [
           this.queue,
           limit,
@@ -507,37 +514,17 @@ export class PostgresStorage
           types.length === 1 ? types[0] : types,
         ],
       );
-      if (!r.rowCount) return [];
-      const inputs = await c.query(
-        "SELECT activity_id,payload,serialization FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
-        [this.queue, r.rows.map((a) => a.id)],
-      );
-      const payloads = new Map(
-        inputs.rows.map((row) => [row.activity_id, row]),
-      );
-      // UPDATE RETURNING has no guaranteed order; restore the claim ordering.
-      r.rows.sort(
-        (a, b) =>
-          b.priority - a.priority ||
-          b.retry_count - a.retry_count ||
-          new Date(a.scheduled_at ?? a.created_at).getTime() -
-            new Date(b.scheduled_at ?? b.created_at).getTime(),
-      );
-      const result: Claim[] = [];
-      for (const a of r.rows) {
-        if (!payloads.has(a.id))
+      return r.rows.map((a): Claim => {
+        if (!a.input_id)
           throw new RunnerQError(
             "internal",
             `Missing input for activity ${a.id}`,
           );
-        await this.event(c, a.id, "Dequeued", a.current_worker_id, {
-          activity_type: a.activity_type,
-        });
-        result.push({
+        return {
           id: a.id,
           type: a.activity_type,
-          payload: payloads.get(a.id)!.payload,
-          serialization: payloads.get(a.id)!.serialization,
+          payload: a.payload,
+          serialization: a.serialization,
           token: a.current_worker_id,
           dueAt: new Date(a.scheduled_at ?? a.created_at).toISOString(),
           retryCount: a.retry_count,
@@ -547,12 +534,9 @@ export class PostgresStorage
           depth: a.depth,
           metadata: a.metadata ?? {},
           leaseDeadlineMs: Number(a.lease_deadline_ms),
-        });
-      }
-      return result;
+        };
+      });
     });
-    if (claims.length) this.hints(undefined, false);
-    return claims;
   }
   async renew(f: Fence, leaseMs: number): Promise<boolean> {
     const rows = await this.query(
@@ -586,25 +570,27 @@ export class PostgresStorage
     await this.wake(c, id);
   }
   async complete(f: Fence, value: SerializedValue): Promise<void> {
+    const data = JSON.stringify(value.data);
     await this.tx(async (c) => {
-      const r = await c.query(
-        `UPDATE runnerq_activities SET status='completed',completed_at=NOW(),last_worker_id=$3,
+      const done = await c.query(
+        `WITH done AS (UPDATE runnerq_activities SET status='completed',completed_at=NOW(),last_worker_id=$3,
         current_worker_id=NULL,lease_deadline_ms=NULL,waiting_result_id=NULL
-        WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 RETURNING id`,
-        [this.queue, f.ownerId, f.token],
+        WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 RETURNING id),
+        stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        SELECT id,$1,'Ok',$4::jsonb,id,NULL,$5 FROM done
+        ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
+        WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id),
+        logged AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
+        SELECT $1,id,'Completed',$3,'{"result_stored":true}'::jsonb FROM done)
+        SELECT id FROM done`,
+        [this.queue, f.ownerId, f.token, data, value.serialization],
       );
-      if (!r.rowCount) {
+      if (!done.rowCount) {
         const previous = await c.query(
           `SELECT (r.data IS NOT DISTINCT FROM $4::jsonb AND r.serialization=$5) AS same FROM runnerq_activities a
           JOIN runnerq_results r ON r.activity_id=a.id AND r.queue_name=a.queue_name
           WHERE a.queue_name=$1 AND a.id=$2 AND a.status='completed' AND a.last_worker_id=$3 AND r.state='Ok'`,
-          [
-            this.queue,
-            f.ownerId,
-            f.token,
-            JSON.stringify(value.data),
-            value.serialization,
-          ],
+          [this.queue, f.ownerId, f.token, data, value.serialization],
         );
         if (previous.rows[0]?.same) return;
         if (previous.rowCount)
@@ -614,16 +600,9 @@ export class PostgresStorage
           );
         throw lost();
       }
-      await this.putResult(
-        c,
-        f.ownerId,
-        f.ownerId,
-        { state: "Ok", ...value },
-        null,
-      );
-      await this.event(c, f.ownerId, "Completed", f.token, {
-        result_stored: true,
-      });
+      // Its own statement: a fresh snapshot sees a park that committed while the UPDATE
+      // above waited on the row lock, so that waiter is not stranded.
+      await this.wake(c, f.ownerId);
     });
     this.hints(f.ownerId);
   }
@@ -668,39 +647,44 @@ export class PostgresStorage
         Number(a.max_retry_delay_seconds) || 3600,
         Number(a.retry_delay_seconds) * 2 ** Math.min(a.retry_count + 1, 52),
       );
+      // Transition, terminal result and event in one statement; the wake stays separate.
+      const result = again
+        ? null
+        : JSON.stringify({
+            error: reason,
+            ...(failure ? { failure } : {}),
+            type: retry ? "dead_letter" : "non_retryable",
+            failed_at: new Date().toISOString(),
+          });
       await c.query(
-        `UPDATE runnerq_activities SET status=$4,last_error=$5,last_error_at=NOW(),last_worker_id=$3,
+        `WITH failed AS (UPDATE runnerq_activities SET status=$4,last_error=$5,last_error_at=NOW(),last_worker_id=$3,
         current_worker_id=NULL,lease_deadline_ms=NULL,waiting_result_id=NULL,
         retry_count=retry_count+CASE WHEN $4='retrying' THEN 1 ELSE 0 END,
         scheduled_at=CASE WHEN $4='retrying' THEN NOW()+$6*INTERVAL '1 second' ELSE scheduled_at END,
         started_at=CASE WHEN $4='retrying' THEN NULL ELSE started_at END,
-        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2`,
-        [this.queue, f.ownerId, f.token, status, reason, delay],
-      );
-      if (!again)
-        await this.putResult(
-          c,
+        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2),
+        stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        SELECT $2::uuid,$1,'Err',$7::jsonb,$2::uuid,NULL,'json-v1' WHERE $7::jsonb IS NOT NULL
+        ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
+        WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id)
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($1,$2,$8,$3,$9::jsonb)`,
+        [
+          this.queue,
           f.ownerId,
-          f.ownerId,
-          {
-            state: "Err",
-            serialization: "json-v1",
-            data: {
-              error: reason,
-              ...(failure ? { failure } : {}),
-              type: retry ? "dead_letter" : "non_retryable",
-              failed_at: new Date().toISOString(),
-            },
-          },
-          null,
-        );
-      await this.event(
-        c,
-        f.ownerId,
-        again ? "Retrying" : retry ? "DeadLetter" : "Failed",
-        f.token,
-        { error: reason, retryable: retry, ...(failure ? { failure } : {}) },
+          f.token,
+          status,
+          reason,
+          delay,
+          result,
+          again ? "Retrying" : retry ? "DeadLetter" : "Failed",
+          JSON.stringify({
+            error: reason,
+            retryable: retry,
+            ...(failure ? { failure } : {}),
+          }),
+        ],
       );
+      if (!again) await this.wake(c, f.ownerId);
       return status;
     });
     this.hints(status === "retrying" ? undefined : f.ownerId);
@@ -713,10 +697,17 @@ export class PostgresStorage
     step: string,
   ): Promise<void> {
     await this.tx(async (c) => {
-      await this.fence(c, f);
+      // The fence, the result and (only when the result is new) its ResultStored event:
+      // one statement. The fence's row lock is taken first, as a statement of its own would.
       const r = await c.query(
-        `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
-        VALUES($1,$2,$3,$4::jsonb,$5,NULLIF($6,''),$7) ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id`,
+        `WITH fenced AS (SELECT id FROM runnerq_activities
+        WHERE queue_name=$2 AND id=$5 AND status='processing' AND current_worker_id=$8 FOR UPDATE),
+        stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        SELECT $1::uuid,$2,$3,$4::jsonb,$5::uuid,NULLIF($6,''),$7 WHERE EXISTS(SELECT 1 FROM fenced)
+        ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id),
+        logged AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
+        SELECT $2,activity_id,'ResultStored',$8,$9::jsonb FROM stored)
+        SELECT EXISTS(SELECT 1 FROM fenced) AS fenced,EXISTS(SELECT 1 FROM stored) AS stored`,
         [
           id,
           this.queue,
@@ -725,9 +716,12 @@ export class PostgresStorage
           f.ownerId,
           step,
           result.serialization,
+          f.token,
+          JSON.stringify({ state: result.state }),
         ],
       );
-      if (!r.rowCount) {
+      if (!r.rows[0].fenced) throw lost();
+      if (!r.rows[0].stored) {
         const same = await c.query(
           `SELECT 1 FROM runnerq_results WHERE activity_id=$1 AND queue_name=$2 AND state=$3
           AND data IS NOT DISTINCT FROM $4::jsonb AND owner_activity_id=$5 AND COALESCE(step,'')=$6 AND serialization=$7`,
@@ -748,7 +742,6 @@ export class PostgresStorage
           );
         return;
       }
-      await this.event(c, id, "ResultStored", f.token, { state: result.state });
       await this.wake(c, id);
     });
     this.hints(id);
@@ -758,15 +751,15 @@ export class PostgresStorage
       "SELECT state,data,serialization FROM runnerq_results WHERE queue_name=$1 AND activity_id=$2",
       [this.queue, id],
     );
-    if (r[0] && !["Ok", "Err"].includes(r[0].state))
+    const row = r[0];
+    if (!row) return null;
+    if (row.state !== "Ok" && row.state !== "Err")
       throw new RunnerQError("serialization", "Invalid stored result state");
-    return r[0]
-      ? {
-          state: r[0].state,
-          data: r[0].data,
-          serialization: r[0].serialization,
-        }
-      : null;
+    return {
+      state: row.state,
+      data: row.data,
+      serialization: row.serialization,
+    };
   }
   async waitResult(id: string, signal?: AbortSignal): Promise<StoredResult> {
     const sub = this.notifications.subscribe(`result:${id}`, signal);
@@ -842,9 +835,10 @@ export class PostgresStorage
         ).rowCount;
       }
       await c.query(
-        `UPDATE runnerq_activities SET status=CASE WHEN $4 THEN 'pending' ELSE 'waiting' END,
+        `WITH parked AS (UPDATE runnerq_activities SET status=CASE WHEN $4 THEN 'pending' ELSE 'waiting' END,
         scheduled_at=CASE WHEN $4 THEN NULL ELSE $5::timestamptz END,waiting_result_id=CASE WHEN $4 THEN NULL ELSE $6::uuid END,
-        last_worker_id=$3,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL WHERE queue_name=$1 AND id=$2`,
+        last_worker_id=$3,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL WHERE queue_name=$1 AND id=$2)
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($1,$2,'Yielded',$3,$7::jsonb)`,
         [
           this.queue,
           f.ownerId,
@@ -852,15 +846,15 @@ export class PostgresStorage
           ready,
           wait.wakeAt,
           wait.resultId ?? null,
+          JSON.stringify({
+            kind: wait.kind,
+            step: wait.step,
+            wake_at: wait.wakeAt,
+            result_id: wait.resultId ?? null,
+            ready,
+          }),
         ],
       );
-      await this.event(c, f.ownerId, "Yielded", f.token, {
-        kind: wait.kind,
-        step: wait.step,
-        wake_at: wait.wakeAt,
-        result_id: wait.resultId ?? null,
-        ready,
-      });
     });
     this.hints();
   }
@@ -968,7 +962,7 @@ export class PostgresStorage
         return 0;
       const skipped: string[] = [];
       let removed = 0;
-      // Bound examined roots as well as deleted roots, so pinned trees cannot create unbounded transactions.
+      // Bound examined roots too, so pinned trees cannot make the transaction unbounded.
       for (
         let examined = 0;
         removed < batch && examined < batch * 10;
@@ -1008,7 +1002,6 @@ export class PostgresStorage
           await c.query("RELEASE SAVEPOINT candidate");
           continue;
         }
-        // Materialize the IDs once, then explicitly delete each payload/history table in this transaction.
         const tree = (
           await c.query(
             "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND root_activity_id=$2",
@@ -1155,7 +1148,7 @@ export class PostgresStorage
       )
     ).map((r) => this.toEvent(r));
   }
-  // QueryStorage: RunnerQ Cloud's read surface. Queries span every queue in the schema.
+  // QueryStorage (RunnerQ Cloud's reads) spans every queue in the schema.
   queryCapabilities(): QueryCapabilities {
     return queryCapabilities();
   }

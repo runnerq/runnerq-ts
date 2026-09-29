@@ -61,11 +61,9 @@ export function track<T>(
     guard(scope);
     return fn();
   });
+  const forget = () => scope.pending.delete(promise);
   scope.pending.add(promise);
-  void promise.then(
-    () => scope.pending.delete(promise),
-    () => scope.pending.delete(promise),
-  );
+  void promise.then(forget, forget);
   return promise;
 }
 export function suspend(scope: AttemptScope, park: Park): never {

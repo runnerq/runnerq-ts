@@ -15,7 +15,7 @@ const integration = (name, fn) =>
   test(name, { skip: !dsn, timeout: 30000 }, fn);
 function worker(t, storage, config = {}) {
   const w = new Worker({ storage, waitGraceMs: 20, ...config });
-  // Stop before setup's storage cleanup, using explicit per-test try/finally below.
+  // Each test stops it in try/finally, before setup's cleanup.
   return w;
 }
 integration(

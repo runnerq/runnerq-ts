@@ -1,5 +1,5 @@
 import { RunnerQError } from "../errors.js";
-import { pause } from "../async.js";
+import { linkSignal, pause } from "../async.js";
 import { reportExecutor } from "../executor.js";
 import type { Worker } from "../worker.js";
 import { isQueryStorage, QueryError, type QueryStorage } from "../query.js";
@@ -14,6 +14,7 @@ import {
   typeGoodbye,
   typeHello,
   WireError,
+  describe,
   frameSlack,
   ts,
   type Capability,
@@ -52,14 +53,12 @@ export interface AgentConfig {
 }
 
 /**
- * Connects a worker to RunnerQ Cloud. It dials out over a WebSocket, describes the worker
- * (hello), reports it as it changes and on an interval, and answers the Cloud's requests.
- * Start it with the worker; `close()` it before stopping the worker, so the Cloud records
- * a clean shutdown rather than a lost executor.
+ * Connects a worker to RunnerQ Cloud over an outbound WebSocket: describes it, reports it on
+ * change and on an interval, and answers the Cloud's requests. `close()` it before stopping
+ * the worker so the Cloud records a clean shutdown rather than a lost executor.
  */
 export class Agent {
   private readonly url: string;
-  private readonly apiKey: string;
   private readonly maxRequests: number;
   private readonly requestTimeoutMs: number;
   private readonly minDelay: number;
@@ -78,7 +77,8 @@ export class Agent {
   private cloudMetadataOnly = false;
   private peerFrameLimit = maxMessageBytes;
   private inFlight = 0;
-  /** The worker's storage when it can be queried; queries and streams are served from it. */
+  private readonly closeOnAbort = () => void this.close();
+  /** The worker's storage, when queryable; queries and streams read it. */
   private readonly qs?: QueryStorage;
 
   constructor(
@@ -88,7 +88,6 @@ export class Agent {
     this.url = agentUrl(config.url);
     if (!config.apiKey)
       throw new RunnerQError("configuration", "The agent needs an API key");
-    this.apiKey = config.apiKey;
     this.maxRequests = positive(config.maxConcurrentRequests, 16);
     this.requestTimeoutMs = positive(config.requestTimeoutMs, 30_000);
     this.minDelay = positive(config.minReconnectDelayMs, 1_000);
@@ -110,13 +109,12 @@ export class Agent {
         else this.caps[type] = route.capability;
       }
     }
-    config.signal?.addEventListener("abort", () => void this.close(), {
+    config.signal?.addEventListener("abort", this.closeOnAbort, {
       once: true,
     });
     this.done = this.run();
   }
 
-  /** Whether a session with the Cloud is open. */
   get connected(): boolean {
     return this.session !== "";
   }
@@ -126,13 +124,13 @@ export class Agent {
   }
   /** Says goodbye and stops. Resolves once the agent has stopped. */
   async close(): Promise<void> {
+    this.config.signal?.removeEventListener("abort", this.closeOnAbort);
     this.closing = true;
-    this.goodbye();
+    if (this.socket) this.goodbye(this.socket);
     this.stop.abort();
     await this.done;
   }
 
-  /** Serves `type` with `fn`, advertised with `capability`. */
   protected handle(type: string, capability: Capability, fn: Handler): void {
     this.table.set(type, fn);
     this.caps[type] = capability;
@@ -176,7 +174,7 @@ export class Agent {
     return new Promise<number>((resolve, reject) => {
       // Node's WebSocket takes headers in its init; the DOM type doesn't know them.
       const ws = new WebSocket(this.url, {
-        headers: { Authorization: `Bearer ${this.apiKey}` },
+        headers: { Authorization: `Bearer ${this.config.apiKey}` },
       } as unknown as string[]);
       const session = new AbortController();
       let streams: Streams | undefined;
@@ -232,7 +230,7 @@ export class Agent {
           welcomed = true;
           clearTimeout(handshake);
           if (this.closing) {
-            this.goodbyeOn(ws);
+            this.goodbye(ws);
             return;
           }
           this.socket = ws;
@@ -240,7 +238,7 @@ export class Agent {
           if (this.qs)
             streams = new Streams(this.qs, {
               send: (type, data) =>
-                this.send(ws, { v: protocolVersion, kind: "evt", type, data }),
+                this.send(ws, { v: protocolVersion, kind: "evt", type }, data),
               buffered: () => ws.bufferedAmount,
               frameLimit: () => this.peerFrameLimit,
               metadataOnly: () => this.metadataOnly,
@@ -326,14 +324,12 @@ export class Agent {
       return;
     }
     if (env.kind !== "req") return;
-    const reply = (res: Partial<Envelope>) =>
-      this.send(ws, {
-        v: env.v,
-        kind: "res",
-        id: env.id,
-        type: env.type,
-        ...res,
-      });
+    const reply = (res: Partial<Envelope>, data?: string) =>
+      this.send(
+        ws,
+        { v: env.v, kind: "res", id: env.id, type: env.type, ...res },
+        data,
+      );
     if (this.inFlight >= this.maxRequests) {
       reply({
         error: new WireError(
@@ -346,7 +342,7 @@ export class Agent {
     this.inFlight++;
     void this.serve(env, session, streams)
       .then(
-        (data) => reply({ data }),
+        (data) => reply({}, data),
         (error) => reply({ error: toWireError(error).body() }),
       )
       .finally(() => this.inFlight--);
@@ -356,7 +352,7 @@ export class Agent {
     env: Envelope,
     session: AbortSignal,
     streams?: Streams,
-  ): Promise<unknown> {
+  ): Promise<string | undefined> {
     const handler = this.table.get(env.type) ?? streams?.handler(env.type);
     if (!handler)
       throw new WireError(
@@ -375,7 +371,7 @@ export class Agent {
         "deadline_exceeded",
         "the request expired before it started",
       );
-    const signal = AbortSignal.any([session, AbortSignal.timeout(remaining)]);
+    const { signal, done } = linkSignal([session], remaining);
     const result = await Promise.race([
       Promise.resolve().then(() => handler(env.data ?? {}, signal)),
       new Promise((_, reject) =>
@@ -391,22 +387,20 @@ export class Agent {
           { once: true },
         ),
       ),
-    ]);
-    const size = Buffer.byteLength(JSON.stringify(result ?? null));
+    ]).finally(done);
+    // Serialized once: measured here, then spliced into the reply frame by send().
+    const data = JSON.stringify(result ?? null);
+    const size = Buffer.byteLength(data);
     const limit = this.peerFrameLimit - frameSlack;
     if (size > limit)
       throw new WireError(
         "resource_exhausted",
         `the reply is ${size} bytes, over the ${limit}-byte frame limit; ask for fewer rows or fields`,
       );
-    return result;
+    return result === undefined ? undefined : data;
   }
 
-  private goodbye(): void {
-    const ws = this.socket;
-    if (ws) this.goodbyeOn(ws);
-  }
-  private goodbyeOn(ws: WebSocket): void {
+  private goodbye(ws: WebSocket): void {
     if (this.goodbyeSent && this.socket === ws) return;
     this.goodbyeSent = true;
     this.send(ws, {
@@ -418,11 +412,17 @@ export class Agent {
     ws.close(1000, "shutdown");
   }
 
-  /** Writes one frame; false when the connection can't take it. */
-  private send(ws: WebSocket, env: Envelope): boolean {
+  /**
+   * Writes one frame, splicing in `data` (JSON text) when given; false when the connection
+   * can't take it.
+   */
+  private send(ws: WebSocket, env: Envelope, data?: string): boolean {
     if (ws.readyState !== WebSocket.OPEN) return false;
     try {
-      ws.send(JSON.stringify(env));
+      const frame = JSON.stringify(env);
+      ws.send(
+        data === undefined ? frame : `${frame.slice(0, -1)},"data":${data}}`,
+      );
       return true;
     } catch (error) {
       this.log.warn(`runnerq-conductor: send failed: ${describe(error)}`);
@@ -464,10 +464,6 @@ function agentUrl(raw: string): string {
 function positive(value: number | undefined, fallback: number): number {
   return value && value > 0 ? value : fallback;
 }
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-/** Maps a handler's error to the wire. */
 export function toWireError(error: unknown): WireError {
   if (error instanceof WireError) return error;
   if (error instanceof QueryError)
@@ -479,9 +475,8 @@ export function toWireError(error: unknown): WireError {
   if (error instanceof RunnerQError) {
     switch (error.code) {
       case "not_found":
-        return new WireError("not_found", error.message);
       case "conflict":
-        return new WireError("conflict", error.message);
+        return new WireError(error.code, error.message);
       case "unavailable":
       case "timeout":
         return new WireError("unavailable", error.message);
