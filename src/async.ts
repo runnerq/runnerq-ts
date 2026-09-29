@@ -43,19 +43,23 @@ export function linkSignal(
     link.abort((event.target as AbortSignal).reason);
   for (const source of sources)
     source.addEventListener("abort", follow, { once: true });
-  const timer =
-    timeoutMs === undefined
-      ? undefined
-      : setTimeout(
-          () =>
-            link.abort(
+  let timer: NodeJS.Timeout | undefined;
+  // Waits past setTimeout's range re-arm in chunks instead of overflowing to 1 ms.
+  const arm = (ms: number) => {
+    timer = setTimeout(
+      () =>
+        ms > maxTimerMs
+          ? arm(ms - maxTimerMs)
+          : link.abort(
               new DOMException(
                 "The operation was aborted due to timeout",
                 "TimeoutError",
               ),
             ),
-          timeoutMs,
-        ).unref();
+      Math.min(ms, maxTimerMs),
+    ).unref();
+  };
+  if (timeoutMs !== undefined) arm(timeoutMs);
   return {
     signal: link.signal,
     done: () => {
