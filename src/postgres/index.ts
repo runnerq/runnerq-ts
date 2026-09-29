@@ -431,10 +431,15 @@ export class PostgresStorage
       const o = a.options;
       const priority =
         ["low", "normal", "high", "critical"].indexOf(o.priority) + 1;
+      // The activity, its input, the parent link and the event: one statement, one round trip.
       await c.query(
-        `INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
+        `WITH activity AS (INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
         timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)
-        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)`,
+        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)),
+        input AS (INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$15::jsonb,$16)),
+        link AS (INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
+        SELECT $2,$12,$1,$1 WHERE $12::uuid IS NOT NULL ON CONFLICT DO NOTHING)
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($2,$1,$17,NULL,$18::jsonb)`,
         [
           a.id,
           this.queue,
@@ -450,19 +455,11 @@ export class PostgresStorage
           a.parentId,
           a.rootId,
           a.depth,
+          JSON.stringify(a.payload),
+          a.serialization,
+          o.delayMs > 0 ? "Scheduled" : "Enqueued",
+          JSON.stringify({ activity_type: a.type, priority }),
         ],
-      );
-      await c.query(
-        "INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$3::jsonb,$4)",
-        [a.id, this.queue, JSON.stringify(a.payload), a.serialization],
-      );
-      if (a.parentId) await this.dependency(c, a.parentId, a.id, a.id);
-      await this.event(
-        c,
-        a.id,
-        o.delayMs > 0 ? "Scheduled" : "Enqueued",
-        null,
-        { activity_type: a.type, priority },
       );
       return a.id;
     });
