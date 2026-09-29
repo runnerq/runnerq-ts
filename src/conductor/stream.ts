@@ -13,6 +13,7 @@ import { decodeRequest, type Spec } from "./decode.js";
 import { filterSpec, toEvent } from "./queries.js";
 import {
   WireError,
+  describe,
   frameSlack,
   typeEventsSubscribe,
   typeEventsUnsubscribe,
@@ -194,7 +195,7 @@ export class Tailer {
       } catch (error) {
         if (signal.aborted) return;
         this.out.log.warn(
-          `runnerq-conductor: event stream ${this.id} poll failed; retrying: ${error instanceof Error ? error.message : String(error)}`,
+          `runnerq-conductor: event stream ${this.id} poll failed; retrying: ${describe(error)}`,
         );
       }
       next = full ? 0 : this.delayMs; // catching up: keep reading

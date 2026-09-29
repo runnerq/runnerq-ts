@@ -92,6 +92,11 @@ export interface Welcome {
   limits?: { max_frame_bytes?: number; max_concurrent_requests?: number };
 }
 
+/** An error's message for logs and replies. */
+export function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** Times on the wire: UTC, milliseconds, Z. */
 export const ts = (d: Date): string => d.toISOString();
 

@@ -207,9 +207,9 @@ export class Worker
       info: {
         id: this.id,
         queue: this.config.storage.queue,
-        activityTypes: [
-          ...(this.servedTypes ?? [...this.handlers.keys()].sort()),
-        ],
+        activityTypes: this.servedTypes
+          ? [...this.servedTypes]
+          : [...this.handlers.keys()].sort(),
         maxConcurrency: this.config.concurrency,
         startedAt: this.startedAt,
         hostname: this.hostname,
@@ -217,9 +217,9 @@ export class Worker
         labels: { ...this.config.labels },
       },
       state: {
-        running: [...this.running.values()]
-          .map((a) => ({ ...a }))
-          .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime()),
+        running: Array.from(this.running.values(), (a) => ({ ...a })).sort(
+          (a, b) => a.startedAt.getTime() - b.startedAt.getTime(),
+        ),
         draining: this.state === "stopping" || this.state === "stopped",
       },
       counters: { ...this.counters },
@@ -495,8 +495,7 @@ export class Worker
       if (scope.violation) {
         error = scope.violation;
         failed = true;
-      }
-      if (scope.suspension && !scope.violation) {
+      } else if (scope.suspension) {
         await scope.recover(() => storage.park(fence, scope.suspension!), true);
         this.publish("activityYielded", event);
         return;
@@ -612,10 +611,7 @@ export class Worker
     return summary;
   }
   private report(error: unknown): void {
-    this.publish(
-      "workerError",
-      error instanceof Error ? error : new Error(message(error)),
-    );
+    this.publish("workerError", asError(error));
   }
   private metric(fn: () => void): void {
     try {
@@ -650,13 +646,11 @@ export class Worker
     }
   }
   private observerError(error: unknown, name: keyof WorkerEvents): void {
-    if (name !== "listenerError")
-      this.publish(
-        "listenerError",
-        error instanceof Error ? error : new Error(message(error)),
-      );
+    if (name !== "listenerError") this.publish("listenerError", asError(error));
   }
   override [captureRejectionSymbol](error: Error, ..._args: unknown[]): void {
     this.observerError(error, "workerError");
   }
 }
+const asError = (error: unknown): Error =>
+  error instanceof Error ? error : new Error(message(error));

@@ -14,6 +14,7 @@ import {
   typeGoodbye,
   typeHello,
   WireError,
+  describe,
   frameSlack,
   ts,
   type Capability,
@@ -58,7 +59,6 @@ export interface AgentConfig {
  */
 export class Agent {
   private readonly url: string;
-  private readonly apiKey: string;
   private readonly maxRequests: number;
   private readonly requestTimeoutMs: number;
   private readonly minDelay: number;
@@ -87,7 +87,6 @@ export class Agent {
     this.url = agentUrl(config.url);
     if (!config.apiKey)
       throw new RunnerQError("configuration", "The agent needs an API key");
-    this.apiKey = config.apiKey;
     this.maxRequests = positive(config.maxConcurrentRequests, 16);
     this.requestTimeoutMs = positive(config.requestTimeoutMs, 30_000);
     this.minDelay = positive(config.minReconnectDelayMs, 1_000);
@@ -126,7 +125,7 @@ export class Agent {
   /** Says goodbye and stops. Resolves once the agent has stopped. */
   async close(): Promise<void> {
     this.closing = true;
-    this.goodbye();
+    if (this.socket) this.goodbye(this.socket);
     this.stop.abort();
     await this.done;
   }
@@ -175,7 +174,7 @@ export class Agent {
     return new Promise<number>((resolve, reject) => {
       // Node's WebSocket takes headers in its init; the DOM type doesn't know them.
       const ws = new WebSocket(this.url, {
-        headers: { Authorization: `Bearer ${this.apiKey}` },
+        headers: { Authorization: `Bearer ${this.config.apiKey}` },
       } as unknown as string[]);
       const session = new AbortController();
       let streams: Streams | undefined;
@@ -231,7 +230,7 @@ export class Agent {
           welcomed = true;
           clearTimeout(handshake);
           if (this.closing) {
-            this.goodbyeOn(ws);
+            this.goodbye(ws);
             return;
           }
           this.socket = ws;
@@ -401,11 +400,7 @@ export class Agent {
     return result;
   }
 
-  private goodbye(): void {
-    const ws = this.socket;
-    if (ws) this.goodbyeOn(ws);
-  }
-  private goodbyeOn(ws: WebSocket): void {
+  private goodbye(ws: WebSocket): void {
     if (this.goodbyeSent && this.socket === ws) return;
     this.goodbyeSent = true;
     this.send(ws, {
@@ -463,9 +458,6 @@ function agentUrl(raw: string): string {
 function positive(value: number | undefined, fallback: number): number {
   return value && value > 0 ? value : fallback;
 }
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 /** Maps a handler's error to the wire. */
 export function toWireError(error: unknown): WireError {
   if (error instanceof WireError) return error;
@@ -478,9 +470,8 @@ export function toWireError(error: unknown): WireError {
   if (error instanceof RunnerQError) {
     switch (error.code) {
       case "not_found":
-        return new WireError("not_found", error.message);
       case "conflict":
-        return new WireError("conflict", error.message);
+        return new WireError(error.code, error.message);
       case "unavailable":
       case "timeout":
         return new WireError("unavailable", error.message);
