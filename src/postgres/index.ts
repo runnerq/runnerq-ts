@@ -835,9 +835,10 @@ export class PostgresStorage
         ).rowCount;
       }
       await c.query(
-        `UPDATE runnerq_activities SET status=CASE WHEN $4 THEN 'pending' ELSE 'waiting' END,
+        `WITH parked AS (UPDATE runnerq_activities SET status=CASE WHEN $4 THEN 'pending' ELSE 'waiting' END,
         scheduled_at=CASE WHEN $4 THEN NULL ELSE $5::timestamptz END,waiting_result_id=CASE WHEN $4 THEN NULL ELSE $6::uuid END,
-        last_worker_id=$3,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL WHERE queue_name=$1 AND id=$2`,
+        last_worker_id=$3,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL WHERE queue_name=$1 AND id=$2)
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($1,$2,'Yielded',$3,$7::jsonb)`,
         [
           this.queue,
           f.ownerId,
@@ -845,15 +846,15 @@ export class PostgresStorage
           ready,
           wait.wakeAt,
           wait.resultId ?? null,
+          JSON.stringify({
+            kind: wait.kind,
+            step: wait.step,
+            wake_at: wait.wakeAt,
+            result_id: wait.resultId ?? null,
+            ready,
+          }),
         ],
       );
-      await this.event(c, f.ownerId, "Yielded", f.token, {
-        kind: wait.kind,
-        step: wait.step,
-        wake_at: wait.wakeAt,
-        result_id: wait.resultId ?? null,
-        ready,
-      });
     });
     this.hints();
   }
