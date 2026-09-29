@@ -15,6 +15,10 @@
       "types": "./dist/postgres/index.d.ts",
       "import": "./dist/postgres/index.js"
     },
+    "./conductor": {
+      "types": "./dist/conductor/index.d.ts",
+      "import": "./dist/conductor/index.js"
+    },
     "./storage": {
       "types": "./dist/storage.d.ts",
       "import": "./dist/storage.js"
@@ -44,8 +48,10 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pg": "^8.15.5",
+    "@types/ws": "^8.18.2",
     "prettier": "^3.9.9",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "ws": "^8.22.0"
   },
   "license": "MIT"
 }
