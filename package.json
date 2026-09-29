@@ -39,7 +39,7 @@
     "test:integration": "npm run build && npm run typecheck && node scripts/test-integration.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepack": "npm run build"
+    "prepare": "npm run build"
   },
   "dependencies": {
     "pg": "^8.16.3",
