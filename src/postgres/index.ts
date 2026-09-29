@@ -573,25 +573,27 @@ export class PostgresStorage
     await this.wake(c, id);
   }
   async complete(f: Fence, value: SerializedValue): Promise<void> {
+    const data = JSON.stringify(value.data);
     await this.tx(async (c) => {
-      const r = await c.query(
-        `UPDATE runnerq_activities SET status='completed',completed_at=NOW(),last_worker_id=$3,
+      const done = await c.query(
+        `WITH done AS (UPDATE runnerq_activities SET status='completed',completed_at=NOW(),last_worker_id=$3,
         current_worker_id=NULL,lease_deadline_ms=NULL,waiting_result_id=NULL
-        WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 RETURNING id`,
-        [this.queue, f.ownerId, f.token],
+        WHERE queue_name=$1 AND id=$2 AND status='processing' AND current_worker_id=$3 RETURNING id),
+        stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        SELECT id,$1,'Ok',$4::jsonb,id,NULL,$5 FROM done
+        ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
+        WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id),
+        logged AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
+        SELECT $1,id,'Completed',$3,'{"result_stored":true}'::jsonb FROM done)
+        SELECT id FROM done`,
+        [this.queue, f.ownerId, f.token, data, value.serialization],
       );
-      if (!r.rowCount) {
+      if (!done.rowCount) {
         const previous = await c.query(
           `SELECT (r.data IS NOT DISTINCT FROM $4::jsonb AND r.serialization=$5) AS same FROM runnerq_activities a
           JOIN runnerq_results r ON r.activity_id=a.id AND r.queue_name=a.queue_name
           WHERE a.queue_name=$1 AND a.id=$2 AND a.status='completed' AND a.last_worker_id=$3 AND r.state='Ok'`,
-          [
-            this.queue,
-            f.ownerId,
-            f.token,
-            JSON.stringify(value.data),
-            value.serialization,
-          ],
+          [this.queue, f.ownerId, f.token, data, value.serialization],
         );
         if (previous.rows[0]?.same) return;
         if (previous.rowCount)
@@ -601,16 +603,9 @@ export class PostgresStorage
           );
         throw lost();
       }
-      await this.putResult(
-        c,
-        f.ownerId,
-        f.ownerId,
-        { state: "Ok", ...value },
-        null,
-      );
-      await this.event(c, f.ownerId, "Completed", f.token, {
-        result_stored: true,
-      });
+      // Its own statement: a fresh snapshot sees a park that committed while the UPDATE
+      // above waited on the row lock, so that waiter is not stranded.
+      await this.wake(c, f.ownerId);
     });
     this.hints(f.ownerId);
   }
