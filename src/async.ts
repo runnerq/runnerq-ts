@@ -24,3 +24,43 @@ export async function recover<T>(
     }
   }
 }
+/**
+ * `AbortSignal.any(sources)`, plus `AbortSignal.timeout(timeoutMs)` when given, with the
+ * same reasons; `done()` detaches it from the sources and clears its timer at once, where
+ * those stay registered until a source aborts or the deadline passes.
+ */
+export function linkSignal(
+  sources: readonly AbortSignal[],
+  timeoutMs?: number,
+): { signal: AbortSignal; done: () => void } {
+  const link = new AbortController();
+  const aborted = sources.find((source) => source.aborted);
+  if (aborted) {
+    link.abort(aborted.reason);
+    return { signal: link.signal, done: () => {} };
+  }
+  const follow = (event: Event) =>
+    link.abort((event.target as AbortSignal).reason);
+  for (const source of sources)
+    source.addEventListener("abort", follow, { once: true });
+  const timer =
+    timeoutMs === undefined
+      ? undefined
+      : setTimeout(
+          () =>
+            link.abort(
+              new DOMException(
+                "The operation was aborted due to timeout",
+                "TimeoutError",
+              ),
+            ),
+          timeoutMs,
+        ).unref();
+  return {
+    signal: link.signal,
+    done: () => {
+      clearTimeout(timer);
+      for (const source of sources) source.removeEventListener("abort", follow);
+    },
+  };
+}

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { Client, type Pool, type ClientConfig } from "pg";
-import { pause } from "../async.js";
+import { linkSignal, pause } from "../async.js";
 
 /** Notifications are bounded, lossy hints. Every consumer must recheck stored data. */
 export class Notifications {
@@ -109,7 +109,7 @@ export class Notifications {
     };
     this.bus.on(name, listener);
     this.bus.on("reconnect", listener);
-    const stop = AbortSignal.any(
+    const { signal: stop, done: unlink } = linkSignal(
       signal ? [signal, this.lifetime.signal] : [this.lifetime.signal],
     );
     return {
@@ -140,6 +140,7 @@ export class Notifications {
         });
       },
       close: () => {
+        unlink();
         this.bus.off(name, listener);
         this.bus.off("reconnect", listener);
         wake?.();

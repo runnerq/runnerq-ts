@@ -1,5 +1,5 @@
 import { RunnerQError } from "../errors.js";
-import { pause } from "../async.js";
+import { linkSignal, pause } from "../async.js";
 import { reportExecutor } from "../executor.js";
 import type { Worker } from "../worker.js";
 import { isQueryStorage, QueryError, type QueryStorage } from "../query.js";
@@ -371,7 +371,7 @@ export class Agent {
         "deadline_exceeded",
         "the request expired before it started",
       );
-    const signal = AbortSignal.any([session, AbortSignal.timeout(remaining)]);
+    const { signal, done } = linkSignal([session], remaining);
     const result = await Promise.race([
       Promise.resolve().then(() => handler(env.data ?? {}, signal)),
       new Promise((_, reject) =>
@@ -387,7 +387,7 @@ export class Agent {
           { once: true },
         ),
       ),
-    ]);
+    ]).finally(done);
     const size = Buffer.byteLength(JSON.stringify(result ?? null));
     const limit = this.peerFrameLimit - frameSlack;
     if (size > limit)
