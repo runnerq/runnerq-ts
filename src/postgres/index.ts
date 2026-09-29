@@ -489,16 +489,26 @@ export class PostgresStorage
         types.length === 1
           ? "activity_type=$5"
           : "activity_type=ANY($5::text[])";
+      // One statement claims, logs Dequeued and reads the inputs (one round trip for the
+      // batch); the order is the claim order, which UPDATE RETURNING alone doesn't keep.
       const r = await c.query(
         `WITH picked AS (SELECT id FROM runnerq_activities
         WHERE queue_name=$1 AND status IN ('pending','scheduled','retrying','waiting')
         AND (status='pending' OR scheduled_at<=NOW()) AND ${filter}
         ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC
-        LIMIT $2 FOR UPDATE SKIP LOCKED)
-        UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
+        LIMIT $2 FOR UPDATE SKIP LOCKED),
+        claimed AS (UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
         started_at=NOW(),waiting_result_id=NULL,
         lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
-        FROM picked WHERE a.id=picked.id RETURNING a.*`,
+        FROM picked WHERE a.id=picked.id RETURNING a.*),
+        dequeued AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
+        SELECT $1,id,'Dequeued',current_worker_id,jsonb_build_object('activity_type',activity_type) FROM claimed
+        ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC)
+        SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
+        c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,
+        i.activity_id AS input_id,i.payload,i.serialization
+        FROM claimed c LEFT JOIN runnerq_inputs i ON i.queue_name=$1 AND i.activity_id=c.id
+        ORDER BY c.priority DESC,c.retry_count DESC,COALESCE(c.scheduled_at,c.created_at) ASC`,
         [
           this.queue,
           limit,
@@ -507,37 +517,17 @@ export class PostgresStorage
           types.length === 1 ? types[0] : types,
         ],
       );
-      if (!r.rowCount) return [];
-      const inputs = await c.query(
-        "SELECT activity_id,payload,serialization FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
-        [this.queue, r.rows.map((a) => a.id)],
-      );
-      const payloads = new Map(
-        inputs.rows.map((row) => [row.activity_id, row]),
-      );
-      // UPDATE RETURNING has no guaranteed order; restore the claim ordering.
-      r.rows.sort(
-        (a, b) =>
-          b.priority - a.priority ||
-          b.retry_count - a.retry_count ||
-          new Date(a.scheduled_at ?? a.created_at).getTime() -
-            new Date(b.scheduled_at ?? b.created_at).getTime(),
-      );
-      const result: Claim[] = [];
-      for (const a of r.rows) {
-        if (!payloads.has(a.id))
+      return r.rows.map((a): Claim => {
+        if (!a.input_id)
           throw new RunnerQError(
             "internal",
             `Missing input for activity ${a.id}`,
           );
-        await this.event(c, a.id, "Dequeued", a.current_worker_id, {
-          activity_type: a.activity_type,
-        });
-        result.push({
+        return {
           id: a.id,
           type: a.activity_type,
-          payload: payloads.get(a.id)!.payload,
-          serialization: payloads.get(a.id)!.serialization,
+          payload: a.payload,
+          serialization: a.serialization,
           token: a.current_worker_id,
           dueAt: new Date(a.scheduled_at ?? a.created_at).toISOString(),
           retryCount: a.retry_count,
@@ -547,9 +537,8 @@ export class PostgresStorage
           depth: a.depth,
           metadata: a.metadata ?? {},
           leaseDeadlineMs: Number(a.lease_deadline_ms),
-        });
-      }
-      return result;
+        };
+      });
     });
   }
   async renew(f: Fence, leaseMs: number): Promise<boolean> {
