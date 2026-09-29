@@ -9,7 +9,13 @@ import {
   type ActivityContext,
   type ChildActivityHandle,
 } from "../src/index.js";
-import type { Storage } from "../src/storage.js";
+import type {
+  Storage,
+  QueryStorage,
+  ActivityRecordPage,
+} from "../src/storage.js";
+// @ts-expect-error the query model is exported from runnerq/storage, not the root
+import type { QueryStorage as RootQueryStorage } from "../src/index.js";
 declare const storage: Storage;
 const signup = activity<{ email: string }, { user_id: string }>(
   "SignupWorkflow",
@@ -117,3 +123,7 @@ async function failureTypes() {
   }
 }
 void failureTypes;
+
+declare const queryable: QueryStorage;
+const records: Promise<ActivityRecordPage> = queryable.queryActivities({});
+void records;

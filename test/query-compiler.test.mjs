@@ -14,7 +14,7 @@ import {
   parseWait,
   queryCapabilities,
 } from "../dist/postgres/query.js";
-import { QueryError } from "../dist/query.js";
+import { QueryError } from "../dist/storage.js";
 import { businessKey } from "../dist/codec.js";
 import { encode } from "../dist/serialization.js";
 import { decodeRequest } from "../dist/conductor/decode.js";
