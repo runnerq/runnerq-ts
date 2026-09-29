@@ -3,7 +3,13 @@
 // storage/postgres/query.go over the same schema. Filters compile to parameterised SQL;
 // nothing from a query is ever spliced into SQL text except whitelisted expressions.
 import { RunnerQError } from "../errors.js";
-import { businessKey, type JsonValue } from "../codec.js";
+import {
+  businessKey,
+  isTimestamp,
+  parseInt64,
+  parseUuid,
+  type JsonValue,
+} from "../codec.js";
 import {
   QueryError,
   RecordEvent,
@@ -178,33 +184,6 @@ export function queryCapabilities(): QueryCapabilities {
 }
 
 // --- values ---
-
-const uuidPattern =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/** A canonical UUID, lowercased, or undefined. */
-export function parseUuid(s: string): string | undefined {
-  return uuidPattern.test(s) ? s.toLowerCase() : undefined;
-}
-
-const rfc3339 =
-  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
-/**
- * Whether `s` is an RFC 3339 timestamp (as Go's time.RFC3339Nano parses it). Valid ones
- * go to Postgres as text, so no precision is lost to JavaScript's milliseconds.
- */
-export function isTimestamp(s: unknown): s is string {
-  if (typeof s !== "string") return false;
-  const m = rfc3339.exec(s);
-  if (!m) return false;
-  const [year, month, day, hour, minute, second] = m
-    .slice(1, 7)
-    .map(Number) as [number, number, number, number, number, number];
-  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  if (year < 1 || month < 1 || month > 12 || day < 1 || day > days)
-    return false;
-  if (hour > 23 || minute > 59 || second > 59) return false;
-  return !m[8] || (Number(m[9]) <= 23 && Number(m[10]) <= 59);
-}
 
 /** Formats a percentile label as Go does ("p99.9", never exponent notation). */
 function percentileLabel(p: number): string {
@@ -870,7 +849,8 @@ export class PostgresQueries {
     let where = sb.where(q.filter, "events");
     const [cmp, dir] = q.desc ? ["<", "DESC"] : [">", "ASC"];
     if (q.cursor) {
-      if (!isInt64(q.cursor)) throw invalid("cursor", "invalid cursor");
+      if (parseInt64(q.cursor) === undefined)
+        throw invalid("cursor", "invalid cursor");
       where += ` AND e.id ${cmp} ${sb.arg(q.cursor, "bigint")}`;
     }
     const detail = q.includeDetail ? "e.detail::text" : "NULL::text";
@@ -993,12 +973,6 @@ export class PostgresQueries {
     }
     return tree;
   }
-}
-
-function isInt64(s: string): boolean {
-  if (!/^[+-]?\d+$/.test(s)) return false;
-  const n = BigInt(s);
-  return n >= -(2n ** 63n) && n < 2n ** 63n;
 }
 
 const groupExprs: Record<string, string> = {

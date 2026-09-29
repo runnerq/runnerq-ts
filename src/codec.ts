@@ -46,14 +46,41 @@ export function nonempty(value: string, label: string): void {
       `${label} must be a non-empty string without NUL`,
     );
 }
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A canonical UUID, lowercased, or undefined. */
+export function parseUuid(value: string): string | undefined {
+  return uuidPattern.test(value) ? value.toLowerCase() : undefined;
+}
 export function uuid(value: string): string {
-  if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      value,
-    )
-  )
-    throw new RunnerQError("configuration", "Invalid activity UUID");
-  return value.toLowerCase();
+  const id = parseUuid(value);
+  if (!id) throw new RunnerQError("configuration", "Invalid activity UUID");
+  return id;
+}
+const rfc3339 =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
+/**
+ * Whether `s` is an RFC 3339 timestamp (as Go's time.RFC3339Nano parses it). Callers pass
+ * valid ones on as text, so no precision is lost to JavaScript's milliseconds.
+ */
+export function isTimestamp(s: unknown): s is string {
+  if (typeof s !== "string") return false;
+  const m = rfc3339.exec(s);
+  if (!m) return false;
+  const [year, month, day, hour, minute, second] = m
+    .slice(1, 7)
+    .map(Number) as [number, number, number, number, number, number];
+  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > days)
+    return false;
+  if (hour > 23 || minute > 59 || second > 59) return false;
+  return !m[8] || (Number(m[9]) <= 23 && Number(m[10]) <= 59);
+}
+/** A decimal 64-bit signed integer (as Go's strconv.ParseInt reads it), or undefined. */
+export function parseInt64(s: string): bigint | undefined {
+  if (!/^[+-]?\d+$/.test(s)) return undefined;
+  const n = BigInt(s);
+  return n >= -(2n ** 63n) && n < 2n ** 63n ? n : undefined;
 }
 export function checkpointId(
   owner: string,

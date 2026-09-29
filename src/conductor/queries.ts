@@ -1,6 +1,6 @@
 // The query messages (activities.*, steps.list, events.list, results.get, trees.get),
 // served from a QueryStorage: a port of runnerq-go's conductor/handlers.go.
-import { json, type JsonValue } from "../codec.js";
+import { isTimestamp, json, parseUuid, type JsonValue } from "../codec.js";
 import { decode, type SerializationFormat } from "../serialization.js";
 import type { Storage } from "../storage.js";
 import type {
@@ -12,7 +12,6 @@ import type {
   RecordInclude,
   StepEntry,
 } from "../query.js";
-import { parseUuid, isTimestamp } from "../postgres/query.js";
 import { decodeRequest, type Spec } from "./decode.js";
 import {
   WireError,

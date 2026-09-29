@@ -11,6 +11,7 @@
 // in edge cases, so consumers dedupe by event id.
 import { randomUUID } from "node:crypto";
 import { pause } from "../async.js";
+import { parseInt64 } from "../codec.js";
 import type { EventRecord, QueryFilter, QueryStorage } from "../query.js";
 import { decodeRequest, type Spec } from "./decode.js";
 import {
@@ -112,15 +113,11 @@ export class Streams {
       minDelayMs,
     );
     const after = req.after_cursor ?? "";
-    let cursor = 0n;
-    let resume: bigint | undefined;
-    if (/^[+-]?\d+$/.test(after)) {
-      const n = BigInt(after);
-      if (n >= 0n && n < 2n ** 63n) resume = n;
-    }
+    const seq = parseInt64(after);
+    const resume = seq !== undefined && seq >= 0n ? seq : undefined;
     // Not a cursor this backend issued: start from the end and say so.
     const gap = after !== "" && resume === undefined;
-    if (resume !== undefined) cursor = resume;
+    let cursor = resume ?? 0n;
     if (after === "" || gap) {
       // Validate the filter and find the log's end in one query.
       const last = await this.qs.queryEvents({ filter, desc: true, limit: 1 });

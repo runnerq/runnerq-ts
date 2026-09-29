@@ -5,8 +5,6 @@ import assert from "node:assert/strict";
 import {
   SqlBuilder,
   PostgresQueries,
-  parseUuid,
-  isTimestamp,
   applicationIdempotencyKey,
   canonicalEvent,
   internalEvents,
@@ -15,7 +13,7 @@ import {
   queryCapabilities,
 } from "../dist/postgres/query.js";
 import { QueryError } from "../dist/storage.js";
-import { businessKey } from "../dist/codec.js";
+import { businessKey, isTimestamp, parseUuid } from "../dist/codec.js";
 import { encode } from "../dist/serialization.js";
 import { decodeRequest } from "../dist/conductor/decode.js";
 import {
