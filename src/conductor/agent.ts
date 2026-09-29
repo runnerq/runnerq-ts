@@ -77,6 +77,7 @@ export class Agent {
   private cloudMetadataOnly = false;
   private peerFrameLimit = maxMessageBytes;
   private inFlight = 0;
+  private readonly closeOnAbort = () => void this.close();
   /** The worker's storage, when queryable; queries and streams read it. */
   private readonly qs?: QueryStorage;
 
@@ -108,7 +109,7 @@ export class Agent {
         else this.caps[type] = route.capability;
       }
     }
-    config.signal?.addEventListener("abort", () => void this.close(), {
+    config.signal?.addEventListener("abort", this.closeOnAbort, {
       once: true,
     });
     this.done = this.run();
@@ -123,6 +124,7 @@ export class Agent {
   }
   /** Says goodbye and stops. Resolves once the agent has stopped. */
   async close(): Promise<void> {
+    this.config.signal?.removeEventListener("abort", this.closeOnAbort);
     this.closing = true;
     if (this.socket) this.goodbye(this.socket);
     this.stop.abort();
