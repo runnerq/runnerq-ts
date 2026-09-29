@@ -39,20 +39,12 @@ const getIncludes = ["events", "last_error", "payload", "result", "steps"];
 
 // --- requests ---
 
-export interface WireFilter {
-  and?: WireFilter[];
-  or?: WireFilter[];
-  not?: WireFilter;
-  field?: string;
-  op?: string;
-  value?: unknown;
-}
 interface WireSort {
   field?: string;
   order?: string;
 }
 interface Query {
-  filter?: WireFilter;
+  filter?: QueryFilter;
   sort?: WireSort[];
   include?: string[];
   limit?: number;
@@ -117,20 +109,6 @@ const aggregateSpec: Spec = {
     limit: "int",
   },
 };
-
-/** Converts a wire filter; values keep their JSON types (a JSON null is null). */
-export function toStorageFilter(f?: WireFilter): QueryFilter | undefined {
-  if (!f) return undefined;
-  const out: QueryFilter = {
-    field: f.field ?? "",
-    op: f.op ?? "",
-    value: f.value ?? null,
-  };
-  if (f.and?.length) out.and = f.and.map((t) => toStorageFilter(t)!);
-  if (f.or?.length) out.or = f.or.map((t) => toStorageFilter(t)!);
-  if (f.not) out.not = toStorageFilter(f.not);
-  return out;
-}
 
 /** At most one sort key (the backend adds the tiebreaker); the default order is desc. */
 function oneSort(sorts?: WireSort[]): QuerySort | undefined {
@@ -378,11 +356,10 @@ export class Queries {
 
   private async activitiesList(data: unknown): Promise<unknown> {
     const q = decodeRequest<Query>(querySpec, data);
-    const filter = toStorageFilter(q.filter);
     const inc = this.includes(q.include, recordIncludes);
     const sort = oneSort(q.sort);
     const res = await this.qs.queryActivities({
-      filter,
+      filter: q.filter,
       include: recordInclude(inc),
       limit: q.limit,
       cursor: q.cursor,
@@ -425,9 +402,9 @@ export class Queries {
   }
 
   private async activitiesCount(data: unknown): Promise<unknown> {
-    const req = decodeRequest<{ filter?: WireFilter }>(countSpec, data);
+    const req = decodeRequest<{ filter?: QueryFilter }>(countSpec, data);
     const { count, exact } = await this.qs.countActivities(
-      toStorageFilter(req.filter),
+      req.filter,
       countLimit,
     );
     return { count, exact };
@@ -435,7 +412,7 @@ export class Queries {
 
   private async activitiesAggregate(data: unknown): Promise<unknown> {
     const req = decodeRequest<{
-      filter?: WireFilter;
+      filter?: QueryFilter;
       group_by?: string[];
       bucket?: {
         field?: string;
@@ -446,7 +423,6 @@ export class Queries {
       metrics?: { name?: string; field?: string; percentiles?: number[] }[];
       limit?: number;
     }>(aggregateSpec, data);
-    const filter = toStorageFilter(req.filter);
     let count = false;
     const durations: { field: string; percentiles?: number[] }[] = [];
     for (const m of req.metrics ?? []) {
@@ -471,7 +447,7 @@ export class Queries {
       };
     }
     const rows = await this.qs.aggregateActivities({
-      filter,
+      filter: req.filter,
       groupBy: req.group_by,
       bucket,
       count,
@@ -513,13 +489,12 @@ export class Queries {
 
   private async eventsList(data: unknown): Promise<unknown> {
     const q = decodeRequest<Query>(querySpec, data);
-    const filter = toStorageFilter(q.filter);
     const inc = this.includes(q.include, ["detail"]);
     const sort = oneSort(q.sort);
     if (sort && sort.field !== "at")
       throw fieldError("unsupported", "sort", "events sort by at only");
     const res = await this.qs.queryEvents({
-      filter,
+      filter: q.filter,
       limit: q.limit,
       cursor: q.cursor,
       includeDetail: inc.has("detail"),

@@ -14,12 +14,7 @@ import { pause } from "../async.js";
 import { parseInt64 } from "../codec.js";
 import type { EventRecord, QueryFilter, QueryStorage } from "../query.js";
 import { decodeRequest, type Spec } from "./decode.js";
-import {
-  filterSpec,
-  toEvent,
-  toStorageFilter,
-  type WireFilter,
-} from "./queries.js";
+import { filterSpec, toEvent } from "./queries.js";
 import {
   WireError,
   typeEventsSubscribe,
@@ -96,12 +91,12 @@ export class Streams {
     request: AbortSignal,
   ): Promise<unknown> {
     const req = decodeRequest<{
-      filter?: WireFilter;
+      filter?: QueryFilter;
       after_cursor?: string;
       max_batch?: number;
       max_delay_ms?: number;
     }>(subscribeSpec, data);
-    const filter = toStorageFilter(req.filter);
+    const filter = req.filter;
     const batch = Math.min(
       req.max_batch && req.max_batch > 0 ? req.max_batch : defaultBatch,
       maxBatch,
