@@ -484,7 +484,7 @@ export class PostgresStorage
       executorId && !executorId.includes(":")
         ? `${executorId}:batch:${randomUUID()}`
         : randomUUID();
-    const claims = await this.tx(async (c) => {
+    return this.tx(async (c) => {
       const filter =
         types.length === 1
           ? "activity_type=$5"
@@ -551,8 +551,6 @@ export class PostgresStorage
       }
       return result;
     });
-    if (claims.length) this.hints(undefined, false);
-    return claims;
   }
   async renew(f: Fence, leaseMs: number): Promise<boolean> {
     const rows = await this.query(
@@ -758,15 +756,15 @@ export class PostgresStorage
       "SELECT state,data,serialization FROM runnerq_results WHERE queue_name=$1 AND activity_id=$2",
       [this.queue, id],
     );
-    if (r[0] && !["Ok", "Err"].includes(r[0].state))
+    const row = r[0];
+    if (!row) return null;
+    if (row.state !== "Ok" && row.state !== "Err")
       throw new RunnerQError("serialization", "Invalid stored result state");
-    return r[0]
-      ? {
-          state: r[0].state,
-          data: r[0].data,
-          serialization: r[0].serialization,
-        }
-      : null;
+    return {
+      state: row.state,
+      data: row.data,
+      serialization: row.serialization,
+    };
   }
   async waitResult(id: string, signal?: AbortSignal): Promise<StoredResult> {
     const sub = this.notifications.subscribe(`result:${id}`, signal);
