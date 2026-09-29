@@ -85,16 +85,28 @@ export class Notifications {
       }, 50).unref();
   }
   private async flush(): Promise<void> {
-    const jobs: [string, string][] = [];
-    if (this.work) jobs.push([this.workChannel, ""]);
+    const channels: string[] = [],
+      payloads: string[] = [];
+    if (this.work) {
+      channels.push(this.workChannel);
+      payloads.push("");
+    }
     const ids = [...this.results];
-    for (let i = 0; i < ids.length; i += 200)
-      jobs.push([this.resultChannel, ids.slice(i, i + 200).join(",")]);
+    for (let i = 0; i < ids.length; i += 200) {
+      channels.push(this.resultChannel);
+      payloads.push(ids.slice(i, i + 200).join(","));
+    }
     this.work = false;
     this.results.clear();
-    // Outside the activity transactions, so a hint never precedes its commit.
-    for (const job of jobs)
-      await this.pool.query("SELECT pg_notify($1,$2)", job).catch(() => {});
+    if (!channels.length) return;
+    // Every pending hint in one statement, outside the activity transactions, so a hint
+    // never precedes its commit.
+    await this.pool
+      .query(
+        "SELECT pg_notify(c,p) FROM unnest($1::text[],$2::text[]) AS n(c,p)",
+        [channels, payloads],
+      )
+      .catch(() => {});
   }
   subscribe(
     name: string,
