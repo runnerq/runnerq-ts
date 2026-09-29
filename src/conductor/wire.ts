@@ -64,6 +64,12 @@ export const typeEventsUnsubscribe = "events.unsubscribe";
 export const typeStreamEvents = "stream.events";
 export const typeStreamGap = "stream.gap";
 
+/** Serves one request type: the request's data in, the reply's data out. */
+export type Handler = (data: unknown, signal: AbortSignal) => unknown;
+
+/** The margin left in every frame for the envelope around a reply's or push's data. */
+export const frameSlack = 1_024;
+
 export interface Capability {
   v: number;
   filters?: string[];

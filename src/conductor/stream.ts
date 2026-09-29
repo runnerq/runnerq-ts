@@ -17,10 +17,12 @@ import { decodeRequest, type Spec } from "./decode.js";
 import { filterSpec, toEvent } from "./queries.js";
 import {
   WireError,
+  frameSlack,
   typeEventsSubscribe,
   typeEventsUnsubscribe,
   typeStreamEvents,
   typeStreamGap,
+  type Handler,
 } from "./wire.js";
 
 export const maxSubscriptions = 4;
@@ -30,8 +32,6 @@ const defaultDelayMs = 500;
 const minDelayMs = 50;
 /** How many ids below the cursor each poll looks at again for late commits. */
 export const rescan = 256n;
-/** The margin the agent leaves in every frame for the envelope. */
-const frameSlack = 1_024;
 /** Pushes wait while the socket holds more than this, rather than buffering without bound. */
 const maxBuffered = 8 << 20;
 
@@ -58,8 +58,6 @@ const subscribeSpec: Spec = {
 const unsubscribeSpec: Spec = {
   object: { subscription_id: "string", cursor: "string" },
 };
-
-type Handler = (data: unknown, signal: AbortSignal) => unknown;
 
 /** One session's subscriptions; they end with the session. */
 export class Streams {

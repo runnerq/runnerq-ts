@@ -43,7 +43,6 @@ export const maxFilterDepth = 8;
 export const maxFilterNodes = 64;
 export const maxInValues = 1000;
 export const maxTreeNodes = 5000;
-export const defaultCountLimit = 100_000;
 
 type Kind = "string" | "int" | "time" | "uuid" | "status" | "eventType";
 interface Field {
@@ -720,7 +719,7 @@ export class PostgresQueries {
     filter: QueryFilter | undefined,
     limit: number,
   ): Promise<{ count: number; exact: boolean }> {
-    const max = limit > 0 ? Math.trunc(limit) : defaultCountLimit;
+    const max = limit > 0 ? Math.trunc(limit) : 0;
     const sb = new SqlBuilder();
     const where = sb.where(filter, "activities");
     const rows = await this.run(

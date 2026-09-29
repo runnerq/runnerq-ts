@@ -11,14 +11,14 @@ import {
   typeConfigUpdate,
   typeExecutorDescribe,
   typeExecutorReport,
-  typeEventsSubscribe,
-  typeEventsUnsubscribe,
   typeGoodbye,
   typeHello,
   WireError,
+  frameSlack,
   ts,
   type Capability,
   type Envelope,
+  type Handler,
   type SessionConfig,
   type Welcome,
 } from "./wire.js";
@@ -29,8 +29,6 @@ const maxMessageBytes = 4 << 20;
 const defaultReportIntervalMs = 15_000;
 /** Spaces the reports an executor's changes trigger. */
 const reportMinGapMs = 1_000;
-/** Room for the envelope around a reply's data. */
-const frameSlack = 1_024;
 
 export interface AgentConfig {
   /** The Cloud gateway, e.g. "wss://cloud.runnerq.dev". `/v1/agent` is appended when missing; http(s) maps to ws(s). */
@@ -52,8 +50,6 @@ export interface AgentConfig {
   /** Where connection problems are logged (default: console). */
   logger?: Pick<Console, "info" | "warn">;
 }
-
-type Handler = (data: unknown, signal: AbortSignal) => unknown;
 
 /**
  * Connects a worker to RunnerQ Cloud. It dials out over a WebSocket, describes the worker
@@ -108,12 +104,11 @@ export class Agent {
     if (isQueryStorage(storage)) {
       this.qs = storage;
       const queries = new Queries(storage, storage, () => this.metadataOnly);
-      const caps = queries.capabilities();
-      for (const [type, fn] of Object.entries(queries.handlers()))
-        this.handle(type, caps[type]!, fn);
-      // Stream requests are bound to a session's connection (see connect).
-      this.caps[typeEventsSubscribe] = caps[typeEventsSubscribe]!;
-      this.caps[typeEventsUnsubscribe] = caps[typeEventsUnsubscribe]!;
+      for (const [type, route] of Object.entries(queries.routes())) {
+        // Stream requests have no handler: they are bound to a session (see connect).
+        if (route.handler) this.handle(type, route.capability, route.handler);
+        else this.caps[type] = route.capability;
+      }
     }
     config.signal?.addEventListener("abort", () => void this.close(), {
       once: true,

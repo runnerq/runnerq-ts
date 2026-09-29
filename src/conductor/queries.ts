@@ -27,6 +27,7 @@ import {
   typeStepsList,
   typeTreesGet,
   type Capability,
+  type Handler,
 } from "./wire.js";
 
 /** Bounds steps and events embedded in activities.get. */
@@ -264,7 +265,11 @@ export function toEvent(e: EventRecord): View {
 
 // --- handlers ---
 
-type Handler = (data: unknown, signal: AbortSignal) => unknown;
+/** A request type's advertised capability and, unless it is bound to a session, its handler. */
+export interface Route {
+  capability: Capability;
+  handler?: Handler;
+}
 
 /** The query handlers and what they advertise, over `qs` (results through `storage`). */
 export class Queries {
@@ -274,56 +279,66 @@ export class Queries {
     private readonly metadataOnly: () => boolean,
   ) {}
 
-  capabilities(): Record<string, Capability> {
+  /**
+   * Every query and stream request type. Stream requests have no handler here: they are
+   * served by the session's Streams. Empty lists are left undefined, so they are omitted.
+   */
+  routes(): Record<string, Route> {
     const qc = this.qs.queryCapabilities();
     const nonEmpty = (list: string[]) => (list.length ? list : undefined);
-    const cap = (c: Capability): Capability =>
-      Object.fromEntries(
-        Object.entries(c).filter(([, x]) => x !== undefined),
-      ) as Capability;
+    const filters = nonEmpty(qc.activityFilters);
+    const eventFilters = nonEmpty(qc.eventFilters);
     return {
-      [typeActivitiesList]: cap({
-        v: 1,
-        filters: nonEmpty(qc.activityFilters),
-        sorts: nonEmpty(qc.activitySorts),
-        include: recordIncludes,
-      }),
-      [typeActivitiesGet]: { v: 1, include: getIncludes },
-      [typeActivitiesCount]: cap({
-        v: 1,
-        filters: nonEmpty(qc.activityFilters),
-      }),
-      [typeActivitiesAggregate]: cap({
-        v: 1,
-        filters: nonEmpty(qc.activityFilters),
-        group_by: nonEmpty(qc.groupBy),
-        buckets: nonEmpty(qc.buckets),
-        metrics: ["count", ...qc.durations.map((d) => "duration." + d)],
-      }),
-      [typeStepsList]: { v: 1, include: ["result"] },
-      [typeEventsList]: cap({
-        v: 1,
-        filters: nonEmpty(qc.eventFilters),
-        sorts: ["at"],
-        include: ["detail"],
-      }),
-      [typeResultsGet]: { v: 1 },
-      [typeTreesGet]: { v: 1, include: recordIncludes },
-      [typeEventsSubscribe]: cap({ v: 1, filters: nonEmpty(qc.eventFilters) }),
-      [typeEventsUnsubscribe]: { v: 1 },
-    };
-  }
-
-  handlers(): Record<string, Handler> {
-    return {
-      [typeActivitiesList]: (d) => this.activitiesList(d),
-      [typeActivitiesGet]: (d) => this.activitiesGet(d),
-      [typeActivitiesCount]: (d) => this.activitiesCount(d),
-      [typeActivitiesAggregate]: (d) => this.activitiesAggregate(d),
-      [typeStepsList]: (d) => this.stepsList(d),
-      [typeEventsList]: (d) => this.eventsList(d),
-      [typeResultsGet]: (d) => this.resultsGet(d),
-      [typeTreesGet]: (d) => this.treesGet(d),
+      [typeActivitiesList]: {
+        capability: {
+          v: 1,
+          filters,
+          sorts: nonEmpty(qc.activitySorts),
+          include: recordIncludes,
+        },
+        handler: (d) => this.activitiesList(d),
+      },
+      [typeActivitiesGet]: {
+        capability: { v: 1, include: getIncludes },
+        handler: (d) => this.activitiesGet(d),
+      },
+      [typeActivitiesCount]: {
+        capability: { v: 1, filters },
+        handler: (d) => this.activitiesCount(d),
+      },
+      [typeActivitiesAggregate]: {
+        capability: {
+          v: 1,
+          filters,
+          group_by: nonEmpty(qc.groupBy),
+          buckets: nonEmpty(qc.buckets),
+          metrics: ["count", ...qc.durations.map((d) => "duration." + d)],
+        },
+        handler: (d) => this.activitiesAggregate(d),
+      },
+      [typeStepsList]: {
+        capability: { v: 1, include: ["result"] },
+        handler: (d) => this.stepsList(d),
+      },
+      [typeEventsList]: {
+        capability: {
+          v: 1,
+          filters: eventFilters,
+          sorts: ["at"],
+          include: ["detail"],
+        },
+        handler: (d) => this.eventsList(d),
+      },
+      [typeResultsGet]: {
+        capability: { v: 1 },
+        handler: (d) => this.resultsGet(d),
+      },
+      [typeTreesGet]: {
+        capability: { v: 1, include: recordIncludes },
+        handler: (d) => this.treesGet(d),
+      },
+      [typeEventsSubscribe]: { capability: { v: 1, filters: eventFilters } },
+      [typeEventsUnsubscribe]: { capability: { v: 1 } },
     };
   }
 
