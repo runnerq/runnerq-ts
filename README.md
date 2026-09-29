@@ -297,7 +297,32 @@ await worker.stop();
 - Requests beyond `maxConcurrentRequests` (16) are refused rather than queued; each is
   bounded by `requestTimeoutMs` (30s) or the Cloud's deadline.
 
-This version answers `executor.describe`; querying activities and live events come next.
+### Queries and live events
+
+When the worker's storage can be queried (`PostgresStorage` can; a custom backend opts in
+by implementing `QueryStorage` from `runnerq/storage`), the agent also answers the
+Cloud's queries and streams events:
+
+- `activities.list`, `activities.get`, `activities.count` and `activities.aggregate`
+  (counts and queue/run/total duration percentiles, grouped by status, type, queue or
+  root, optionally in time buckets), `steps.list`, `events.list`, `results.get` and
+  `trees.get`, over every queue in the database, in the Cloud's canonical model
+  (`processing` is `running`, `retrying` is `scheduled`, `Dequeued` is
+  `attempt.started`, and so on).
+- `events.subscribe` tails the event log from a cursor (or the log's end) and pushes
+  batches as `stream.events`, each within the Cloud's frame limit. Subscriptions resume
+  from the last cursor on any executor, catch events whose transaction committed late,
+  and end with the session; a session holds at most four.
+- Filters, sorts, includes and metrics the storage cannot evaluate are refused
+  (`unsupported`, naming the field), never ignored. Paging uses opaque keyset cursors.
+- Payloads and results go out as plain JSON: native (SuperJSON) values are decoded and,
+  when they aren't plain JSON (a `Date`, a `Map`, a `bigint`...), sent as SuperJSON's
+  JSON projection (ISO strings, entry pairs, decimal strings).
+- In metadata-only mode, asking for payloads, results, errors or event details, or for
+  `results.get`, is `forbidden`, and streamed events carry no details.
+
+A running activity's `executor_id` is the id of the worker running it: `PostgresStorage`
+records it in the claim token.
 
 ## Reading state
 

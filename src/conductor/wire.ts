@@ -51,6 +51,18 @@ export const typeGoodbye = "goodbye";
 export const typeConfigUpdate = "config.update";
 export const typeExecutorDescribe = "executor.describe";
 export const typeExecutorReport = "executor.report";
+export const typeActivitiesList = "activities.list";
+export const typeActivitiesGet = "activities.get";
+export const typeActivitiesCount = "activities.count";
+export const typeActivitiesAggregate = "activities.aggregate";
+export const typeStepsList = "steps.list";
+export const typeEventsList = "events.list";
+export const typeResultsGet = "results.get";
+export const typeTreesGet = "trees.get";
+export const typeEventsSubscribe = "events.subscribe";
+export const typeEventsUnsubscribe = "events.unsubscribe";
+export const typeStreamEvents = "stream.events";
+export const typeStreamGap = "stream.gap";
 
 export interface Capability {
   v: number;
