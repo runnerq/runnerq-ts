@@ -6,7 +6,7 @@ import {
   type PoolConfig,
   type QueryResultRow,
 } from "pg";
-import { checkpointId, nonempty, type JsonValue } from "../codec.js";
+import { checkpointId, nonempty } from "../codec.js";
 import { databaseError, RunnerQError, type FailureDetails } from "../errors.js";
 import type { SerializedValue } from "../serialization.js";
 import { integer } from "../options.js";
@@ -50,7 +50,6 @@ export interface PostgresConfig {
   ssl?: PoolConfig["ssl"];
 }
 type Row = QueryResultRow;
-const terminal = ["completed", "failed", "dead_letter"];
 const lost = () =>
   new RunnerQError("claim_lost", "Execution no longer owns this activity");
 const iso = (v: Date | string | null): string | null =>
