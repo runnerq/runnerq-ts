@@ -692,10 +692,17 @@ export class PostgresStorage
     step: string,
   ): Promise<void> {
     await this.tx(async (c) => {
-      await this.fence(c, f);
+      // The fence, the result and (only when the result is new) its ResultStored event:
+      // one statement. The fence's row lock is taken first, as a statement of its own would.
       const r = await c.query(
-        `INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
-        VALUES($1,$2,$3,$4::jsonb,$5,NULLIF($6,''),$7) ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id`,
+        `WITH fenced AS (SELECT id FROM runnerq_activities
+        WHERE queue_name=$2 AND id=$5 AND status='processing' AND current_worker_id=$8 FOR UPDATE),
+        stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        SELECT $1::uuid,$2,$3,$4::jsonb,$5::uuid,NULLIF($6,''),$7 WHERE EXISTS(SELECT 1 FROM fenced)
+        ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id),
+        logged AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
+        SELECT $2,activity_id,'ResultStored',$8,$9::jsonb FROM stored)
+        SELECT EXISTS(SELECT 1 FROM fenced) AS fenced,EXISTS(SELECT 1 FROM stored) AS stored`,
         [
           id,
           this.queue,
@@ -704,9 +711,12 @@ export class PostgresStorage
           f.ownerId,
           step,
           result.serialization,
+          f.token,
+          JSON.stringify({ state: result.state }),
         ],
       );
-      if (!r.rowCount) {
+      if (!r.rows[0].fenced) throw lost();
+      if (!r.rows[0].stored) {
         const same = await c.query(
           `SELECT 1 FROM runnerq_results WHERE activity_id=$1 AND queue_name=$2 AND state=$3
           AND data IS NOT DISTINCT FROM $4::jsonb AND owner_activity_id=$5 AND COALESCE(step,'')=$6 AND serialization=$7`,
@@ -727,7 +737,6 @@ export class PostgresStorage
           );
         return;
       }
-      await this.event(c, id, "ResultStored", f.token, { state: result.state });
       await this.wake(c, id);
     });
     this.hints(id);
