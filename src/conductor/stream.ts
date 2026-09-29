@@ -34,8 +34,8 @@ const maxBuffered = 8 << 20;
 
 /** Where a session's streams write. */
 export interface StreamOutput {
-  /** Writes one event frame; false when the connection can't take it. */
-  send(type: string, data: unknown): boolean;
+  /** Writes one event frame with `data` (JSON text); false when the connection can't take it. */
+  send(type: string, data: string): boolean;
   /** Bytes queued on the socket and not yet written. */
   buffered(): number;
   frameLimit(): number;
@@ -140,10 +140,11 @@ export class Streams {
     void (async () => {
       try {
         if (gap)
-          await t.push(stop.signal, typeStreamGap, {
-            subscription_id: id,
-            since_cursor: after,
-          });
+          await t.push(
+            stop.signal,
+            typeStreamGap,
+            JSON.stringify({ subscription_id: id, since_cursor: after }),
+          );
         await t.run(stop.signal);
       } catch {
         /* the subscription ended */
@@ -251,18 +252,19 @@ export class Tailer {
    */
   async send(signal: AbortSignal, events: EventRecord[]): Promise<void> {
     const budget = this.out.frameLimit() - frameSlack;
-    let items: Record<string, unknown>[] = [];
+    // Items stay JSON text: each is serialized once, to size it and to send it.
+    let items: string[] = [];
     let ids: bigint[] = [];
     let size = 0;
     const flush = async () => {
       if (!items.length) return;
       let cursor = this.cursor;
       for (const id of ids) if (id > cursor) cursor = id;
-      await this.push(signal, typeStreamEvents, {
-        subscription_id: this.id,
-        items,
-        cursor: cursor.toString(),
-      });
+      await this.push(
+        signal,
+        typeStreamEvents,
+        `{"subscription_id":${JSON.stringify(this.id)},"items":[${items.join(",")}],"cursor":"${cursor}"}`,
+      );
       for (const id of ids) this.sent.add(id);
       this.cursor = cursor;
       items = [];
@@ -271,16 +273,18 @@ export class Tailer {
     };
     for (const ev of events) {
       const item = toEvent(ev);
-      let n = encodedSize(item);
+      let json = JSON.stringify(item);
+      let n = Buffer.byteLength(json);
       if (budget > 0 && n > budget && "detail" in item) {
         this.out.log.warn(
           `runnerq-conductor: event ${ev.id} detail is ${n} bytes, over the ${budget}-byte frame limit; streaming the event without it`,
         );
         delete item.detail;
-        n = encodedSize(item);
+        json = JSON.stringify(item);
+        n = Buffer.byteLength(json);
       }
       if (budget > 0 && items.length && size + n + 1 > budget) await flush();
-      items.push(item);
+      items.push(json);
       ids.push(BigInt(ev.id));
       size += n + 1;
     }
@@ -292,14 +296,10 @@ export class Tailer {
    * stops before writing; a started write is never cut short, so an unsubscribe mid-push
    * cannot drop the session.
    */
-  async push(signal: AbortSignal, type: string, data: unknown): Promise<void> {
+  async push(signal: AbortSignal, type: string, data: string): Promise<void> {
     while (this.out.buffered() > maxBuffered) await pause(20, signal);
     signal.throwIfAborted();
     if (!this.out.send(type, data))
       throw new Error("the connection is not open");
   }
-}
-
-function encodedSize(v: unknown): number {
-  return Buffer.byteLength(JSON.stringify(v));
 }

@@ -236,7 +236,7 @@ export class Agent {
           if (this.qs)
             streams = new Streams(this.qs, {
               send: (type, data) =>
-                this.send(ws, { v: protocolVersion, kind: "evt", type, data }),
+                this.send(ws, { v: protocolVersion, kind: "evt", type }, data),
               buffered: () => ws.bufferedAmount,
               frameLimit: () => this.peerFrameLimit,
               metadataOnly: () => this.metadataOnly,
@@ -322,14 +322,12 @@ export class Agent {
       return;
     }
     if (env.kind !== "req") return;
-    const reply = (res: Partial<Envelope>) =>
-      this.send(ws, {
-        v: env.v,
-        kind: "res",
-        id: env.id,
-        type: env.type,
-        ...res,
-      });
+    const reply = (res: Partial<Envelope>, data?: string) =>
+      this.send(
+        ws,
+        { v: env.v, kind: "res", id: env.id, type: env.type, ...res },
+        data,
+      );
     if (this.inFlight >= this.maxRequests) {
       reply({
         error: new WireError(
@@ -342,7 +340,7 @@ export class Agent {
     this.inFlight++;
     void this.serve(env, session, streams)
       .then(
-        (data) => reply({ data }),
+        (data) => reply({}, data),
         (error) => reply({ error: toWireError(error).body() }),
       )
       .finally(() => this.inFlight--);
@@ -352,7 +350,7 @@ export class Agent {
     env: Envelope,
     session: AbortSignal,
     streams?: Streams,
-  ): Promise<unknown> {
+  ): Promise<string | undefined> {
     const handler = this.table.get(env.type) ?? streams?.handler(env.type);
     if (!handler)
       throw new WireError(
@@ -388,14 +386,16 @@ export class Agent {
         ),
       ),
     ]).finally(done);
-    const size = Buffer.byteLength(JSON.stringify(result ?? null));
+    // Serialized once: measured here, then spliced into the reply frame by send().
+    const data = JSON.stringify(result ?? null);
+    const size = Buffer.byteLength(data);
     const limit = this.peerFrameLimit - frameSlack;
     if (size > limit)
       throw new WireError(
         "resource_exhausted",
         `the reply is ${size} bytes, over the ${limit}-byte frame limit; ask for fewer rows or fields`,
       );
-    return result;
+    return result === undefined ? undefined : data;
   }
 
   private goodbye(ws: WebSocket): void {
@@ -410,11 +410,14 @@ export class Agent {
     ws.close(1000, "shutdown");
   }
 
-  /** Writes one frame; false when the connection can't take it. */
-  private send(ws: WebSocket, env: Envelope): boolean {
+  /** Writes one frame, with `data` as its JSON data when given; false when the connection can't take it. */
+  private send(ws: WebSocket, env: Envelope, data?: string): boolean {
     if (ws.readyState !== WebSocket.OPEN) return false;
     try {
-      ws.send(JSON.stringify(env));
+      const frame = JSON.stringify(env);
+      ws.send(
+        data === undefined ? frame : `${frame.slice(0, -1)},"data":${data}}`,
+      );
       return true;
     } catch (error) {
       this.log.warn(`runnerq-conductor: send failed: ${describe(error)}`);
