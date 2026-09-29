@@ -44,6 +44,8 @@ export interface Claim {
   depth: number;
   metadata: Record<string, string>;
   leaseDeadlineMs: number;
+  /** When the activity became due (ISO-8601); the worker reports claim lag from it. */
+  dueAt?: string;
 }
 export interface Park {
   kind: "sleep" | "signal" | "await";

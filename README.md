@@ -248,6 +248,27 @@ Worker events are local observations, emitted after corresponding commits where 
 
 Retention is disabled by default. It deletes complete terminal trees and their inputs, results, checkpoints, events, keys and dependencies atomically. Live consumer trees pin shared producer results. Completion/failure retention clocks are separate; zero keeps that class forever.
 
+### Executor snapshots
+
+A started worker is an executor: `worker.snapshot()` describes it as it is now, and is
+what RunnerQ Cloud shows in Fleet.
+
+```ts
+const worker = new Worker({ storage, labels: { region: "eu-west-1" } });
+const { info, state, counters } = worker.snapshot();
+// info: id, queue, activityTypes, maxConcurrency, startedAt, hostname, sdk, labels
+// state: running (id, type, attempt, startedAt), draining
+// counters since construction: claimed, succeeded, retried, failed, timedOut,
+//   deadLettered, claimsLost, heartbeatFailures, lastClaimLagMs
+```
+
+`worker.id` is random and fixed for the worker's lifetime. `worker.changed()` resolves at
+the next change (an activity starting or finishing, or a drain beginning), so a reporter
+needn't wait for its interval; `reportExecutor()` is that loop, spacing reports by a
+minimum gap. `worker.observe(observer)` (before `start()`) calls `executorStarted(worker)`
+and `executorStopped(id)`; a storage backend that implements both is attached
+automatically, which is how RunnerQ Cloud's storage adapter reports hosted workers.
+
 ## Reading state
 
 The PostgreSQL storage has read methods for scripts and tests. They aren't
