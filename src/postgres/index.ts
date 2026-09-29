@@ -516,6 +516,7 @@ export class PostgresStorage
           payload: payloads.get(a.id)!.payload,
           serialization: payloads.get(a.id)!.serialization,
           token: a.current_worker_id,
+          dueAt: new Date(a.scheduled_at ?? a.created_at).toISOString(),
           retryCount: a.retry_count,
           timeoutMs: Number(a.timeout_seconds) * 1000,
           parentId: a.parent_activity_id,

@@ -5,6 +5,22 @@ export type { ResultOptions, ChildActivityHandle } from "./client.js";
 export { ActivityContext } from "./context.js";
 export type { StepContext } from "./context.js";
 export { Worker } from "./worker.js";
+export {
+  ChangeSignal,
+  reportExecutor,
+  isExecutorObserver,
+} from "./executor.js";
+export type {
+  ExecutorInfo,
+  ExecutorSdk,
+  ExecutorState,
+  ExecutorCounters,
+  ExecutorSnapshot,
+  ExecutorSource,
+  ExecutorObserver,
+  RunningActivity,
+  ReportOptions,
+} from "./executor.js";
 export type { FailureDetails } from "./errors.js";
 export type {
   WorkerConfig,

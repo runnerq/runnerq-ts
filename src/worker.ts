@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { EventEmitter, captureRejectionSymbol } from "node:events";
 import type { ActivityDefinition } from "./activity.js";
 import { ActivityContext } from "./context.js";
@@ -7,6 +8,17 @@ import { integer } from "./options.js";
 import { pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
 import type { Storage, Claim, Fence, Retention } from "./storage.js";
+import {
+  ChangeSignal,
+  isExecutorObserver,
+  thisHostname,
+  thisSdk,
+  type ExecutorCounters,
+  type ExecutorObserver,
+  type ExecutorSnapshot,
+  type ExecutorSource,
+  type RunningActivity,
+} from "./executor.js";
 
 export interface StopSummary {
   drained: boolean;
@@ -47,6 +59,11 @@ export interface WorkerConfig {
   maxActivityDepth?: number;
   retention?: Retention;
   metrics?: Metrics;
+  /**
+   * Free-form tags for this worker (region, deploy version). RunnerQ Cloud shows them
+   * in Fleet, whichever way the worker reports.
+   */
+  labels?: Readonly<Record<string, string>>;
 }
 export type ActivityHandler<I, O> = (
   context: ActivityContext,
@@ -58,7 +75,12 @@ interface Registration {
   handler: ActivityHandler<unknown, unknown>;
 }
 
-export class Worker extends EventEmitter<WorkerEvents> {
+export class Worker
+  extends EventEmitter<WorkerEvents>
+  implements ExecutorSource
+{
+  /** This worker's identity: random, fixed at construction; RunnerQ Cloud's executor id. */
+  readonly id = randomUUID();
   private readonly config: Required<
     Pick<
       WorkerConfig,
@@ -85,6 +107,23 @@ export class Worker extends EventEmitter<WorkerEvents> {
   private stopPromise?: Promise<StopSummary>;
   private resolveClosed!: () => void;
   readonly closed: Promise<void>;
+  private readonly running = new Map<string, RunningActivity>();
+  private readonly counters: ExecutorCounters = {
+    claimed: 0,
+    succeeded: 0,
+    retried: 0,
+    failed: 0,
+    timedOut: 0,
+    deadLettered: 0,
+    claimsLost: 0,
+    heartbeatFailures: 0,
+    lastClaimLagMs: 0,
+  };
+  private readonly changes = new ChangeSignal();
+  private readonly observers: ExecutorObserver[] = [];
+  private startedAt?: Date;
+  private servedTypes?: string[];
+  private readonly hostname = thisHostname();
   constructor(config: WorkerConfig) {
     super({ captureRejections: true });
     this.config = {
@@ -123,6 +162,7 @@ export class Worker extends EventEmitter<WorkerEvents> {
         ? [...config.activityTypes]
         : undefined,
       retention: config.retention ? { ...config.retention } : undefined,
+      labels: { ...config.labels },
     };
     if (this.config.heartbeatMs >= this.config.leaseMs)
       throw new RunnerQError(
@@ -160,6 +200,51 @@ export class Worker extends EventEmitter<WorkerEvents> {
     });
     return this;
   }
+  /**
+   * The worker as it is now: who it is, what it's running, and what it has done since it
+   * was built. RunnerQ Cloud's agent and storage adapter report it.
+   */
+  snapshot(): ExecutorSnapshot {
+    return {
+      info: {
+        id: this.id,
+        queue: this.config.storage.queue,
+        activityTypes: [
+          ...(this.servedTypes ?? [...this.handlers.keys()].sort()),
+        ],
+        maxConcurrency: this.config.concurrency,
+        startedAt: this.startedAt,
+        hostname: this.hostname,
+        sdk: thisSdk(),
+        labels: { ...this.config.labels },
+      },
+      state: {
+        running: [...this.running.values()]
+          .map((a) => ({ ...a }))
+          .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime()),
+        draining: this.state === "stopping" || this.state === "stopped",
+      },
+      counters: { ...this.counters },
+      at: new Date(),
+    };
+  }
+  /** Resolves at the next change: an activity starting or finishing, or a drain beginning. */
+  changed(): Promise<void> {
+    return this.changes.changed();
+  }
+  /**
+   * Tells `observer` when this worker starts and stops, so it can report it. A storage
+   * backend that is an observer is attached without asking. Call before `start()`.
+   */
+  observe(observer: ExecutorObserver): this {
+    if (this.state !== "idle")
+      throw new RunnerQError(
+        "configuration",
+        "Add observers before starting the worker",
+      );
+    this.observers.push(observer);
+    return this;
+  }
   start(): Promise<void> {
     if (this.state !== "idle")
       return Promise.reject(
@@ -180,6 +265,10 @@ export class Worker extends EventEmitter<WorkerEvents> {
           "At least one registered handler is required and all filtered types must be registered",
         );
       this.state = "running";
+      this.startedAt = new Date();
+      this.servedTypes = [...types].sort();
+      if (isExecutorObserver(this.config.storage))
+        this.observers.push(this.config.storage);
       this.maintenance = [
         this.loop(this.config.reaperIntervalMs, () =>
           this.config.storage.reap(this.config.reaperBatchSize),
@@ -192,6 +281,12 @@ export class Worker extends EventEmitter<WorkerEvents> {
           ),
         );
       this.dispatch = this.dispatcher(types);
+      for (const observer of this.observers)
+        try {
+          observer.executorStarted(this);
+        } catch (error) {
+          this.report(error);
+        }
       this.publish("started");
     } catch (error) {
       this.state = "stopped";
@@ -324,10 +419,27 @@ export class Worker extends EventEmitter<WorkerEvents> {
             return;
           }
         } catch (error) {
-          if (!beatSignal.aborted) this.report(error);
+          if (!beatSignal.aborted) {
+            this.counters.heartbeatFailures++;
+            this.report(error);
+          }
         }
       }
     })();
+    const startedAt = new Date();
+    this.running.set(claim.id, {
+      id: claim.id,
+      type: claim.type,
+      attempt: claim.retryCount + 1,
+      startedAt,
+    });
+    this.counters.claimed++;
+    if (claim.dueAt)
+      this.counters.lastClaimLagMs = Math.max(
+        0,
+        startedAt.getTime() - new Date(claim.dueAt).getTime(),
+      );
+    this.changes.notify();
     this.publish("activityStarted", event);
     const started = performance.now();
     let output: unknown,
@@ -380,6 +492,7 @@ export class Worker extends EventEmitter<WorkerEvents> {
     try {
       const reason = handlerSignal.reason;
       if (reason instanceof RunnerQError && reason.code === "claim_lost") {
+        this.counters.claimsLost++;
         this.publish("claimLost", event);
         return;
       }
@@ -405,11 +518,13 @@ export class Worker extends EventEmitter<WorkerEvents> {
         }
         if (!failed) {
           await scope.recover(() => storage.complete(fence, data!), true);
+          this.counters.succeeded++;
           this.publish("activityCompleted", event);
           return;
         }
       }
       if (error instanceof RunnerQError && error.code === "claim_lost") {
+        this.counters.claimsLost++;
         this.publish("claimLost", event);
         return;
       }
@@ -418,6 +533,13 @@ export class Worker extends EventEmitter<WorkerEvents> {
         () => storage.fail(fence, failure.message, retryable(error), failure),
         true,
       );
+      // As Go counts them: a timeout is a timeout, not also a retry.
+      const deadline = handlerAbort.signal.reason;
+      if (deadline instanceof RunnerQError && deadline.code === "timeout")
+        this.counters.timedOut++;
+      else if (status === "failed") this.counters.failed++;
+      else this.counters.retried++;
+      if (status === "dead_letter") this.counters.deadLettered++;
       this.publish(
         status === "retrying"
           ? "activityRetrying"
@@ -427,6 +549,8 @@ export class Worker extends EventEmitter<WorkerEvents> {
         event,
       );
     } finally {
+      this.running.delete(claim.id);
+      this.changes.notify();
       this.metric(() =>
         metrics?.duration("activity_execution", performance.now() - started),
       );
@@ -441,6 +565,7 @@ export class Worker extends EventEmitter<WorkerEvents> {
     if (this.state === "starting") await this.startPromise?.catch(() => {});
     this.state = "stopping";
     this.intake.abort();
+    this.changes.notify();
     const drain = (async () => {
       await this.dispatch;
       await Promise.allSettled([...this.inFlight, ...this.maintenance]);
@@ -457,6 +582,36 @@ export class Worker extends EventEmitter<WorkerEvents> {
       new RunnerQError("timeout", "Worker shutdown budget expired"),
     );
     this.state = "stopped";
+    // Observers may send a goodbye: wait for them, but never longer than the grace
+    // period (at least a second, so a zero-grace stop can still say goodbye). Each
+    // catches its own error, so none rejects.
+    const observerBudget = Math.max(graceMs, 1_000);
+    await Promise.all(
+      this.observers.map(async (observer) => {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            observer.executorStopped(this.id),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () =>
+                  reject(
+                    new RunnerQError(
+                      "timeout",
+                      `An executor observer did not finish stopping within ${observerBudget}ms`,
+                    ),
+                  ),
+                observerBudget,
+              );
+            }),
+          ]);
+        } catch (error) {
+          this.report(error);
+        } finally {
+          clearTimeout(timer);
+        }
+      }),
+    );
     const summary = { drained, remaining: this.inFlight.size };
     this.publish("stopped", summary);
     this.resolveClosed();
