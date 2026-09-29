@@ -3,7 +3,7 @@
 // storage/postgres/query.go over the same schema. Filters compile to parameterised SQL;
 // nothing from a query is ever spliced into SQL text except whitelisted expressions.
 import { RunnerQError } from "../errors.js";
-import type { JsonValue } from "../codec.js";
+import { businessKey, type JsonValue } from "../codec.js";
 import {
   QueryError,
   RecordEvent,
@@ -181,18 +181,9 @@ export function queryCapabilities(): QueryCapabilities {
 
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/**
- * Parses a UUID in the forms Go's uuid.Parse accepts (canonical, urn:uuid:, braced, or 32
- * hex digits); returns it canonical and lowercase, or undefined.
- */
+/** A canonical UUID, lowercased, or undefined. */
 export function parseUuid(s: string): string | undefined {
-  let v = s;
-  if (v.length === 45 && v.slice(0, 9).toLowerCase() === "urn:uuid:")
-    v = v.slice(9);
-  else if (v.length === 38 && v[0] === "{" && v[37] === "}") v = v.slice(1, 37);
-  else if (v.length === 32 && /^[0-9a-f]{32}$/i.test(v))
-    v = `${v.slice(0, 8)}-${v.slice(8, 12)}-${v.slice(12, 16)}-${v.slice(16, 20)}-${v.slice(20)}`;
-  return uuidPattern.test(v) ? v.toLowerCase() : undefined;
+  return uuidPattern.test(s) ? s.toLowerCase() : undefined;
 }
 
 const rfc3339 =
@@ -339,8 +330,7 @@ export class SqlBuilder {
   }
   /**
    * Matches the application's key (see applicationIdempotencyKey) against how it is
-   * stored: as a v2 business key for the row's own type, a legacy "<key>-<type>" key, or
-   * as is. Step-derived keys are not application keys. Encoded keys can't be matched by
+   * stored: as a v2 business key for the row's own type, or as is. Step-derived keys are not application keys. Encoded keys can't be matched by
    * prefix or substring.
    */
   private idempotencyKey(f: QueryFilter): string {
@@ -362,7 +352,7 @@ export class SqlBuilder {
         // The v2 encoding, computed per row for its type: base64 without padding
         // (Postgres wraps base64 at 76 characters, so drop newlines).
         const v2 = `'rq:key:v2:' || rtrim(translate(encode(convert_to(octet_length(k) || ':' || k || a.activity_type, 'UTF8'), 'base64'), E'\\n', ''), '=')`;
-        const match = `EXISTS (SELECT 1 FROM unnest(${this.arg(raw, "text[]")}) AS keys(k) WHERE ${stored} = ${v2} OR ${stored} = k || '-' || a.activity_type OR (${stored} = k AND left(${stored}, 10) <> 'rq:key:v2:'))`;
+        const match = `EXISTS (SELECT 1 FROM unnest(${this.arg(raw, "text[]")}) AS keys(k) WHERE ${stored} = ${v2} OR (${stored} = k AND left(${stored}, 10) <> 'rq:key:v2:'))`;
         const cond = `(${hasKey} AND ${match})`;
         return f.op === "ne" || f.op === "nin" ? `(NOT ${cond})` : cond;
       }
@@ -521,32 +511,30 @@ export function clampLimit(
 const businessKeyPrefix = "rq:key:v2:";
 /** Starts the keys the engine derives for activities spawned by a step. */
 const stepKeyPrefix = "rq:step:";
+/** Decodes a key `businessKey` encoded; anything it could not have produced is undefined. */
 function decodeBusinessKey(
   encoded: string,
 ): { key: string; type: string } | undefined {
   if (!encoded.startsWith(businessKeyPrefix)) return undefined;
-  const body = encoded.slice(businessKeyPrefix.length);
-  if (!/^[A-Za-z0-9+/]*$/.test(body) || body.length % 4 === 1) return undefined;
-  const data = Buffer.from(body, "base64");
+  const data = Buffer.from(encoded.slice(businessKeyPrefix.length), "base64");
   const colon = data.indexOf(":");
   if (colon < 0) return undefined;
-  const lenText = data.subarray(0, colon).toString("utf8");
-  if (!/^[+-]?\d+$/.test(lenText)) return undefined;
-  const n = Number(lenText);
-  if (n < 0 || n > data.length - colon - 1) return undefined;
+  const n = Number(data.subarray(0, colon).toString("utf8"));
+  if (!Number.isSafeInteger(n) || n < 0 || n > data.length - colon - 1)
+    return undefined;
   const key = data.subarray(colon + 1, colon + 1 + n).toString("utf8");
   const type = data.subarray(colon + 1 + n).toString("utf8");
-  const again =
-    businessKeyPrefix +
-    Buffer.from(`${Buffer.byteLength(key)}:${key}${type}`)
-      .toString("base64")
-      .replace(/=+$/, "");
-  return again === encoded ? { key, type } : undefined;
+  try {
+    // Only an exact re-encoding proves the split (and the base64) canonical.
+    return businessKey(key, type) === encoded ? { key, type } : undefined;
+  } catch {
+    return undefined; // an empty key or type: not one businessKey wrote
+  }
 }
 /**
  * The key the application set, from the key as stored and the activity's type. Stored
- * keys are v2 business keys, legacy "<key>-<type>" keys, keys written directly through
- * the storage API (returned as they are), or keys derived for a step's child ("").
+ * keys are v2 business keys, keys written directly through the storage API (returned as
+ * they are), or keys derived for a step's child ("").
  */
 export function applicationIdempotencyKey(
   stored: string,
@@ -554,11 +542,7 @@ export function applicationIdempotencyKey(
 ): string {
   if (!stored || stored.startsWith(stepKeyPrefix)) return "";
   const business = decodeBusinessKey(stored);
-  if (business) return business.type === type ? business.key : stored;
-  const suffix = "-" + type;
-  if (type && stored.endsWith(suffix) && stored.length > suffix.length)
-    return stored.slice(0, -suffix.length);
-  return stored;
+  return business?.type === type ? business.key : stored;
 }
 
 // --- activities ---

@@ -210,13 +210,13 @@ test("values that can't match compile to constants", () => {
     compile({ field: "type", op: "eq", value: "made.up" }, "events").sql,
     "false",
   );
-  // UUIDs are normalised; unparseable ones in a list are dropped.
+  // UUIDs are lowercased; ones this backend could not have issued are dropped.
   const { args } = compile({
     field: "id",
     op: "in",
     value: [id.toUpperCase(), "{" + id + "}", "nope"],
   });
-  assert.deepEqual(args, [[id, id]]);
+  assert.deepEqual(args, [[id]]);
 });
 
 test("event filters: canonical types, roots and seq", () => {
@@ -304,16 +304,10 @@ test("capabilities match the Go agent's", () => {
 });
 
 test("ids, timestamps and idempotency keys", () => {
-  for (const form of [
-    id,
-    id.toUpperCase(),
-    `urn:uuid:${id}`,
-    `{${id}}`,
-    id.replaceAll("-", ""),
-  ])
+  for (const form of [id, id.toUpperCase()])
     assert.equal(parseUuid(form), id, form);
-  for (const bad of ["", "x", id + "0", `{${id}`, "urn:uuid:x"])
-    assert.equal(parseUuid(bad), undefined);
+  for (const bad of ["", "x", id + "0", `{${id}}`, id.replaceAll("-", "")])
+    assert.equal(parseUuid(bad), undefined, bad);
   for (const ok of [
     "2026-09-29T10:00:00Z",
     "2026-09-29T10:00:00.123456789+02:00",
@@ -335,10 +329,6 @@ test("ids, timestamps and idempotency keys", () => {
   );
   const other = businessKey("order-42", "Refund");
   assert.equal(applicationIdempotencyKey(other, "Charge"), other);
-  assert.equal(
-    applicationIdempotencyKey("order-42-Charge", "Charge"),
-    "order-42",
-  );
   assert.equal(applicationIdempotencyKey("rq:step:a:b:c", "Charge"), "");
   assert.equal(applicationIdempotencyKey("raw", "Charge"), "raw");
   assert.equal(
