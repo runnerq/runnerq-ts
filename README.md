@@ -269,6 +269,36 @@ minimum gap. `worker.observe(observer)` (before `start()`) calls `executorStarte
 and `executorStopped(id)`; a storage backend that implements both is attached
 automatically, which is how RunnerQ Cloud's storage adapter reports hosted workers.
 
+## RunnerQ Cloud
+
+The conductor agent connects a worker to RunnerQ Cloud. It dials out over a WebSocket (no
+inbound port), describes the worker, and reports it on an interval and within about a
+second of a change.
+
+```ts
+import { startAgent } from "runnerq/conductor";
+
+await worker.start();
+const agent = startAgent(worker, {
+  url: "wss://cloud.runnerq.dev",
+  apiKey: process.env.RUNNERQ_CONDUCTOR_KEY!,
+});
+// ...
+await agent.close(); // before stopping the worker: the Cloud records a clean shutdown
+await worker.stop();
+```
+
+- The worker shows in Fleet as an executor (`worker.id`), with its host, queue, activity
+  types, capacity, labels, what it's running and its counters.
+- `startAgent` returns at once; the agent reconnects with backoff when the connection
+  drops. `signal` stops it like `close()`.
+- `metadataOnly: true` keeps payloads, results, errors and event details from ever
+  leaving the process, whatever the Cloud asks.
+- Requests beyond `maxConcurrentRequests` (16) are refused rather than queued; each is
+  bounded by `requestTimeoutMs` (30s) or the Cloud's deadline.
+
+This version answers `executor.describe`; querying activities and live events come next.
+
 ## Reading state
 
 The PostgreSQL storage has read methods for scripts and tests. They aren't
