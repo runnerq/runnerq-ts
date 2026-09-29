@@ -67,8 +67,9 @@ export interface ExecutorSource {
  * Hears a worker start and stop, and reads its snapshots from the source on its own
  * schedule. A worker calls every observer given to `observe()`, and its storage when the
  * storage is an observer (RunnerQ Cloud's storage adapter reports hosted workers this way).
- * Both calls must return promptly; `executorStopped` may return a promise the worker awaits
- * (bounded by the stop's grace period) so a final report can be sent.
+ * Both calls must return promptly; `executorStopped` may return a promise the worker awaits,
+ * so a final report can be sent, for up to the stop's grace period (at least a second).
+ * Past that, or if it fails, the worker reports a `workerError` and finishes stopping.
  */
 export interface ExecutorObserver {
   executorStarted(source: ExecutorSource): void;

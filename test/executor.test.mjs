@@ -223,3 +223,29 @@ test("reportExecutor: on the interval, soon after changes, spaced by the gap", a
     `${plain.length} interval reports`,
   );
 });
+
+test("a stuck or failing observer can't hold up stop()", async () => {
+  const worker = new Worker({ storage: fakeStorage() });
+  worker.register(activity("noop"), () => null);
+  const errors = [];
+  worker.on("workerError", (e) => errors.push(e.message));
+  worker.observe({
+    executorStarted() {},
+    executorStopped: () => new Promise(() => {}), // never settles
+  });
+  worker.observe({
+    executorStarted() {},
+    executorStopped: async () => {
+      throw new Error("goodbye failed");
+    },
+  });
+  await worker.start();
+  const began = Date.now();
+  await within(worker.stop({ graceMs: 0 }), 3_000, "stop to finish");
+  const took = Date.now() - began;
+  assert.ok(took >= 900 && took < 2_500, `stop took ${took}ms`);
+  assert.ok(
+    errors.some((m) => m.includes("did not finish stopping within 1000ms")),
+  );
+  assert.ok(errors.includes("goodbye failed"));
+});
