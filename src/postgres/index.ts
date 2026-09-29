@@ -647,39 +647,44 @@ export class PostgresStorage
         Number(a.max_retry_delay_seconds) || 3600,
         Number(a.retry_delay_seconds) * 2 ** Math.min(a.retry_count + 1, 52),
       );
+      // Transition, terminal result and event in one statement; the wake stays separate.
+      const result = again
+        ? null
+        : JSON.stringify({
+            error: reason,
+            ...(failure ? { failure } : {}),
+            type: retry ? "dead_letter" : "non_retryable",
+            failed_at: new Date().toISOString(),
+          });
       await c.query(
-        `UPDATE runnerq_activities SET status=$4,last_error=$5,last_error_at=NOW(),last_worker_id=$3,
+        `WITH failed AS (UPDATE runnerq_activities SET status=$4,last_error=$5,last_error_at=NOW(),last_worker_id=$3,
         current_worker_id=NULL,lease_deadline_ms=NULL,waiting_result_id=NULL,
         retry_count=retry_count+CASE WHEN $4='retrying' THEN 1 ELSE 0 END,
         scheduled_at=CASE WHEN $4='retrying' THEN NOW()+$6*INTERVAL '1 second' ELSE scheduled_at END,
         started_at=CASE WHEN $4='retrying' THEN NULL ELSE started_at END,
-        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2`,
-        [this.queue, f.ownerId, f.token, status, reason, delay],
-      );
-      if (!again)
-        await this.putResult(
-          c,
+        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2),
+        stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
+        SELECT $2::uuid,$1,'Err',$7::jsonb,$2::uuid,NULL,'json-v1' WHERE $7::jsonb IS NOT NULL
+        ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
+        WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id)
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($1,$2,$8,$3,$9::jsonb)`,
+        [
+          this.queue,
           f.ownerId,
-          f.ownerId,
-          {
-            state: "Err",
-            serialization: "json-v1",
-            data: {
-              error: reason,
-              ...(failure ? { failure } : {}),
-              type: retry ? "dead_letter" : "non_retryable",
-              failed_at: new Date().toISOString(),
-            },
-          },
-          null,
-        );
-      await this.event(
-        c,
-        f.ownerId,
-        again ? "Retrying" : retry ? "DeadLetter" : "Failed",
-        f.token,
-        { error: reason, retryable: retry, ...(failure ? { failure } : {}) },
+          f.token,
+          status,
+          reason,
+          delay,
+          result,
+          again ? "Retrying" : retry ? "DeadLetter" : "Failed",
+          JSON.stringify({
+            error: reason,
+            retryable: retry,
+            ...(failure ? { failure } : {}),
+          }),
+        ],
       );
+      if (!again) await this.wake(c, f.ownerId);
       return status;
     });
     this.hints(status === "retrying" ? undefined : f.ownerId);
