@@ -587,12 +587,33 @@ export class Worker
       new RunnerQError("timeout", "Worker shutdown budget expired"),
     );
     this.state = "stopped";
-    await Promise.allSettled(
+    // Observers may send a goodbye: wait for them, but never longer than the grace
+    // period (at least a second, so a zero-grace stop can still say goodbye). Each
+    // catches its own error, so none rejects.
+    const observerBudget = Math.max(graceMs, 1_000);
+    await Promise.all(
       this.observers.map(async (observer) => {
+        let timer: NodeJS.Timeout | undefined;
         try {
-          await observer.executorStopped(this.id);
+          await Promise.race([
+            observer.executorStopped(this.id),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () =>
+                  reject(
+                    new RunnerQError(
+                      "timeout",
+                      `An executor observer did not finish stopping within ${observerBudget}ms`,
+                    ),
+                  ),
+                observerBudget,
+              );
+            }),
+          ]);
         } catch (error) {
           this.report(error);
+        } finally {
+          clearTimeout(timer);
         }
       }),
     );
