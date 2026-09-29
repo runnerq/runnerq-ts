@@ -38,7 +38,6 @@ export interface StreamOutput {
   send(type: string, data: unknown): boolean;
   /** Bytes queued on the socket and not yet written. */
   buffered(): number;
-  /** The Cloud's frame limit. */
   frameLimit(): number;
   metadataOnly(): boolean;
   log: Pick<Console, "warn">;

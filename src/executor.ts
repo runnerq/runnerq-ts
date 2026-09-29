@@ -26,7 +26,6 @@ export interface RunningActivity {
   attempt: number;
   startedAt: Date;
 }
-/** What the executor is doing now. */
 export interface ExecutorState {
   running: RunningActivity[];
   /** A stop has begun: intake has stopped and running activities finish. */
@@ -140,7 +139,6 @@ export async function reportExecutor(options: ReportOptions): Promise<void> {
 }
 
 let sdk: ExecutorSdk | undefined;
-/** Names the runnerq SDK in this process. */
 export function thisSdk(): ExecutorSdk {
   if (!sdk) {
     let version = "unknown";

@@ -34,7 +34,6 @@ export interface QueryStorage {
   ): Promise<ActivityTree>;
 }
 
-/** Whether `storage` implements `QueryStorage`. */
 export function isQueryStorage(storage: unknown): storage is QueryStorage {
   const s = storage as Partial<Record<keyof QueryStorage, unknown>> | null;
   return (
@@ -126,7 +125,6 @@ export interface RecordInclude {
   lastError?: boolean;
 }
 
-/** A filtered, sorted, paginated activity query. */
 export interface ActivityQuery {
   filter?: QueryFilter;
   /** Default: created_at descending. */

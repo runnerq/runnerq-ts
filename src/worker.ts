@@ -197,7 +197,6 @@ export class Worker
     });
     return this;
   }
-  /** The storage this worker runs activities on. */
   get storage(): Storage {
     return this.config.storage;
   }

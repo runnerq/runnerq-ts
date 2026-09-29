@@ -64,7 +64,6 @@ export const typeEventsUnsubscribe = "events.unsubscribe";
 export const typeStreamEvents = "stream.events";
 export const typeStreamGap = "stream.gap";
 
-/** Serves one request type: the request's data in, the reply's data out. */
 export type Handler = (data: unknown, signal: AbortSignal) => unknown;
 
 /** The margin left in every frame for the envelope around a reply's or push's data. */
@@ -92,7 +91,6 @@ export interface Welcome {
   limits?: { max_frame_bytes?: number; max_concurrent_requests?: number };
 }
 
-/** An error's message for logs and replies. */
 export function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

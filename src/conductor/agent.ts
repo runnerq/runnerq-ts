@@ -114,7 +114,6 @@ export class Agent {
     this.done = this.run();
   }
 
-  /** Whether a session with the Cloud is open. */
   get connected(): boolean {
     return this.session !== "";
   }
@@ -130,7 +129,6 @@ export class Agent {
     await this.done;
   }
 
-  /** Serves `type` with `fn`, advertised with `capability`. */
   protected handle(type: string, capability: Capability, fn: Handler): void {
     this.table.set(type, fn);
     this.caps[type] = capability;
@@ -458,7 +456,6 @@ function agentUrl(raw: string): string {
 function positive(value: number | undefined, fallback: number): number {
   return value && value > 0 ? value : fallback;
 }
-/** Maps a handler's error to the wire. */
 export function toWireError(error: unknown): WireError {
   if (error instanceof WireError) return error;
   if (error instanceof QueryError)

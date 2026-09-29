@@ -158,7 +158,6 @@ export function canonicalEvent(internal: string): string {
     ? canonicalEvents[internal]!
     : "other." + internal.toLowerCase();
 }
-/** The internal event names a canonical type covers. */
 export function internalEvents(canonical: string): string[] {
   const out = Object.entries(canonicalEvents)
     .filter(([, c]) => c === canonical)
@@ -713,7 +712,6 @@ export class PostgresQueries {
     return n > max ? { count: max, exact: false } : { count: n, exact: true };
   }
 
-  /** Groups activities and computes counts and duration percentiles, optionally bucketed. */
   async aggregate(q: AggregateQuery): Promise<AggregateRows> {
     if (!q.count && !q.durations?.length)
       throw invalid("metrics", "ask for at least one metric");
