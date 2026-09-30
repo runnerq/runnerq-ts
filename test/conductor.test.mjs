@@ -136,6 +136,28 @@ test("protocol errors, deadlines and the request limit", async (t) => {
   assert.equal((await g.call("executor.describe", {})).error, undefined);
 });
 
+test("request timeouts past setTimeout's range do not expire early", async (t) => {
+  const g = await fakeGateway(t);
+  const { worker: w } = await worker(t);
+  const agent = startAgent(w, {
+    url: g.url,
+    apiKey: key,
+    requestTimeoutMs: 30 * 86_400_000,
+    logger: quiet,
+  });
+  t.after(() => agent.close());
+  await g.until(() => agent.connected, "connection");
+
+  // An overflowing timer would abort this after ~1 ms.
+  agent.handle("slow", { v: 1 }, async (_, signal) => {
+    await new Promise((r) => setTimeout(r, 50));
+    return { aborted: signal.aborted };
+  });
+  const reply = await g.call("slow", {});
+  assert.equal(reply.error, undefined);
+  assert.deepEqual(reply.data, { aborted: false });
+});
+
 test("oversized replies and failing handlers", async (t) => {
   const g = await fakeGateway(t, { frame: 64 << 10 });
   const { worker: w } = await worker(t);
