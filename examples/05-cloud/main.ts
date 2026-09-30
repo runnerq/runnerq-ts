@@ -64,8 +64,9 @@ worker.register(PlaceOrder, async (ctx, order) => {
 
 await worker.start();
 // Dials out over a WebSocket: the worker appears in Fleet, and the console reads
-// activities from this database through it.
-const agent = startAgent(worker, { url, apiKey });
+// activities from this database through it. allowControl lets the console cancel,
+// retry, reschedule and signal them too.
+const agent = startAgent(worker, { url, apiKey, allowControl: true });
 console.log(
   `worker ${worker.id} connected to ${url}; placing an order every 3s`,
 );
