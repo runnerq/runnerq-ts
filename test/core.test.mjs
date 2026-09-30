@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { activity, runner, Worker } from "../dist/index.js";
 import { json, businessKey, checkpointId } from "../dist/codec.js";
 import { executionOptions } from "../dist/options.js";
+import { fakeStorage, until } from "./helpers.mjs";
 
 test("activity options are immutable, composable and last wins without losing defaults", () => {
   assert.equal(executionOptions([]).maxAttempts, "unlimited");
@@ -76,4 +77,61 @@ test("names are explicit and worker registration validates routing", async () =>
   w.register(a, () => null);
   assert.throws(() => w.register(a, () => null));
   assert.throws(() => new Worker({ storage: {}, concurrency: 0 }));
+});
+
+test("a signal wait past setTimeout's range parks on one timer instead of spinning", async (t) => {
+  const DAY_MS = 86_400_000;
+  const results = new Map();
+  let waits = 0,
+    deliver;
+  const storage = fakeStorage({
+    async checkpoint(_fence, id, result) {
+      results.set(id, result);
+    },
+    async getResult(id) {
+      return results.get(id) ?? null;
+    },
+    waitResult(id, signal) {
+      waits++;
+      return new Promise((resolve, reject) => {
+        deliver = () => resolve(results.get(id));
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    },
+  });
+  const w = new Worker({ storage });
+  w.register(activity("Approval"), (ctx) =>
+    ctx.waitForSignal("go", { timeoutMs: 30 * DAY_MS }),
+  );
+  await w.start();
+  t.after(() => w.stop({ graceMs: 100 }));
+  const id = "22222222-2222-4222-8222-222222222222";
+  storage.push({
+    id,
+    type: "Approval",
+    payload: null,
+    serialization: "json-v1",
+    token: "t",
+    retryCount: 0,
+    timeoutMs: 40 * DAY_MS,
+    parentId: null,
+    rootId: id,
+    depth: 0,
+    metadata: {},
+    leaseDeadlineMs: Date.now() + 60_000,
+  });
+  await until(() => waits > 0, 3_000, "signal wait");
+  // An overflowing timeout aborts after ~1 ms and re-arms in a loop.
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(waits, 1);
+  results.set(checkpointId(id, "signal", "go"), {
+    state: "Ok",
+    serialization: "json-v1",
+    data: "approved",
+  });
+  deliver();
+  await until(() => storage.outcomes.length, 3_000, "completion");
+  assert.deepEqual(storage.outcomes, [["complete", id]]);
 });

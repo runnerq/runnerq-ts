@@ -227,10 +227,10 @@ export class ActivityContext {
                 Math.min(deadline, Date.now() + 60_000),
               ).toISOString(),
             });
-          const signal = AbortSignal.any([
-            s.signal,
-            AbortSignal.timeout(Math.max(1, Math.ceil(deadline - Date.now()))),
-          ]);
+          const { signal, done } = linkSignal(
+            [s.signal],
+            Math.max(1, Math.ceil(deadline - Date.now())),
+          );
           try {
             const result = await s.recover(
               () => s.storage.waitResult(resultId, signal),
@@ -240,6 +240,8 @@ export class ActivityContext {
             return parse(decode(result), options.parse, `signal ${name}`);
           } catch (error) {
             if (!signal.aborted || s.signal.aborted) throw error;
+          } finally {
+            done();
           }
         }
       }),
