@@ -125,7 +125,7 @@ const canonicalStatuses: Record<string, string[]> = {
   cancelled: ["cancelled"],
 };
 const canonicalStatusSQL = `CASE a.status WHEN 'processing' THEN 'running' WHEN 'retrying' THEN 'scheduled' ELSE a.status END`;
-function canonicalStatus(internal: string): RecordStatus {
+export function canonicalStatus(internal: string): RecordStatus {
   if (internal === "processing") return "running";
   if (internal === "retrying") return "scheduled";
   return internal as RecordStatus;

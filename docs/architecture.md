@@ -10,7 +10,7 @@ Lease renewal verifies ownership; claim loss cancels the handler signal. Timeout
 
 ## Schema baseline
 
-`PostgresStorage.initialize` is an explicit, advisory-lock-coordinated baseline initializer. It creates all seven tables and current indexes atomically only when none exists. On an existing schema it validates instead of migrating. `connect` performs catalog reads only. Validation covers types, nullability, defaults, primary keys, index definitions and index validity, and rejects inline payload columns.
+`PostgresStorage.initialize` is an explicit, advisory-lock-coordinated baseline initializer. It creates all tables and current indexes atomically only when none exists. On an existing schema it validates instead of migrating, except for tables added after the baseline (the `runnerq_commands` ledger), which it creates when missing, as Go defines them. `connect` performs catalog reads only and accepts a database without those added tables, checking them when present; applying a command with an id then fails until `initialize` adds the ledger. Validation covers types, nullability, defaults, primary keys, index definitions and index validity, and rejects inline payload columns.
 
 The schema lock uses the same numeric key as Go. The baseline preserves final names such as the `_v2` dequeue indexes without reproducing old indexes or migration history. The separate-input design is a deliberate schema break. Initialization must never be run as an attempted conversion of a live Go installation.
 

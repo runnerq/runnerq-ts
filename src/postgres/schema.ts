@@ -65,10 +65,21 @@ CREATE INDEX idx_runnerq_worker_pools_queue_alive ON runnerq_worker_pools(queue_
 CREATE INDEX idx_runnerq_dependencies_result ON runnerq_dependencies(queue_name, result_id);
 CREATE INDEX idx_runnerq_dependencies_producer ON runnerq_dependencies(queue_name, producer_activity_id);
 `;
+/**
+ * Tables added after the baseline, as Go defines them: initialize creates them in an existing
+ * database, and connect accepts a database without them (checking them when present).
+ */
+export const additions = `
+CREATE TABLE runnerq_commands (
+ queue_name TEXT NOT NULL, command_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+ kind TEXT NOT NULL, result JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY(queue_name, command_id)
+);
+CREATE INDEX idx_runnerq_commands_created ON runnerq_commands(created_at);
+`;
 export const schemaLock = "5932734182207934753"; // 0x52554E4E45525121, shared with Go.
-export const tableNames = [...schema.matchAll(/CREATE TABLE (\w+)/g)].map(
-  (m) => m[1]!,
-);
-export const indexNames = [...schema.matchAll(/CREATE INDEX (\w+)/g)].map(
-  (m) => m[1]!,
-);
+const names = (sql: string, re: RegExp) =>
+  [...sql.matchAll(re)].map((m) => m[1]!);
+export const tableNames = names(schema + additions, /CREATE TABLE (\w+)/g);
+export const indexNames = names(schema + additions, /CREATE INDEX (\w+)/g);
+export const additionTables = names(additions, /CREATE TABLE (\w+)/g);

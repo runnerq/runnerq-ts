@@ -23,8 +23,18 @@ import type {
   ListOptions,
   StepRecord,
   ActivityEvent,
+  Command,
+  CommandResult,
+  CommandStorage,
 } from "../storage.js";
-import { schema, schemaLock, tableNames, indexNames } from "./schema.js";
+import {
+  additions,
+  additionTables,
+  indexNames,
+  schema,
+  schemaLock,
+  tableNames,
+} from "./schema.js";
 import { PostgresQueries, queryCapabilities } from "./query.js";
 import type {
   QueryStorage,
@@ -41,6 +51,8 @@ import type {
   ActivityTree,
 } from "../query.js";
 import { Notifications } from "./notifications.js";
+import { PostgresCommands } from "./command.js";
+import { deleteTree, lockTree, terminalSQL } from "./trees.js";
 
 export interface PostgresConfig {
   connectionString: string;
@@ -79,7 +91,9 @@ function canonicalIndex(sql: string): string {
     .replace(/\s+asc\b/g, "")
     .replace(/[\s"()[\];]/g, "");
 }
+/** Checks the schema without DDL; addition tables may be absent, and are checked when present. */
 async function verifySchema(client: PoolClient): Promise<void> {
+  const ddl = schema + additions;
   const columns = await client.query(
     `SELECT table_name,column_name,udt_name,is_nullable,column_default FROM information_schema.columns
     WHERE table_schema=current_schema() AND table_name=ANY($1)`,
@@ -88,6 +102,9 @@ async function verifySchema(client: PoolClient): Promise<void> {
   const actual = new Map(
     columns.rows.map((r) => [`${r.table_name}.${r.column_name}`, r]),
   );
+  const present = new Set(columns.rows.map((r) => r.table_name as string));
+  const absent = (table: string) =>
+    additionTables.includes(table) && !present.has(table);
   const types: Record<string, string> = {
     UUID: "uuid",
     TEXT: "text",
@@ -98,9 +115,8 @@ async function verifySchema(client: PoolClient): Promise<void> {
     BIGSERIAL: "int8",
     TIMESTAMPTZ: "timestamptz",
   };
-  for (const table of schema.matchAll(
-    /CREATE TABLE (\w+) \(([\s\S]*?)\n\);/g,
-  )) {
+  for (const table of ddl.matchAll(/CREATE TABLE (\w+) \(([\s\S]*?)\n\);/g)) {
+    if (absent(table[1]!)) continue;
     for (const col of table[2]!.matchAll(
       /\b(\w+) (UUID|TEXT|JSONB|INTEGER|SMALLINT|BIGINT|BIGSERIAL|TIMESTAMPTZ)(\[\])?([^,\n]*)/g,
     )) {
@@ -141,7 +157,10 @@ async function verifySchema(client: PoolClient): Promise<void> {
     WHERE n.nspname=current_schema() AND c.relname=ANY($1)`,
     [indexNames],
   );
-  for (const expected of schema.matchAll(/CREATE INDEX (\w+)[\s\S]*?;/g)) {
+  for (const expected of ddl.matchAll(
+    /CREATE INDEX (\w+) ON (\w+)[\s\S]*?;/g,
+  )) {
+    if (absent(expected[2]!)) continue;
     const row = indexes.rows.find((r) => r.relname === expected[1]);
     if (
       !row?.indisvalid ||
@@ -168,11 +187,13 @@ async function verifySchema(client: PoolClient): Promise<void> {
     runnerq_worker_pools: ["pool_id"],
     runnerq_idempotency: ["queue_name", "idempotency_key"],
     runnerq_dependencies: ["queue_name", "waiter_activity_id", "result_id"],
+    runnerq_commands: ["queue_name", "command_id"],
   };
   for (const [name, columns] of Object.entries(expectedKeys))
     if (
+      !absent(name) &&
       JSON.stringify(keys.rows.find((r) => r.relname === name)?.columns) !==
-      JSON.stringify(columns)
+        JSON.stringify(columns)
     )
       throw new RunnerQError(
         "configuration",
@@ -182,7 +203,7 @@ async function verifySchema(client: PoolClient): Promise<void> {
 
 export class PostgresStorage
   extends EventEmitter<{ storageError: [error: Error] }>
-  implements Storage, QueryStorage
+  implements Storage, QueryStorage, CommandStorage
 {
   readonly queue: string;
   private readonly pool: Pool;
@@ -191,6 +212,7 @@ export class PostgresStorage
   private readonly queries = new PostgresQueries((sql, values) =>
     this.query(sql, values),
   );
+  private readonly commands: PostgresCommands;
   private constructor(config: PostgresConfig) {
     super();
     this.queue = config.queue;
@@ -209,6 +231,18 @@ export class PostgresStorage
       this.pool,
       config.queue,
     );
+    this.commands = new PostgresCommands({
+      queue: this.queue,
+      pool: this.pool,
+      putResult: (c, id, owner, result, step) =>
+        this.putResult(c, id, owner, result, step),
+      event: (c, id, type, token, detail) =>
+        this.event(c, id, type, token, detail),
+      notify: (results, work) => {
+        for (const id of results) this.notifications.hint("result", id);
+        if (work) this.notifications.hint("work");
+      },
+    });
   }
   static async initialize(
     config: Omit<PostgresConfig, "queue">,
@@ -237,10 +271,20 @@ export class PostgresStorage
           "SELECT tablename FROM pg_tables WHERE schemaname=current_schema() AND tablename=ANY($1)",
           [tableNames],
         );
-        if (present.rowCount === 0) {
+        const tables = new Set(present.rows.map((r) => r.tablename));
+        // A database from before an addition gets it; IF NOT EXISTS tolerates Go's creating it.
+        const ddl = !tables.size
+          ? schema + additions
+          : additionTables.some((t) => !tables.has(t))
+            ? additions.replace(
+                /CREATE (TABLE|INDEX) /g,
+                "CREATE $1 IF NOT EXISTS ",
+              )
+            : "";
+        if (ddl) {
           await client.query("BEGIN");
           try {
-            await client.query(schema);
+            await client.query(ddl);
             await client.query("COMMIT");
           } catch (error) {
             await client.query("ROLLBACK");
@@ -415,7 +459,7 @@ export class PostgresStorage
             );
           if (
             policy === "allowReuseOnFailure" &&
-            !["failed", "dead_letter"].includes(existing.status)
+            !["failed", "dead_letter", "cancelled"].includes(existing.status)
           )
             throw new RunnerQError(
               "idempotency_conflict",
@@ -550,7 +594,7 @@ export class PostgresStorage
     c: PoolClient,
     id: string,
     owner: string,
-    result: StoredResult,
+    result: Omit<StoredResult, "data"> & { data?: StoredResult["data"] },
     step: string | null,
   ): Promise<void> {
     await c.query(
@@ -561,7 +605,7 @@ export class PostgresStorage
         id,
         this.queue,
         result.state,
-        JSON.stringify(result.data),
+        result.data === undefined ? null : JSON.stringify(result.data),
         owner,
         step,
         result.serialization,
@@ -972,8 +1016,8 @@ export class PostgresStorage
         const r = await c.query(
           `SELECT r.id FROM runnerq_activities r WHERE r.queue_name=$1 AND r.parent_activity_id IS NULL
           AND r.id<>ALL($4::uuid[]) AND ((r.status='completed' AND $2::bigint>0 AND r.completed_at<NOW()-$2*INTERVAL '1 millisecond')
-          OR (r.status IN ('failed','dead_letter') AND $3::bigint>0 AND r.completed_at<NOW()-$3*INTERVAL '1 millisecond'))
-          AND NOT EXISTS(SELECT 1 FROM runnerq_activities a WHERE a.queue_name=$1 AND a.root_activity_id=r.id AND a.status NOT IN ('completed','failed','dead_letter'))
+          OR (r.status IN ('failed','dead_letter','cancelled') AND $3::bigint>0 AND r.completed_at<NOW()-$3*INTERVAL '1 millisecond'))
+          AND NOT EXISTS(SELECT 1 FROM runnerq_activities a WHERE a.queue_name=$1 AND a.root_activity_id=r.id AND a.status NOT IN ${terminalSQL})
           ORDER BY r.completed_at LIMIT 1 FOR UPDATE SKIP LOCKED`,
           [this.queue, completed, failed, skipped],
         );
@@ -982,58 +1026,13 @@ export class PostgresStorage
           await c.query("RELEASE SAVEPOINT candidate");
           break;
         }
-        await c.query(
-          `SELECT 1 FROM runnerq_idempotency WHERE queue_name=$1 AND activity_id IN
-          (SELECT id FROM runnerq_activities WHERE queue_name=$1 AND root_activity_id=$2) FOR UPDATE`,
-          [this.queue, root],
-        );
-        const pinned = await c.query(
-          `SELECT 1 FROM runnerq_dependencies d
-          JOIN runnerq_activities producer ON producer.id=d.producer_activity_id AND producer.queue_name=d.queue_name
-          JOIN runnerq_activities waiter ON waiter.id=d.waiter_activity_id AND waiter.queue_name=d.queue_name
-          WHERE d.queue_name=$1 AND producer.root_activity_id=$2 AND waiter.root_activity_id<>$2
-          AND EXISTS(SELECT 1 FROM runnerq_activities live WHERE live.queue_name=$1 AND live.root_activity_id=waiter.root_activity_id
-            AND live.status NOT IN ('completed','failed','dead_letter')) LIMIT 1`,
-          [this.queue, root],
-        );
-        if (pinned.rowCount) {
+        if (await lockTree(c, this.queue, root)) {
           skipped.push(root);
           await c.query("ROLLBACK TO SAVEPOINT candidate");
           await c.query("RELEASE SAVEPOINT candidate");
           continue;
         }
-        const tree = (
-          await c.query(
-            "SELECT id FROM runnerq_activities WHERE queue_name=$1 AND root_activity_id=$2",
-            [this.queue, root],
-          )
-        ).rows.map((x) => x.id);
-        await c.query(
-          "DELETE FROM runnerq_dependencies WHERE queue_name=$1 AND (waiter_activity_id=ANY($2::uuid[]) OR producer_activity_id=ANY($2::uuid[]))",
-          [this.queue, tree],
-        );
-        const resultIds = (
-          await c.query(
-            "DELETE FROM runnerq_results WHERE queue_name=$1 AND (owner_activity_id=ANY($2::uuid[]) OR activity_id=ANY($2::uuid[])) RETURNING activity_id",
-            [this.queue, tree],
-          )
-        ).rows.map((x) => x.activity_id);
-        await c.query(
-          "DELETE FROM runnerq_events WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
-          [this.queue, [...tree, ...resultIds]],
-        );
-        await c.query(
-          "DELETE FROM runnerq_inputs WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
-          [this.queue, tree],
-        );
-        await c.query(
-          "DELETE FROM runnerq_idempotency WHERE queue_name=$1 AND activity_id=ANY($2::uuid[])",
-          [this.queue, tree],
-        );
-        await c.query(
-          "DELETE FROM runnerq_activities WHERE queue_name=$1 AND id=ANY($2::uuid[])",
-          [this.queue, tree],
-        );
+        await deleteTree(c, this.queue, root);
         await c.query("RELEASE SAVEPOINT candidate");
         removed++;
       }
@@ -1181,6 +1180,10 @@ export class PostgresStorage
     maxNodes: number,
   ): Promise<ActivityTree> {
     return this.queries.tree(activityId, include, maxNodes);
+  }
+  /** Applies a RunnerQ Cloud command to this storage's queue; see `CommandStorage`. */
+  applyCommand(command: Command): Promise<CommandResult> {
+    return this.commands.apply(command);
   }
   close(): Promise<void> {
     return (this.closing ??= (async () => {

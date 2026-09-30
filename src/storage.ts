@@ -2,6 +2,7 @@ import type { FailureDetails } from "./errors.js";
 import type { JsonValue } from "./codec.js";
 import type { ExecutionOptions } from "./options.js";
 import type { SerializedValue, SerializationFormat } from "./serialization.js";
+import type { QueryFilter, RecordStatus } from "./query.js";
 export type ActivityStatus =
   | "pending"
   | "scheduled"
@@ -10,7 +11,8 @@ export type ActivityStatus =
   | "waiting"
   | "completed"
   | "failed"
-  | "dead_letter";
+  | "dead_letter"
+  | "cancelled";
 export interface StoredResult extends SerializedValue {
   state: "Ok" | "Err";
   data: JsonValue;
@@ -142,6 +144,84 @@ export interface Storage {
   reap(limit: number): Promise<number>;
   cleanup(retention: Retention): Promise<number>;
   close(): Promise<void>;
+}
+
+/**
+ * Applies RunnerQ Cloud commands to the backend's own queue (optional: the agent advertises
+ * commands only for a backend that has it). Commands are idempotent by `Command.id`: the
+ * result is kept for at least 24 hours and replayed for the same id, and the same id with a
+ * different `fingerprint` is a `conflict`. Per-target problems (not found, wrong state) are
+ * reported per item and do not fail the command; a rejected promise means nothing was applied.
+ */
+export interface CommandStorage {
+  applyCommand(command: Command): Promise<CommandResult>;
+}
+export function isCommandStorage(storage: unknown): storage is CommandStorage {
+  return (
+    typeof (storage as Partial<CommandStorage> | null)?.applyCommand ===
+    "function"
+  );
+}
+export type CommandKind =
+  | "cancel"
+  | "retry"
+  | "run_now"
+  | "reschedule"
+  | "set_priority"
+  | "delete"
+  | "signal";
+/** Exactly one of `ids`, a `filter` bounded by `max`, or an `idempotencyKey` (signal only). */
+export interface CommandTarget {
+  /** At most 1000. */
+  ids?: readonly string[];
+  /** Selects only activities the command can act on, oldest first, up to `max` (1 to 10000). */
+  filter?: QueryFilter;
+  max?: number;
+  /** The stored key (see `businessKey`), not the one the application passed. */
+  idempotencyKey?: string;
+}
+export interface Command {
+  /** Makes the command idempotent; absent or "" disables the ledger. */
+  id?: string;
+  /** Identifies the input, to detect a reused id. */
+  fingerprint?: string;
+  kind: CommandKind;
+  target: CommandTarget;
+  /** Reports what would happen and changes nothing. */
+  dryRun?: boolean;
+  /** Recorded in the activity's history. */
+  reason?: string;
+  /** cancel: also cancel non-terminal descendants. */
+  cascadeChildren?: boolean;
+  /** retry: restore the full attempt budget. */
+  resetAttempts?: boolean;
+  /** reschedule: the new time (an RFC 3339 string keeps its full precision). */
+  at?: Date | string;
+  /** set_priority: 1 (low) to 4 (critical). */
+  priority?: number;
+  signalName?: string;
+  /** signal: the payload; absent stores none. */
+  signalPayload?: JsonValue;
+}
+export type CommandOutcome = "applied" | "skipped" | "would_apply";
+export interface CommandItem {
+  id: string;
+  outcome: CommandOutcome;
+  /** The canonical status after the command (current when skipped); absent once deleted. */
+  status?: RecordStatus;
+  /** Why it was skipped: the activity doesn't exist here, or is in the wrong state. */
+  error?: { kind: "not_found" | "conflict"; message: string };
+}
+export interface CommandResult {
+  matched: number;
+  applied: number;
+  /** Descendants a cascading cancel also cancelled. */
+  cascaded: number;
+  /** A filter target matched more than `max`. */
+  more: boolean;
+  items: CommandItem[];
+  /** The result came from the ledger. */
+  replayed: boolean;
 }
 
 export { QueryError, RecordEvent, isQueryStorage } from "./query.js";
