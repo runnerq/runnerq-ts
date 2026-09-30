@@ -251,6 +251,13 @@ test("every event the TypeScript storage writes has a canonical type", () => {
     "Signaled",
     "SpawnLinked",
     "Requeued",
+    // Commands.
+    "Cancelled",
+    "Retried",
+    "Redriven",
+    "RunNow",
+    "Rescheduled",
+    "PriorityChanged",
   ];
   for (const name of written) {
     const canonical = canonicalEvent(name);

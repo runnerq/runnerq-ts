@@ -20,6 +20,9 @@ import {
   type RunningActivity,
 } from "./executor.js";
 
+/** Internal: the agent's handle on `Worker`'s interrupt (not exported from the package). */
+export const interruptActivity = Symbol("runnerq.interruptActivity");
+
 export interface StopSummary {
   drained: boolean;
   remaining: number;
@@ -95,8 +98,8 @@ export class Worker
   private readonly handlers = new Map<string, Registration>();
   private readonly inFlight = new Set<Promise<void>>();
   private readonly slotFreed = new ChangeSignal();
-  /** Running attempts' controllers, aborted when the shutdown budget runs out. */
-  private readonly attempts = new Set<AbortController>();
+  /** Running attempts' controllers by activity id, aborted when the shutdown budget runs out. */
+  private readonly attempts = new Map<string, AbortController>();
   private intake = new AbortController();
   private lifetime = new AbortController();
   private maintenance: Promise<void>[] = [];
@@ -355,7 +358,9 @@ export class Worker
       },
       { once: true },
     );
-    this.attempts.add(attempt);
+    // A reclaim of an activity still running here (a wedged attempt) supersedes it.
+    this.attempts.get(claim.id)?.abort(reclaimed());
+    this.attempts.set(claim.id, attempt);
     if (this.lifetime.signal.aborted)
       attempt.abort(this.lifetime.signal.reason);
     const deadline = Date.now() + claim.timeoutMs;
@@ -554,8 +559,10 @@ export class Worker
         event,
       );
     } finally {
-      this.attempts.delete(attempt);
-      this.running.delete(claim.id);
+      if (this.attempts.get(claim.id) === attempt) {
+        this.attempts.delete(claim.id);
+        this.running.delete(claim.id);
+      }
       this.changes.notify();
       this.metric(() =>
         metrics?.duration("activity_execution", performance.now() - started),
@@ -589,7 +596,7 @@ export class Worker
       "Worker shutdown budget expired",
     );
     this.lifetime.abort(expired);
-    for (const attempt of this.attempts) attempt.abort(expired);
+    for (const attempt of this.attempts.values()) attempt.abort(expired);
     this.state = "stopped";
     // Observers may send a goodbye: wait up to the grace period, at least a second so a
     // zero-grace stop can still say goodbye.
@@ -624,6 +631,19 @@ export class Worker
     this.publish("stopped", summary);
     this.resolveClosed();
     return summary;
+  }
+  /**
+   * Stops the attempt running `activityId` here as if its claim were lost, and reports
+   * whether one was running. For a cancel from this worker's own agent: the heartbeat would
+   * notice within an interval; this makes it immediate.
+   */
+  [interruptActivity](activityId: string): boolean {
+    const attempt = this.attempts.get(activityId);
+    if (!attempt || attempt.signal.aborted) return false;
+    attempt.abort(
+      new RunnerQError("claim_lost", `Activity ${activityId} was cancelled`),
+    );
+    return true;
   }
   private report(error: unknown): void {
     this.publish("workerError", asError(error));

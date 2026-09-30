@@ -1,7 +1,9 @@
 import { RunnerQError } from "../errors.js";
 import { linkSignal, pause } from "../async.js";
 import { reportExecutor } from "../executor.js";
-import type { Worker } from "../worker.js";
+import { interruptActivity, type Worker } from "../worker.js";
+import { isCommandStorage } from "../storage.js";
+import { Commands } from "./commands.js";
 import { isQueryStorage, QueryError, type QueryStorage } from "../query.js";
 import { Queries } from "./queries.js";
 import { Streams } from "./stream.js";
@@ -36,6 +38,11 @@ export interface AgentConfig {
   url: string;
   /** Authenticates the app; sent in the Authorization header, never in the URL. */
   apiKey: string;
+  /**
+   * Lets the Cloud run commands (cancel, retry, run now, reschedule, set priority, delete,
+   * signal) on this worker's queue, when its storage supports them. Off by default: read-only.
+   */
+  allowControl?: boolean;
   /** Strips payloads, results, errors and event details from every reply, whatever the Cloud asks. */
   metadataOnly?: boolean;
   /** Added to the worker's labels (and win on a clash); prefer `WorkerConfig.labels`. */
@@ -108,6 +115,13 @@ export class Agent {
         if (route.handler) this.handle(type, route.capability, route.handler);
         else this.caps[type] = route.capability;
       }
+    }
+    if (config.allowControl && isCommandStorage(storage)) {
+      const commands = new Commands(storage, storage.queue, (id) =>
+        worker[interruptActivity](id),
+      );
+      for (const [type, route] of Object.entries(commands.routes()))
+        this.handle(type, route.capability, route.handler!);
     }
     config.signal?.addEventListener("abort", this.closeOnAbort, {
       once: true,
