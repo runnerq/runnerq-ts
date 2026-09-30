@@ -306,6 +306,17 @@ Without it, the agent serves only the executor. Payloads and results are shown a
 JSON: a SuperJSON `Date`, `Map` or `bigint` appears as its JSON projection (an ISO
 string, entry pairs, a decimal string).
 
+### Commands
+
+The agent is read-only unless you pass `allowControl: true`. Then, when the storage
+implements `CommandStorage` (`PostgresStorage` does), the Cloud can cancel, retry, run
+now, reschedule, reprioritize, delete and signal activities of the worker's queue.
+Commands are idempotent by id (replayed for at least 24 hours) and work in metadata-only
+mode too. A cancelled activity stops at once when it runs on this worker, or at its next
+heartbeat elsewhere: its `ctx.signal` aborts with a `claim_lost` error, and it counts as a
+lost claim, not a failure. The command ledger is the `runnerq_commands` table, which
+`PostgresStorage.initialize()` adds to an existing database.
+
 ## Reading state
 
 The PostgreSQL storage has read methods for scripts and tests. They aren't
