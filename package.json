@@ -1,7 +1,7 @@
 {
   "name": "runnerq",
   "version": "0.1.0",
-  "description": "Durable activities and workflows for Node.js, backed by PostgreSQL",
+  "description": "Durable TypeScript functions, with pluggable storage",
   "type": "module",
   "engines": {
     "node": ">=22"

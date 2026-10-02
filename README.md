@@ -1,6 +1,6 @@
 # RunnerQ for TypeScript
 
-Durable activities and workflows for Node.js, backed by PostgreSQL. The runtime uses bounded async concurrency, native event emitters and cooperative cancellation. There is no separate orchestration service.
+Durable TypeScript functions, with pluggable storage. PostgreSQL is built in, and `runnerq/storage` exports the contract for custom backends. The runtime uses bounded async concurrency, native event emitters and cooperative cancellation. There is no separate orchestration service.
 
 This SDK uses **separate activity inputs**: `runnerq_inputs.payload`, not `runnerq_activities.payload`. It cannot share a schema with the current Go SDK until Go adopts this layout and the serialization format columns. Existing Go databases require a coordinated migration; this package deliberately contains no legacy schema or key-encoding fallback.
 
