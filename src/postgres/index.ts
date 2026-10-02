@@ -516,11 +516,13 @@ export class PostgresStorage
       await c.query(
         `WITH activity AS (INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
         timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)
-        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)),
+        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)
+        RETURNING scheduled_at),
         input AS (INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$15::jsonb,$16)),
         link AS (INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
         SELECT $2,$12,$1,$1 WHERE $12::uuid IS NOT NULL ON CONFLICT DO NOTHING)
-        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($2,$1,$17,NULL,$18::jsonb)`,
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) SELECT $2,$1,$17,NULL,
+        jsonb_strip_nulls(jsonb_build_object('activity_type',$3::text,'priority',$4::int,'scheduled_at',scheduled_at)) FROM activity`,
         [
           a.id,
           this.queue,
@@ -539,7 +541,6 @@ export class PostgresStorage
           JSON.stringify(a.payload),
           a.serialization,
           o.delayMs > 0 ? "Scheduled" : "Enqueued",
-          JSON.stringify({ activity_type: a.type, priority }),
         ],
       );
       return a.id;
@@ -580,7 +581,7 @@ export class PostgresStorage
         lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
         FROM picked WHERE a.id=picked.id RETURNING a.*),
         dequeued AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
-        SELECT $1,id,'Dequeued',current_worker_id,jsonb_build_object('activity_type',activity_type) FROM claimed
+        SELECT $1,id,'Dequeued',current_worker_id,jsonb_build_object('activity_type',activity_type,'lease_deadline_ms',lease_deadline_ms) FROM claimed
         ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC)
         SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
         c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,
@@ -743,12 +744,15 @@ export class PostgresStorage
         retry_count=retry_count+CASE WHEN $4='retrying' THEN 1 ELSE 0 END,
         scheduled_at=CASE WHEN $4='retrying' THEN NOW()+$6*INTERVAL '1 second' ELSE scheduled_at END,
         started_at=CASE WHEN $4='retrying' THEN NULL ELSE started_at END,
-        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2),
+        completed_at=CASE WHEN $4='retrying' THEN NULL ELSE NOW() END WHERE queue_name=$1 AND id=$2
+        RETURNING retry_count,scheduled_at),
         stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
         SELECT $2::uuid,$1,'Err',$7::jsonb,$2::uuid,NULL,'json-v1' WHERE $7::jsonb IS NOT NULL
         ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
         WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id)
-        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) VALUES($1,$2,$8,$3,$9::jsonb)`,
+        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) SELECT $1,$2,$8,$3,
+        $9::jsonb||CASE $4 WHEN 'retrying' THEN jsonb_build_object('retry_count',retry_count,'scheduled_at',scheduled_at)
+        WHEN 'dead_letter' THEN '{"reason":"attempts_exhausted"}'::jsonb ELSE '{}'::jsonb END FROM failed`,
         [
           this.queue,
           f.ownerId,
@@ -758,11 +762,7 @@ export class PostgresStorage
           delay,
           result,
           again ? "Retrying" : retry ? "DeadLetter" : "Failed",
-          JSON.stringify({
-            error: reason,
-            retryable: retry,
-            ...(failure ? { failure } : {}),
-          }),
+          JSON.stringify({ error: reason, ...(failure ? { failure } : {}) }),
         ],
       );
       if (!again) await this.wake(c, f.ownerId);
@@ -992,7 +992,7 @@ export class PostgresStorage
         last_worker_id=current_worker_id,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL,waiting_result_id=NULL
         WHERE id IN (SELECT id FROM runnerq_activities WHERE queue_name=$1 AND status='processing'
           AND lease_deadline_ms<(EXTRACT(EPOCH FROM NOW())*1000)::bigint LIMIT $2 FOR UPDATE SKIP LOCKED)
-        RETURNING id,status,last_error`,
+        RETURNING id,status,last_error,retry_count`,
         [this.queue, integer(limit, "reaper limit", 1)],
       );
       for (const a of rows.rows) {
@@ -1017,7 +1017,13 @@ export class PostgresStorage
           a.id,
           a.status === "dead_letter" ? "DeadLetter" : "Requeued",
           null,
-          { reason: "lease_expired", error: a.last_error },
+          a.status === "dead_letter"
+            ? { reason: "lease_expired", error: a.last_error }
+            : {
+                reason: "lease_expired",
+                error: a.last_error,
+                retry_count: a.retry_count,
+              },
         );
       }
       return rows.rows;
