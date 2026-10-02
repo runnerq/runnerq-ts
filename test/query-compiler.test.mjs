@@ -17,12 +17,12 @@ import { businessKey, isTimestamp, parseUuid } from "../dist/codec.js";
 import { encode } from "../dist/serialization.js";
 import { decodeRequest } from "../dist/conductor/decode.js";
 import {
-  filterSpec,
   plainJson,
   toResult,
   toActivity,
   Queries,
 } from "../dist/conductor/queries.js";
+import { specs } from "../dist/conductor/specs.js";
 import { WireError } from "../dist/conductor/index.js";
 
 const id = "0b6b1a51-8f3a-4d5e-9c3b-2f1e0d9c8b7a";
@@ -586,9 +586,13 @@ test("limits, counts, events, steps and aggregates", async () => {
 
 test("requests decode strictly", () => {
   const spec = {
-    object: { filter: filterSpec, include: { array: "string" }, limit: "int" },
+    object: {
+      filter: specs.Filter,
+      include: { array: "string" },
+      limit: "int",
+    },
   };
-  const fails = (data, pattern) =>
+  const fails = (data, pattern, field) =>
     assert.throws(
       () => decodeRequest(spec, data),
       (e) => {
@@ -596,18 +600,24 @@ test("requests decode strictly", () => {
         assert.equal(e.code, "invalid_argument");
         assert.match(e.message, /^decode request: /);
         if (pattern) assert.match(e.message, pattern);
+        assert.deepEqual(e.details, field && { field });
         return true;
       },
     );
-  fails({ surprise: 1 }, /unknown field "surprise"/);
+  fails({ surprise: 1 }, /unknown field "surprise"/, "surprise");
   fails(
     { filter: { field: "type", op: "eq", value: 1, colour: "red" } },
     /unknown field "colour"/,
+    "filter.colour",
   );
-  fails({ filter: { and: [{ nope: 1 }] } }, /unknown field "nope"/);
-  fails({ limit: "5" }, /limit/);
-  fails({ limit: 1.5 });
-  fails({ include: "payload" });
+  fails(
+    { filter: { and: [{ nope: 1 }] } },
+    /unknown field "nope"/,
+    "filter.and[0].nope",
+  );
+  fails({ limit: "5" }, /limit/, "limit");
+  fails({ limit: 1.5 }, undefined, "limit");
+  fails({ include: "payload" }, undefined, "include");
   fails([]);
   assert.deepEqual(decodeRequest(spec, undefined), {});
   assert.deepEqual(
@@ -762,6 +772,7 @@ test("the agent's query handlers check requests and advertise capabilities", asy
     "activities.list",
     { filter: null, surprise: 1 },
     "invalid_argument",
+    "surprise",
   );
 
   const caps = Object.fromEntries(

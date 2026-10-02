@@ -1,95 +1,50 @@
-// The RunnerQ Cloud agent protocol's wire shapes (runnerq-cloud docs/protocol.md).
+// Runtime helpers around the conductor protocol's generated shapes (protocol.ts).
 import type { ExecutorSnapshot } from "../executor.js";
-
-export const protocolVersion = 1;
-
-export type Kind = "req" | "res" | "evt";
-export interface Envelope {
-  v: number;
-  kind: Kind;
-  id?: string;
-  type: string;
-  data?: unknown;
-  error?: WireErrorBody;
-  meta?: Record<string, unknown>;
-}
-export interface WireErrorBody {
-  code: ErrorCode;
-  message: string;
-  details?: Record<string, unknown>;
-}
-export type ErrorCode =
-  | "invalid_argument"
-  | "not_found"
-  | "failed_precondition"
-  | "conflict"
-  | "forbidden"
-  | "unsupported"
-  | "resource_exhausted"
-  | "deadline_exceeded"
-  | "unavailable"
-  | "internal";
+import type {
+  Capability,
+  Error as ErrorBody,
+  ErrorCode,
+  ExecutorState,
+  Messages,
+} from "./protocol.js";
 
 /** A failed request, as it goes on the wire. */
 export class WireError extends Error {
   constructor(
     readonly code: ErrorCode,
     message: string,
-    readonly details?: Record<string, unknown>,
+    readonly details?: ErrorBody["details"],
   ) {
     super(message);
   }
-  body(): WireErrorBody {
+  body(): ErrorBody {
     return this.details
       ? { code: this.code, message: this.message, details: this.details }
       : { code: this.code, message: this.message };
   }
 }
 
-export const typeHello = "hello";
-export const typeGoodbye = "goodbye";
-export const typeConfigUpdate = "config.update";
-export const typeExecutorDescribe = "executor.describe";
-export const typeExecutorReport = "executor.report";
-export const typeActivitiesList = "activities.list";
-export const typeActivitiesGet = "activities.get";
-export const typeActivitiesCount = "activities.count";
-export const typeActivitiesAggregate = "activities.aggregate";
-export const typeStepsList = "steps.list";
-export const typeEventsList = "events.list";
-export const typeResultsGet = "results.get";
-export const typeTreesGet = "trees.get";
-export const typeEventsSubscribe = "events.subscribe";
-export const typeEventsUnsubscribe = "events.unsubscribe";
-export const typeStreamEvents = "stream.events";
-export const typeStreamGap = "stream.gap";
+/** The requests the Cloud sends. */
+export type RequestType = {
+  [T in keyof Messages]: Messages[T] extends { kind: "req"; from: "cloud" }
+    ? T
+    : never;
+}[keyof Messages];
 
 export type Handler = (data: unknown, signal: AbortSignal) => unknown;
 
+/** A request type's advertised capability and, unless it is bound to a session, its handler. */
+export interface Route<T extends RequestType = RequestType> {
+  capability: Capability;
+  handler?: (
+    data: unknown,
+    signal: AbortSignal,
+  ) => Messages[T]["response"] | Promise<Messages[T]["response"]>;
+}
+export type Routes = { [T in RequestType]?: Route<T> };
+
 /** The margin left in every frame for the envelope around a reply's or push's data. */
 export const frameSlack = 1_024;
-
-export interface Capability {
-  v: number;
-  filters?: string[];
-  sorts?: string[];
-  include?: string[];
-  group_by?: string[];
-  buckets?: string[];
-  metrics?: string[];
-  targets?: string[];
-}
-export interface SessionConfig {
-  data_mode?: string;
-  report_interval_ms?: number;
-}
-export interface Welcome {
-  version: number;
-  session_id: string;
-  app?: { id: string; name: string };
-  config?: SessionConfig;
-  limits?: { max_frame_bytes?: number; max_concurrent_requests?: number };
-}
 
 export function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -98,44 +53,27 @@ export function describe(error: unknown): string {
 /** Times on the wire: UTC, milliseconds, Z. */
 export const ts = (d: Date): string => d.toISOString();
 
-export interface ExecutorStateWire {
-  id: string;
-  uptime_ms: number;
-  max_concurrency: number;
-  in_flight: number;
-  running?: {
-    activity_id: string;
-    type: string;
-    attempt: number;
-    started_at: string;
-  }[];
-  claim_lag_ms: number;
-  heartbeat_failures: number;
-  draining: boolean;
-  counters: {
-    claimed: number;
-    succeeded: number;
-    retried: number;
-    failed: number;
-    timed_out: number;
-    dead_lettered: number;
-    claims_lost: number;
-  };
-}
-
 /** A snapshot's state on the wire; `running` only for `executor.describe`. */
 export function stateOf(
   snap: ExecutorSnapshot,
   agentStarted: Date,
   withRunning: boolean,
-): ExecutorStateWire {
+): ExecutorState {
   const c = snap.counters;
   const started = snap.info.startedAt ?? agentStarted;
-  const state: ExecutorStateWire = {
+  return {
     id: snap.info.id,
     uptime_ms: Math.max(0, snap.at.getTime() - started.getTime()),
     max_concurrency: snap.info.maxConcurrency,
     in_flight: snap.state.running.length,
+    ...(withRunning && {
+      running: snap.state.running.map((a) => ({
+        activity_id: a.id,
+        type: a.type,
+        attempt: a.attempt,
+        started_at: ts(a.startedAt),
+      })),
+    }),
     claim_lag_ms: Math.round(c.lastClaimLagMs),
     heartbeat_failures: c.heartbeatFailures,
     draining: snap.state.draining,
@@ -149,12 +87,4 @@ export function stateOf(
       claims_lost: c.claimsLost,
     },
   };
-  if (withRunning)
-    state.running = snap.state.running.map((a) => ({
-      activity_id: a.id,
-      type: a.type,
-      attempt: a.attempt,
-      started_at: ts(a.startedAt),
-    }));
-  return state;
 }

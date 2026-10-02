@@ -36,7 +36,8 @@ jobs:
         timeout-minutes: 3
       - run: npm pack --dry-run
   spec:
-    # src/spec.ts is generated from the pinned runnerq-spec submodule.
+    # src/spec.ts, src/spec-schema.ts and src/conductor/{protocol,specs}.ts are generated
+    # from the pinned runnerq-spec submodule (npm run spec:gen).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

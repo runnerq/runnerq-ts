@@ -4,7 +4,6 @@
 import { createHash } from "node:crypto";
 import { businessKey, isTimestamp, parseUuid } from "../codec.js";
 import { RunnerQError } from "../errors.js";
-import type { QueryFilter } from "../query.js";
 import type {
   Command,
   CommandKind,
@@ -12,68 +11,41 @@ import type {
   CommandStorage,
 } from "../storage.js";
 import { decodeRequest, type Spec } from "./decode.js";
-import { filterSpec, type Route } from "./queries.js";
-import { WireError, type WireErrorBody } from "./wire.js";
+import {
+  cancelCascadeValues,
+  deleteCascadeValues,
+  type CancelRequest,
+  type CommandItem,
+  type CommandResult as CommandReply,
+  type DeleteRequest,
+  type RescheduleRequest,
+  type RetryRequest,
+  type RunNowRequest,
+  type SetPriorityRequest,
+  type SignalRequest,
+} from "./protocol.js";
+import { specs } from "./specs.js";
+import { WireError, type RequestType, type Routes } from "./wire.js";
 
-const commandKinds: Record<string, CommandKind> = {
-  "activities.cancel": "cancel",
-  "activities.retry": "retry",
-  "activities.run_now": "run_now",
-  "activities.reschedule": "reschedule",
-  "activities.set_priority": "set_priority",
-  "activities.delete": "delete",
-  "activities.signal": "signal",
-};
+/** Each command's kind and request: a command accepts only its own fields. */
+const commandTypes = [
+  ["activities.cancel", "cancel", specs.CancelRequest],
+  ["activities.retry", "retry", specs.RetryRequest],
+  ["activities.run_now", "run_now", specs.RunNowRequest],
+  ["activities.reschedule", "reschedule", specs.RescheduleRequest],
+  ["activities.set_priority", "set_priority", specs.SetPriorityRequest],
+  ["activities.delete", "delete", specs.DeleteRequest],
+  ["activities.signal", "signal", specs.SignalRequest],
+] as const satisfies readonly (readonly [RequestType, CommandKind, Spec])[];
 
-interface CommandRequest {
-  command_id?: string;
-  target?: {
-    ids?: string[];
-    filter?: QueryFilter;
-    max?: number;
-    idempotency_key?: string;
-    type?: string;
-    queue?: string;
-  };
-  dry_run?: boolean;
-  reason?: string;
-  cascade?: string;
-  reset_attempts?: boolean;
-  at?: string;
-  priority?: number;
-  name?: string;
-  payload?: unknown;
-}
-const commandSpec: Spec = {
-  object: {
-    command_id: "string",
-    target: {
-      object: {
-        ids: { array: "string" },
-        filter: filterSpec,
-        max: "int",
-        idempotency_key: "string",
-        type: "string",
-        queue: "string",
-      },
-    },
-    dry_run: "bool",
-    reason: "string",
-    cascade: "string",
-    reset_attempts: "bool",
-    at: "string",
-    priority: "int",
-    name: "string",
-    payload: "any",
-  },
-};
-
-interface CommandItemWire {
-  id: string;
-  outcome: string;
-  status?: string;
-  error?: WireErrorBody;
-}
+type CommandRequest =
+  | CancelRequest
+  | RetryRequest
+  | RunNowRequest
+  | RescheduleRequest
+  | SetPriorityRequest
+  | DeleteRequest
+  | SignalRequest;
 
 const fieldError = (
   code: "invalid_argument" | "failed_precondition",
@@ -119,9 +91,9 @@ export class Commands {
     private readonly interrupt?: (activityId: string) => void,
   ) {}
 
-  routes(): Record<string, Route> {
-    const out: Record<string, Route> = {};
-    for (const [type, kind] of Object.entries(commandKinds))
+  routes(): Routes {
+    const out: Routes = {};
+    for (const [type, kind, spec] of commandTypes)
       out[type] = {
         capability: {
           v: 1,
@@ -130,13 +102,17 @@ export class Commands {
               ? ["filter", "idempotency_key", "ids"]
               : ["filter", "ids"],
         },
-        handler: (data) => this.command(kind, data),
+        handler: (data) => this.command(kind, spec, data),
       };
     return out;
   }
 
-  private async command(kind: CommandKind, data: unknown): Promise<unknown> {
-    const req = decodeRequest<CommandRequest>(commandSpec, data);
+  private async command(
+    kind: CommandKind,
+    spec: Spec,
+    data: unknown,
+  ): Promise<CommandReply> {
+    const req = decodeRequest<CommandRequest>(spec, data);
     const { cmd, badIds } = this.toCommand(kind, req);
     cmd.fingerprint = fingerprint(data ?? {});
 
@@ -162,8 +138,8 @@ export class Commands {
       for (const it of res.items)
         if (it.outcome === "applied") this.interrupt(it.id);
 
-    const results: CommandItemWire[] = res.items.map((it) => {
-      const ci: CommandItemWire = { id: it.id, outcome: it.outcome };
+    const results = res.items.map((it) => {
+      const ci: CommandItem = { id: it.id, outcome: it.outcome };
       if (it.status) ci.status = it.status;
       if (it.error?.message) {
         const e = it.error;
@@ -215,60 +191,52 @@ export class Commands {
         `this executor serves queue ${quote(this.queue)}, not ${quote(t.queue)}`,
       );
 
-    // Each command accepts only its own fields.
-    const unexpected: [string, boolean][] = [
-      ["cascade", !!req.cascade && kind !== "cancel" && kind !== "delete"],
-      ["reset_attempts", !!req.reset_attempts && kind !== "retry"],
-      ["at", !!req.at && kind !== "reschedule"],
-      ["priority", !!req.priority && kind !== "set_priority"],
-      ["name", !!req.name && kind !== "signal"],
-      ["payload", "payload" in req && kind !== "signal"],
-    ];
-    for (const [field, set] of unexpected)
-      if (set)
-        throw fieldError(
-          "invalid_argument",
-          field,
-          `${field} does not apply to ${kind}`,
-        );
-
+    // Enums decode as plain strings: they are checked here.
     switch (kind) {
-      case "cancel":
-        if (req.cascade && req.cascade !== "children" && req.cascade !== "none")
+      case "cancel": {
+        const { cascade } = req as CancelRequest;
+        if (cascade && !cancelCascadeValues.includes(cascade))
           throw fieldError(
             "invalid_argument",
             "cascade",
             "cascade must be children or none",
           );
-        cmd.cascadeChildren = req.cascade !== "none"; // cascading is the default
+        cmd.cascadeChildren = cascade !== "none"; // cascading is the default
         break;
-      case "delete":
-        if (req.cascade && req.cascade !== "tree")
+      }
+      case "delete": {
+        const { cascade } = req as DeleteRequest;
+        if (cascade && !deleteCascadeValues.includes(cascade))
           throw fieldError(
             "invalid_argument",
             "cascade",
             "delete always removes the whole tree",
           );
         break;
+      }
       case "retry":
-        cmd.resetAttempts = !!req.reset_attempts;
+        cmd.resetAttempts = !!(req as RetryRequest).reset_attempts;
         break;
-      case "reschedule":
-        if (!isTimestamp(req.at))
+      case "reschedule": {
+        const { at } = req as RescheduleRequest;
+        if (!isTimestamp(at))
           throw fieldError(
             "invalid_argument",
             "at",
             "at must be an RFC 3339 timestamp",
           );
-        cmd.at = req.at;
+        cmd.at = at;
         break;
+      }
       case "set_priority":
-        cmd.priority = req.priority ?? 0;
+        cmd.priority = (req as SetPriorityRequest).priority ?? 0;
         break;
-      case "signal":
-        cmd.signalName = req.name ?? "";
-        if ("payload" in req) cmd.signalPayload = req.payload as never;
+      case "signal": {
+        const r = req as SignalRequest;
+        cmd.signalName = r.name ?? "";
+        if ("payload" in r) cmd.signalPayload = r.payload as never;
         break;
+      }
     }
 
     const badIds: string[] = [];

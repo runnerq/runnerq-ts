@@ -8,23 +8,29 @@ import { isQueryStorage, QueryError, type QueryStorage } from "../query.js";
 import { Queries } from "./queries.js";
 import { Streams } from "./stream.js";
 import {
-  protocolVersion,
+  conductorVersion,
+  type Capability,
+  type Envelope,
+  type Hello,
+  type Messages,
+  type SessionConfig,
+  type Welcome,
+} from "./protocol.js";
+import {
   stateOf,
-  typeConfigUpdate,
-  typeExecutorDescribe,
-  typeExecutorReport,
-  typeGoodbye,
-  typeHello,
   WireError,
   describe,
   frameSlack,
   ts,
-  type Capability,
-  type Envelope,
   type Handler,
-  type SessionConfig,
-  type Welcome,
 } from "./wire.js";
+
+/** The events an agent sends. */
+type AgentEvent = {
+  [T in keyof Messages]: Messages[T] extends { kind: "evt"; from: "agent" }
+    ? T
+    : never;
+}[keyof Messages];
 
 const agentPath = "/v1/agent";
 const handshakeTimeoutMs = 10_000;
@@ -103,7 +109,7 @@ export class Agent {
       this.minDelay,
     );
     this.log = config.logger ?? console;
-    this.handle(typeExecutorDescribe, { v: 1 }, () =>
+    this.handle("executor.describe", { v: 1 }, () =>
       stateOf(this.worker.snapshot(), this.started, true),
     );
     const storage = worker.storage;
@@ -216,10 +222,10 @@ export class Agent {
       ws.addEventListener("close", (event) => end(event.code));
       ws.addEventListener("open", () => {
         this.send(ws, {
-          v: protocolVersion,
+          v: conductorVersion,
           kind: "req",
           id: "hello",
-          type: typeHello,
+          type: "hello",
           data: this.hello(),
         });
       });
@@ -252,7 +258,7 @@ export class Agent {
           if (this.qs)
             streams = new Streams(this.qs, {
               send: (type, data) =>
-                this.send(ws, { v: protocolVersion, kind: "evt", type }, data),
+                this.send(ws, { v: conductorVersion, kind: "evt", type }, data),
               buffered: () => ws.bufferedAmount,
               frameLimit: () => this.peerFrameLimit,
               metadataOnly: () => this.metadataOnly,
@@ -263,14 +269,12 @@ export class Agent {
             source: this.worker,
             intervalMs: () => this.reportEveryMs,
             minGapMs: reportMinGapMs,
-            send: () => {
-              this.send(ws, {
-                v: protocolVersion,
-                kind: "evt",
-                type: typeExecutorReport,
-                data: stateOf(this.worker.snapshot(), this.started, false),
-              });
-            },
+            send: () =>
+              void this.event(
+                ws,
+                "executor.report",
+                stateOf(this.worker.snapshot(), this.started, false),
+              ),
           });
           return;
         }
@@ -279,11 +283,11 @@ export class Agent {
     });
   }
 
-  private hello(): unknown {
+  private hello(): Hello {
     const { info } = this.worker.snapshot();
     const labels = { ...info.labels, ...this.config.labels };
     return {
-      protocol_versions: [protocolVersion],
+      protocol_versions: [conductorVersion],
       sdk: info.sdk,
       executor: {
         id: info.id,
@@ -305,12 +309,12 @@ export class Agent {
   }
 
   private welcome(env: Envelope): void {
-    if (env.kind !== "res" || env.type !== typeHello)
+    if (env.kind !== "res" || env.type !== "hello")
       throw new Error("unexpected handshake reply");
     if (env.error)
       throw new Error(`the Cloud rejected the handshake: ${env.error.message}`);
-    const welcome = env.data as Welcome;
-    if (welcome?.version !== protocolVersion)
+    const welcome = env.data as Welcome | undefined;
+    if (welcome?.version !== conductorVersion)
       throw new Error(`the Cloud chose protocol version ${welcome?.version}`);
     const frame = welcome.limits?.max_frame_bytes ?? 0;
     this.peerFrameLimit =
@@ -333,7 +337,7 @@ export class Agent {
     streams?: Streams,
   ): void {
     if (env.kind === "evt") {
-      if (env.type === typeConfigUpdate)
+      if (env.type === "config.update")
         this.applyConfig(env.data as SessionConfig);
       return;
     }
@@ -417,13 +421,16 @@ export class Agent {
   private goodbye(ws: WebSocket): void {
     if (this.goodbyeSent && this.socket === ws) return;
     this.goodbyeSent = true;
-    this.send(ws, {
-      v: protocolVersion,
-      kind: "evt",
-      type: typeGoodbye,
-      data: { reason: "shutdown" },
-    });
+    this.event(ws, "goodbye", { reason: "shutdown" });
     ws.close(1000, "shutdown");
+  }
+
+  private event<T extends AgentEvent>(
+    ws: WebSocket,
+    type: T,
+    data: Messages[T]["data"],
+  ): boolean {
+    return this.send(ws, { v: conductorVersion, kind: "evt", type, data });
   }
 
   /**

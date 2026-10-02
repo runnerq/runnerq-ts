@@ -13,9 +13,10 @@ export type Spec =
   | (() => Spec);
 
 /**
- * Decodes `data` against `spec`, or throws invalid_argument "decode request: ...". An
- * absent or null object field is left out; a null array element is its type's zero value,
- * as Go decodes it.
+ * Decodes `data` against `spec`, or throws invalid_argument "decode request: ..." naming the
+ * field. An absent or null object field is left out; a null array element is its type's zero
+ * value, as Go decodes it. Only JSON kinds are checked: required fields, enum values and
+ * bounds are the caller's to check.
  */
 export function decodeRequest<T>(spec: Spec, data: unknown): T {
   if (data === undefined || data === null) return {} as T;
@@ -26,12 +27,20 @@ export function decodeRequest<T>(spec: Spec, data: unknown): T {
       throw new WireError(
         "invalid_argument",
         `decode request: ${error.message}`,
+        error.field ? { field: error.field } : undefined,
       );
     throw error;
   }
 }
 
-class DecodeError extends Error {}
+class DecodeError extends Error {
+  constructor(
+    message: string,
+    readonly field: string,
+  ) {
+    super(message);
+  }
+}
 
 function resolve(spec: Spec): Exclude<Spec, () => Spec> {
   return typeof spec === "function" ? resolve(spec()) : spec;
@@ -44,6 +53,7 @@ function typeName(v: unknown): string {
 function mismatch(v: unknown, path: string, want: string): DecodeError {
   return new DecodeError(
     `json: cannot unmarshal ${typeName(v)} into ${path || "request"} of type ${want}`,
+    path,
   );
 }
 function zero(spec: Spec): unknown {
@@ -85,10 +95,12 @@ function visit(spec: Spec, v: unknown, path: string): unknown {
     throw mismatch(v, path, "object");
   const out: Record<string, unknown> = {};
   for (const [key, x] of Object.entries(v)) {
+    const at = path ? `${path}.${key}` : key;
     if (!Object.hasOwn(s.object, key))
-      throw new DecodeError(`json: unknown field ${JSON.stringify(key)}`);
-    if (x === null && s.object[key] !== "any") continue;
-    out[key] = visit(s.object[key]!, x, path ? `${path}.${key}` : key);
+      throw new DecodeError(`json: unknown field ${JSON.stringify(key)}`, at);
+    const field = resolve(s.object[key]!);
+    if (x === null && field !== "any") continue;
+    out[key] = visit(field, x, at);
   }
   return out;
 }

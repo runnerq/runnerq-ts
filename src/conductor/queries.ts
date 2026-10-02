@@ -7,29 +7,36 @@ import type { Storage } from "../storage.js";
 import type {
   ActivityRecord,
   EventRecord,
-  QueryFilter,
   QuerySort,
   QueryStorage,
   RecordInclude,
   StepEntry,
 } from "../query.js";
-import { decodeRequest, type Spec } from "./decode.js";
-import {
-  WireError,
-  ts,
-  typeActivitiesAggregate,
-  typeActivitiesCount,
-  typeActivitiesGet,
-  typeActivitiesList,
-  typeEventsList,
-  typeEventsSubscribe,
-  typeEventsUnsubscribe,
-  typeResultsGet,
-  typeStepsList,
-  typeTreesGet,
-  type Capability,
-  type Handler,
-} from "./wire.js";
+import { decodeRequest } from "./decode.js";
+import type {
+  Activity,
+  ActivityPage,
+  AggregateGroup,
+  AggregateRequest,
+  AggregateResult,
+  CountRequest,
+  CountResult,
+  Event as WireEvent,
+  EventPage,
+  GetRequest,
+  Query,
+  Result,
+  ResultRequest,
+  Sort,
+  Step,
+  StepKind,
+  StepPage,
+  StepsRequest,
+  Tree,
+  TreeRequest,
+} from "./protocol.js";
+import { specs } from "./specs.js";
+import { WireError, ts, type Routes } from "./wire.js";
 
 /** Bounds steps and events embedded in activities.get. */
 const maxEmbedded = 1000;
@@ -39,79 +46,8 @@ const countLimit = 100_000;
 const recordIncludes = ["last_error", "payload", "result"];
 const getIncludes = ["events", "last_error", "payload", "result", "steps"];
 
-interface WireSort {
-  field?: string;
-  order?: string;
-}
-interface Query {
-  filter?: QueryFilter;
-  sort?: WireSort[];
-  include?: string[];
-  limit?: number;
-  cursor?: string;
-}
-
-export const filterSpec: Spec = {
-  object: {
-    and: { array: () => filterSpec },
-    or: { array: () => filterSpec },
-    not: () => filterSpec,
-    field: "string",
-    op: "string",
-    value: "any",
-  },
-};
-const includeSpec: Spec = { array: "string" };
-const querySpec: Spec = {
-  object: {
-    filter: filterSpec,
-    sort: { array: { object: { field: "string", order: "string" } } },
-    include: includeSpec,
-    limit: "int",
-    cursor: "string",
-  },
-};
-const getSpec: Spec = { object: { id: "string", include: includeSpec } };
-const countSpec: Spec = { object: { filter: filterSpec } };
-const stepsSpec: Spec = {
-  object: {
-    activity_id: "string",
-    include: includeSpec,
-    limit: "int",
-    cursor: "string",
-  },
-};
-const resultSpec: Spec = { object: { activity_id: "string" } };
-const treeSpec: Spec = {
-  object: { id: "string", include: includeSpec, max_nodes: "int" },
-};
-const aggregateSpec: Spec = {
-  object: {
-    filter: filterSpec,
-    group_by: { array: "string" },
-    bucket: {
-      object: {
-        field: "string",
-        interval_ms: "int",
-        from: "string",
-        to: "string",
-      },
-    },
-    metrics: {
-      array: {
-        object: {
-          name: "string",
-          field: "string",
-          percentiles: { array: "number" },
-        },
-      },
-    },
-    limit: "int",
-  },
-};
-
 /** At most one sort key (the backend adds the tiebreaker); the default order is desc. */
-function oneSort(sorts?: WireSort[]): QuerySort | undefined {
+function oneSort(sorts?: Sort[]): QuerySort | undefined {
   if (!sorts?.length) return undefined;
   if (sorts.length > 1)
     throw fieldError("unsupported", "sort", "only one sort key is supported");
@@ -151,16 +87,11 @@ export function plainJson(serialization: string, data: JsonValue): JsonValue {
   }
 }
 
-interface ResultView {
-  state: "ok" | "error";
-  data?: JsonValue;
-  error?: { message?: string; kind?: string };
-}
 export function toResult(r: {
   state: "Ok" | "Err";
   serialization: string;
   data?: JsonValue;
-}): ResultView {
+}): Result {
   const data =
     r.data === undefined ? undefined : plainJson(r.serialization, r.data);
   if (r.state === "Ok")
@@ -180,87 +111,85 @@ export function toResult(r: {
   return data === undefined ? { state: "error" } : { state: "error", data };
 }
 
-type View = Record<string, unknown>;
-/** Sets `key` unless the value is empty ("", undefined), as Go's omitempty. */
-function put(v: View, key: string, value: unknown): void {
-  if (value !== undefined && value !== "") v[key] = value;
-}
-const tsp = (d?: Date) => (d ? ts(d) : undefined);
-
-export function toActivity(r: ActivityRecord): View {
-  const v: View = { id: r.id, type: r.type };
-  put(v, "queue", r.queue);
-  v.status = r.status;
-  v.priority = r.priority;
-  put(v, "root_id", r.rootId);
-  put(v, "parent_id", r.parentId);
-  v.depth = r.depth;
-  put(v, "idempotency_key", r.idempotencyKey);
-  v.attempt = r.attempt;
-  // Unlimited attempts: omitted ("fields that do not apply are omitted").
-  put(v, "max_attempts", r.maxAttempts);
-  v.created_at = ts(r.createdAt);
-  put(v, "scheduled_for", tsp(r.scheduledFor));
-  put(v, "started_at", tsp(r.startedAt));
-  put(v, "completed_at", tsp(r.completedAt));
-  put(v, "updated_at", tsp(r.updatedAt));
-  if (r.timeoutMs) v.timeout_ms = r.timeoutMs;
-  put(v, "lease_expires_at", tsp(r.leaseExpiresAt));
-  put(v, "executor_id", r.executorId);
-  if (r.wait) {
-    const w: View = { kind: r.wait.kind };
-    put(w, "name", r.wait.name);
-    put(w, "until", tsp(r.wait.until));
-    v.wait = w;
-  }
-  if (r.metadata && Object.keys(r.metadata).length) v.metadata = r.metadata;
-  if (r.lastError) {
-    const e: View = {};
-    put(e, "message", r.lastError.message);
-    put(e, "kind", r.lastError.kind);
-    put(e, "at", tsp(r.lastError.at));
-    v.last_error = e;
-  }
-  if (r.payload) v.payload = plainJson(r.payload.serialization, r.payload.data);
-  if (r.result) v.result = toResult(r.result);
+/** Drops undefined fields: fields that don't apply are omitted, never null. */
+function compact<T extends object>(v: T): T {
+  for (const k in v) if (v[k] === undefined) delete v[k];
   return v;
 }
+/** "" is unset, as Go's omitempty. */
+const opt = (s?: string) => s || undefined;
+const tsp = (d?: Date) => (d ? ts(d) : undefined);
 
-export function toStep(s: StepEntry): View {
-  const v: View = {
+export function toActivity(r: ActivityRecord): Activity {
+  return compact<Activity>({
+    id: r.id,
+    type: r.type,
+    queue: opt(r.queue),
+    status: r.status,
+    priority: r.priority,
+    root_id: opt(r.rootId),
+    parent_id: opt(r.parentId),
+    depth: r.depth,
+    idempotency_key: opt(r.idempotencyKey),
+    attempt: r.attempt,
+    max_attempts: r.maxAttempts, // unlimited: omitted
+    created_at: ts(r.createdAt),
+    scheduled_for: tsp(r.scheduledFor),
+    started_at: tsp(r.startedAt),
+    completed_at: tsp(r.completedAt),
+    updated_at: tsp(r.updatedAt),
+    timeout_ms: r.timeoutMs || undefined,
+    lease_expires_at: tsp(r.leaseExpiresAt),
+    executor_id: opt(r.executorId),
+    wait:
+      r.wait &&
+      compact({
+        kind: r.wait.kind,
+        name: opt(r.wait.name),
+        until: tsp(r.wait.until),
+      }),
+    metadata:
+      r.metadata && Object.keys(r.metadata).length ? r.metadata : undefined,
+    last_error:
+      r.lastError &&
+      compact({
+        message: opt(r.lastError.message),
+        kind: opt(r.lastError.kind),
+        at: tsp(r.lastError.at),
+      }),
+    payload: r.payload && plainJson(r.payload.serialization, r.payload.data),
+    result: r.result && toResult(r.result),
+  });
+}
+
+export function toStep(s: StepEntry): Step {
+  return compact<Step>({
     id: s.id,
     activity_id: s.activityId,
     name: s.name,
-    kind: s.kind,
+    kind: s.kind as StepKind,
     status: s.state === "Ok" ? "completed" : "failed",
     created_at: ts(s.createdAt),
-  };
-  if (s.data)
-    v.result = toResult({
-      state: s.state,
-      serialization: s.data.serialization,
-      data: s.data.data,
-    });
-  return v;
+    result:
+      s.data &&
+      toResult({
+        state: s.state,
+        serialization: s.data.serialization,
+        data: s.data.data,
+      }),
+  });
 }
 
-export function toEvent(e: EventRecord): View {
-  const v: View = {
+export function toEvent(e: EventRecord): WireEvent {
+  return compact<WireEvent>({
     id: e.cursor,
     cursor: e.cursor,
     activity_id: e.activityId,
     type: e.type,
     at: ts(e.at),
-  };
-  put(v, "executor_id", e.executorId);
-  if (e.detail !== undefined) v.detail = e.detail;
-  return v;
-}
-
-/** A request type's advertised capability and, unless it is bound to a session, its handler. */
-export interface Route {
-  capability: Capability;
-  handler?: Handler;
+    executor_id: opt(e.executorId),
+    detail: e.detail,
+  });
 }
 
 /** The query handlers and what they advertise, over `qs` (results through `storage`). */
@@ -272,13 +201,13 @@ export class Queries {
   ) {}
 
   /** Every query and stream request type; stream ones have no handler (Streams serve them). */
-  routes(): Record<string, Route> {
+  routes(): Routes {
     const qc = this.qs.queryCapabilities();
     const nonEmpty = (list: string[]) => (list.length ? list : undefined);
     const filters = nonEmpty(qc.activityFilters);
     const eventFilters = nonEmpty(qc.eventFilters);
     return {
-      [typeActivitiesList]: {
+      "activities.list": {
         capability: {
           v: 1,
           filters,
@@ -287,15 +216,15 @@ export class Queries {
         },
         handler: (d) => this.activitiesList(d),
       },
-      [typeActivitiesGet]: {
+      "activities.get": {
         capability: { v: 1, include: getIncludes },
         handler: (d) => this.activitiesGet(d),
       },
-      [typeActivitiesCount]: {
+      "activities.count": {
         capability: { v: 1, filters },
         handler: (d) => this.activitiesCount(d),
       },
-      [typeActivitiesAggregate]: {
+      "activities.aggregate": {
         capability: {
           v: 1,
           filters,
@@ -305,11 +234,11 @@ export class Queries {
         },
         handler: (d) => this.activitiesAggregate(d),
       },
-      [typeStepsList]: {
+      "steps.list": {
         capability: { v: 1, include: ["result"] },
         handler: (d) => this.stepsList(d),
       },
-      [typeEventsList]: {
+      "events.list": {
         capability: {
           v: 1,
           filters: eventFilters,
@@ -318,16 +247,16 @@ export class Queries {
         },
         handler: (d) => this.eventsList(d),
       },
-      [typeResultsGet]: {
+      "results.get": {
         capability: { v: 1 },
         handler: (d) => this.resultsGet(d),
       },
-      [typeTreesGet]: {
+      "trees.get": {
         capability: { v: 1, include: recordIncludes },
         handler: (d) => this.treesGet(d),
       },
-      [typeEventsSubscribe]: { capability: { v: 1, filters: eventFilters } },
-      [typeEventsUnsubscribe]: { capability: { v: 1 } },
+      "events.subscribe": { capability: { v: 1, filters: eventFilters } },
+      "events.unsubscribe": { capability: { v: 1 } },
     };
   }
 
@@ -355,8 +284,8 @@ export class Queries {
     return out;
   }
 
-  private async activitiesList(data: unknown): Promise<unknown> {
-    const q = decodeRequest<Query>(querySpec, data);
+  private async activitiesList(data: unknown): Promise<ActivityPage> {
+    const q = decodeRequest<Query>(specs.Query, data);
     const inc = this.includes(q.include, recordIncludes);
     const sort = oneSort(q.sort);
     const res = await this.qs.queryActivities({
@@ -369,11 +298,8 @@ export class Queries {
     return page(res.items.map(toActivity), res.nextCursor);
   }
 
-  private async activitiesGet(data: unknown): Promise<unknown> {
-    const req = decodeRequest<{ id?: string; include?: string[] }>(
-      getSpec,
-      data,
-    );
+  private async activitiesGet(data: unknown): Promise<Activity> {
+    const req = decodeRequest<GetRequest>(specs.GetRequest, data);
     const inc = this.includes(req.include, getIncludes);
     const raw = req.id ?? "";
     // Ids are opaque on the wire; one this backend could not have issued does not exist.
@@ -402,8 +328,8 @@ export class Queries {
     return v;
   }
 
-  private async activitiesCount(data: unknown): Promise<unknown> {
-    const req = decodeRequest<{ filter?: QueryFilter }>(countSpec, data);
+  private async activitiesCount(data: unknown): Promise<CountResult> {
+    const req = decodeRequest<CountRequest>(specs.CountRequest, data);
     const { count, exact } = await this.qs.countActivities(
       req.filter,
       countLimit,
@@ -411,19 +337,8 @@ export class Queries {
     return { count, exact };
   }
 
-  private async activitiesAggregate(data: unknown): Promise<unknown> {
-    const req = decodeRequest<{
-      filter?: QueryFilter;
-      group_by?: string[];
-      bucket?: {
-        field?: string;
-        interval_ms?: number;
-        from?: string;
-        to?: string;
-      };
-      metrics?: { name?: string; field?: string; percentiles?: number[] }[];
-      limit?: number;
-    }>(aggregateSpec, data);
+  private async activitiesAggregate(data: unknown): Promise<AggregateResult> {
+    const req = decodeRequest<AggregateRequest>(specs.AggregateRequest, data);
     let count = false;
     const durations: { field: string; percentiles?: number[] }[] = [];
     for (const m of req.metrics ?? []) {
@@ -456,26 +371,23 @@ export class Queries {
       limit: req.limit,
     });
     return {
-      groups: rows.rows.map((r) => {
-        const g: View = {};
-        if (r.key && Object.keys(r.key).length) g.key = r.key;
-        put(g, "bucket", tsp(r.bucket));
-        if (count) g.count = r.count;
-        if (r.durations && Object.keys(r.durations).length)
-          g.durations = r.durations;
-        return g;
-      }),
+      groups: rows.rows.map((r) =>
+        compact<AggregateGroup>({
+          key: r.key && Object.keys(r.key).length ? r.key : undefined,
+          bucket: tsp(r.bucket),
+          count: count ? r.count : undefined,
+          durations:
+            r.durations && Object.keys(r.durations).length
+              ? r.durations
+              : undefined,
+        }),
+      ),
       truncated: rows.truncated,
     };
   }
 
-  private async stepsList(data: unknown): Promise<unknown> {
-    const req = decodeRequest<{
-      activity_id?: string;
-      include?: string[];
-      limit?: number;
-      cursor?: string;
-    }>(stepsSpec, data);
+  private async stepsList(data: unknown): Promise<StepPage> {
+    const req = decodeRequest<StepsRequest>(specs.StepsRequest, data);
     const inc = this.includes(req.include, ["result"]);
     const id = parseUuid(req.activity_id ?? "");
     if (!id) return { items: [] };
@@ -488,8 +400,8 @@ export class Queries {
     return page(res.items.map(toStep), res.nextCursor);
   }
 
-  private async eventsList(data: unknown): Promise<unknown> {
-    const q = decodeRequest<Query>(querySpec, data);
+  private async eventsList(data: unknown): Promise<EventPage> {
+    const q = decodeRequest<Query>(specs.Query, data);
     const inc = this.includes(q.include, ["detail"]);
     const sort = oneSort(q.sort);
     if (sort && sort.field !== "at")
@@ -504,13 +416,13 @@ export class Queries {
     return page(res.items.map(toEvent), res.nextCursor);
   }
 
-  private async resultsGet(data: unknown): Promise<unknown> {
+  private async resultsGet(data: unknown): Promise<Result> {
     if (this.metadataOnly())
       throw new WireError(
         "forbidden",
         "results are not sent in metadata-only mode",
       );
-    const req = decodeRequest<{ activity_id?: string }>(resultSpec, data);
+    const req = decodeRequest<ResultRequest>(specs.ResultRequest, data);
     const raw = req.activity_id ?? "";
     const missing = () =>
       new WireError("not_found", `no result for activity ${quote(raw)}`);
@@ -521,12 +433,8 @@ export class Queries {
     return toResult(res);
   }
 
-  private async treesGet(data: unknown): Promise<unknown> {
-    const req = decodeRequest<{
-      id?: string;
-      include?: string[];
-      max_nodes?: number;
-    }>(treeSpec, data);
+  private async treesGet(data: unknown): Promise<Tree> {
+    const req = decodeRequest<TreeRequest>(specs.TreeRequest, data);
     const inc = this.includes(req.include, recordIncludes);
     const raw = req.id ?? "";
     const id = parseUuid(raw);
@@ -552,7 +460,10 @@ function recordInclude(inc: Set<string>): RecordInclude {
     lastError: inc.has("last_error"),
   };
 }
-function page(items: unknown[], nextCursor: string): View {
+function page<T>(
+  items: T[],
+  nextCursor: string,
+): { items: T[]; next_cursor?: string } {
   return nextCursor ? { items, next_cursor: nextCursor } : { items };
 }
 function parseTime(field: string, s?: string): Date | undefined {
