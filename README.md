@@ -27,24 +27,23 @@ npm install github:runnerq/runnerq-ts
 
 ## Quick start
 
-Keep activity definitions and their handlers in separate modules. Producers import only the definitions; workers import both.
-
 ```ts
-// activities.ts: the contract. Producers and workers both import it.
-import { activity } from "runnerq";
+import {
+  activity,
+  runner,
+  RunnerQClient,
+  Worker,
+  type ActivityContext,
+} from "runnerq";
+import { PostgresStorage } from "runnerq/postgres";
 
-export type SignupInput = { email: string };
-export type Account = { user_id: string };
+type SignupInput = { email: string };
+type Account = { user_id: string };
 
-export const Signup = activity<SignupInput, Account>("SignupWorkflow");
-```
+const Signup = activity<SignupInput, Account>("SignupWorkflow");
 
-```ts
-// handlers.ts: the implementation. Only workers import it.
-import type { ActivityContext } from "runnerq";
-import type { Account, SignupInput } from "./activities.js";
-
-export async function handleSignup(
+// A handler is a plain function, so it can live in its own module.
+async function handleSignup(
   ctx: ActivityContext,
   input: SignupInput,
 ): Promise<Account> {
@@ -53,14 +52,6 @@ export async function handleSignup(
     return { user_id: "u_1001" };
   });
 }
-```
-
-```ts
-// main.ts
-import { runner, RunnerQClient, Worker } from "runnerq";
-import { PostgresStorage } from "runnerq/postgres";
-import { Signup } from "./activities.js";
-import { handleSignup } from "./handlers.js";
 
 const connectionString = process.env.DATABASE_URL!;
 
