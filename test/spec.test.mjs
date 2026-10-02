@@ -3,7 +3,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { businessKey, checkpointId, stepKey } from "../dist/codec.js";
-import { applicationIdempotencyKey } from "../dist/postgres/query.js";
+import {
+  applicationIdempotencyKey,
+  canonicalEvent,
+  canonicalStatus,
+  internalEvents,
+} from "../dist/postgres/query.js";
+import { attemptsRemain, retryDelaySeconds } from "../dist/retry.js";
 import { plainJson } from "../dist/conductor/queries.js";
 
 function cases(path) {
@@ -59,4 +65,41 @@ test("spec: plain JSON of stored values", () => {
     "serialization/vectors/plain_json.json",
   ))
     assert.deepEqual(plainJson(input.serialization, input.data), output, name);
+});
+
+test("spec: attempts remain after a failure", () => {
+  for (const { name, input, output } of cases("vectors/attempts_remain.json"))
+    assert.equal(
+      attemptsRemain(input.retry_count, input.max_retries),
+      output,
+      name,
+    );
+});
+
+test("spec: retry delay", () => {
+  for (const { name, input, output } of cases("vectors/retry_delay.json"))
+    assert.equal(
+      retryDelaySeconds(
+        input.retry_count,
+        input.retry_delay_seconds,
+        input.max_retry_delay_seconds,
+      ),
+      output,
+      name,
+    );
+});
+
+test("spec: canonical statuses", () => {
+  for (const { name, input, output } of cases("vectors/canonical_status.json"))
+    assert.equal(canonicalStatus(input.status), output, name);
+});
+
+test("spec: canonical events", () => {
+  for (const { name, input, output } of cases("vectors/canonical_event.json"))
+    assert.equal(canonicalEvent(input.event_type), output, name);
+});
+
+test("spec: internal events for a canonical type", () => {
+  for (const { name, input, output } of cases("vectors/internal_events.json"))
+    assert.deepEqual(internalEvents(input.type), output, name);
 });

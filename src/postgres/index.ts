@@ -53,6 +53,7 @@ import type {
 import { Notifications } from "./notifications.js";
 import { PostgresCommands } from "./command.js";
 import { deleteTree, lockTree, terminalSQL } from "./trees.js";
+import { attemptsRemain, retryDelaySeconds } from "../retry.js";
 
 export interface PostgresConfig {
   connectionString: string;
@@ -684,12 +685,12 @@ export class PostgresStorage
               : "failed";
         throw lost();
       }
-      const again =
-        retry && (a.max_retries === 0 || a.retry_count + 1 < a.max_retries);
+      const again = retry && attemptsRemain(a.retry_count, a.max_retries);
       const status = again ? "retrying" : retry ? "dead_letter" : "failed";
-      const delay = Math.min(
-        Number(a.max_retry_delay_seconds) || 3600,
-        Number(a.retry_delay_seconds) * 2 ** Math.min(a.retry_count + 1, 52),
+      const delay = retryDelaySeconds(
+        a.retry_count,
+        Number(a.retry_delay_seconds),
+        Number(a.max_retry_delay_seconds),
       );
       // Transition, terminal result and event in one statement; the wake stays separate.
       const result = again
