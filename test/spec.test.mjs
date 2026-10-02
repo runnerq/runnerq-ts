@@ -10,6 +10,7 @@ import {
   internalEvents,
 } from "../dist/postgres/query.js";
 import { attemptsRemain, retryDelaySeconds } from "../dist/retry.js";
+import { normalizeDefault, normalizeIndex } from "../dist/postgres/schema.js";
 import { plainJson } from "../dist/conductor/queries.js";
 
 function cases(path) {
@@ -102,4 +103,14 @@ test("spec: canonical events", () => {
 test("spec: internal events for a canonical type", () => {
   for (const { name, input, output } of cases("vectors/internal_events.json"))
     assert.deepEqual(internalEvents(input.type), output, name);
+});
+
+test("spec: index definitions normalize", () => {
+  for (const { name, input, output } of cases("vectors/index_definition.json"))
+    assert.equal(normalizeIndex(input.definition), output, name);
+});
+
+test("spec: column defaults normalize", () => {
+  for (const { name, input, output } of cases("vectors/column_default.json"))
+    assert.equal(normalizeDefault(input.default), output, name);
 });

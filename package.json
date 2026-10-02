@@ -39,7 +39,7 @@
     "test:integration": "npm run build && npm run typecheck && node scripts/test-integration.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "spec:gen": "go run -C spec ./tools/gen -lang ts -out ../src/spec.ts",
+    "spec:gen": "go run -C spec ./tools/gen -lang ts -out ../src/spec.ts && go run -C spec ./tools/gen -lang ts -part schema -out ../src/spec-schema.ts",
     "prepare": "npm run build"
   },
   "dependencies": {
