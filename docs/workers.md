@@ -16,7 +16,7 @@ The library installs no process signal handlers and never calls `process.exit()`
 const worker = new Worker({
   storage,
   concurrency: 20,
-  activityTypes: [Checkout.name],
+  activityTypes: [Checkout],
   leaseMs: 60_000,
   heartbeatMs: 10_000,
   reaperIntervalMs: 5_000,
