@@ -212,6 +212,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 | 03  | [fan-out](examples/03-fan-out/)                      | children and a durable join with one execution slot                        |
 | 04  | [signals-and-sleep](examples/04-signals-and-sleep/)  | buffered signals, persisted deadlines, a durable timer                     |
 | 05  | [cloud](examples/05-cloud/)                          | a worker connected to RunnerQ Cloud                                        |
+| 06  | [multiple-files](examples/06-multiple-files/)        | definitions, handlers, worker and producer in separate files               |
 
 ## Documentation
 
