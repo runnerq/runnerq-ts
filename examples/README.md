@@ -13,7 +13,7 @@ node --experimental-strip-types examples/01-hello-workflow/main.ts
 
 On Node releases where type stripping is enabled by default, the flag is optional. Alternatively compile the examples with TypeScript. `DATABASE_URL` overrides the local connection string.
 
-- `01-hello-workflow`: two checkpointed steps, typed results, graceful cleanup. It splits the activity definition (`activities.ts`), its handler (`handlers.ts`) and the worker (`main.ts`) into separate files, the layout to copy for a real app.
+- `01-hello-workflow`: two checkpointed steps, typed results, graceful cleanup.
 - `02-crash-and-resume`: terminate and restart the process after its charge checkpoint commits; the business key reattaches to the same activity. Lease expiry/reaping recovers the killed execution. A new run after completion returns the stored result.
 - `03-fan-out`: children and a durable join with only one execution slot.
 - `04-signals-and-sleep`: buffered signals, persisted deadlines, and a durable timer longer than the handler timeout.

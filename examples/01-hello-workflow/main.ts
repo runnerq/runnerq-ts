@@ -1,7 +1,31 @@
-import { RunnerQClient, Worker } from "runnerq";
+import {
+  activity,
+  RunnerQClient,
+  Worker,
+  NonRetryableError,
+  type ActivityContext,
+} from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
-import { SignupWorkflow } from "./activities.ts";
-import { handleSignupWorkflow } from "./handlers.ts";
+
+type Account = { user_id: string; email: string };
+const SignupWorkflow = activity<{ email: string }, Account>("SignupWorkflow");
+
+async function handleSignupWorkflow(
+  ctx: ActivityContext,
+  input: { email: string },
+): Promise<Account> {
+  if (typeof input?.email !== "string")
+    throw new NonRetryableError("Invalid payload");
+  const user = await ctx.run("create-account", async () => {
+    console.log(`  ▶ creating account for ${input.email}`);
+    return { user_id: "u_1001", email: input.email };
+  });
+  await ctx.run("send-welcome", async () => {
+    console.log(`  ▶ sending welcome email to ${user.email}`);
+    return true;
+  });
+  return user;
+}
 
 async function main() {
   const connectionString =
