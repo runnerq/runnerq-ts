@@ -8,11 +8,11 @@ Activity handlers run with an explicit ActivityContext and an internal AsyncLoca
 
 Lease renewal verifies ownership; claim loss cancels the handler signal. Timeout and shutdown are cooperative. Promise rejection cannot stop arbitrary JavaScript effects. A running handler keeps its local slot until it settles. Heartbeats stop when the handler signal aborts, so an uncooperative execution cannot renew forever after timeout or shutdown. Persistence retries may continue renewing while a captured outcome is being reconciled.
 
-## Schema baseline
+## Schema
 
-`PostgresStorage.initialize` is an explicit, advisory-lock-coordinated baseline initializer. It creates all tables and current indexes atomically only when none exists. On an existing schema it validates instead of migrating, except for tables added after the baseline (the `runnerq_commands` ledger), which it creates when missing, as Go defines them. `connect` performs catalog reads only and accepts a database without those added tables, checking them when present; applying a command with an id then fails until `initialize` adds the ledger. Validation covers types, nullability, defaults, primary keys, index definitions and index validity, and rejects inline payload columns.
+The schema is runnerq-spec's (`spec/schema/postgres`, generated into `src/spec-schema.ts`), shared with the Go SDK, which applies it the same way. `PostgresStorage.initialize` takes the shared advisory lock and checks the catalog without DDL; if it is not current, it runs every migration in one transaction (each is safe to re-run) and then builds the concurrent indexes one statement at a time, dropping an invalid leftover first and a replaced index only after its successor is valid. It refuses a database that still has inline payload columns: the separate-input design is a deliberate break, and initialization must never be run as an attempted conversion of a live inline-payload Go installation.
 
-The schema lock uses the same numeric key as Go. The baseline preserves final names such as the `_v2` dequeue indexes without reproducing old indexes or migration history. The separate-input design is a deliberate schema break. Initialization must never be run as an attempted conversion of a live Go installation.
+`connect` performs catalog reads only. It checks types, nullability, defaults, primary keys, index definitions and index validity against the spec's catalog, and rejects inline payload columns. It accepts a database initialized by an older version of this SDK, without the `runnerq_commands` ledger or the query indexes, while checking them when present; applying a command with an id then fails until `initialize` adds the ledger.
 
 Inputs are immutable rows in `runnerq_inputs`. Submission writes activity state, input, idempotency ownership, dependency and event in one transaction. A duplicated key retaining an existing activity never replaces its input. Claiming selects and locks state rows first, then loads only the selected input batch in that transaction. Missing inputs fail the claim transaction.
 
@@ -35,7 +35,7 @@ ALTER TABLE runnerq_results ADD COLUMN serialization TEXT NOT NULL DEFAULT 'json
 COMMIT;
 ```
 
-Coordinate the change with clients and workers; old readers cannot decode new native values. The initializer does not apply migrations, and missing/unknown formats do not trigger decoder inference. This SQL only upgrades the previous TS layout; it does not migrate inline-input Go schemas.
+Coordinate the change with clients and workers; old readers cannot decode new native values. Missing or unknown formats do not trigger decoder inference. This SQL only upgrades the previous TS layout; it does not migrate inline-input Go schemas.
 
 ## Failure diagnostics
 

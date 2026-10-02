@@ -28,10 +28,12 @@ import type {
   CommandStorage,
 } from "../storage.js";
 import {
-  additions,
-  additionTables,
+  catalog,
+  concurrentIndexes,
   indexNames,
-  schema,
+  migrations,
+  normalizeDefault,
+  normalizeIndex,
   schemaLock,
   tableNames,
 } from "./schema.js";
@@ -82,19 +84,34 @@ function poolConfig(config: Omit<PostgresConfig, "queue">): PoolConfig {
     idle_in_transaction_session_timeout: 10_000,
   };
 }
-function canonicalIndex(sql: string): string {
-  return sql
-    .toLowerCase()
-    .replace(/\bon\s+(?:"(?:[^"]|"")+"|[a-z_]\w*)\./g, "on ")
-    .replace(/::text(?:\[\])?/g, "")
-    .replace(/=\s*any\s*\(\s*array\s*\[/g, "in(")
-    .replace(/using\s+btree/g, "")
-    .replace(/\s+asc\b/g, "")
-    .replace(/[\s"()[\];]/g, "");
-}
-/** Checks the schema without DDL; addition tables may be absent, and are checked when present. */
-async function verifySchema(client: PoolClient): Promise<void> {
-  const ddl = schema + additions;
+const initializeHint = "run PostgresStorage.initialize to bring it up to date";
+const inlinePayloads = () =>
+  new RunnerQError(
+    "configuration",
+    "Inline-payload schemas are unsupported; migrate Go and the database to the separate-input contract first",
+  );
+/**
+ * Objects that databases initialized by older versions of this SDK lack. connect accepts their
+ * absence (commands then ask for initialize; queries are slower); initialize adds them.
+ */
+const addedSince = {
+  tables: ["runnerq_commands"],
+  indexes: [
+    "idx_runnerq_commands_created",
+    "idx_runnerq_query_created",
+    "idx_runnerq_query_status_created",
+    "idx_runnerq_query_type_created",
+  ],
+};
+/**
+ * Checks the schema against runnerq-spec's catalog, without DDL. With `allowOlder` (connect), the
+ * objects in addedSince may be absent and replaced indexes may linger; everything present must
+ * still match.
+ */
+async function verifySchema(
+  client: PoolClient,
+  allowOlder = false,
+): Promise<void> {
   const columns = await client.query(
     `SELECT table_name,column_name,udt_name,is_nullable,column_default FROM information_schema.columns
     WHERE table_schema=current_schema() AND table_name=ANY($1)`,
@@ -103,75 +120,58 @@ async function verifySchema(client: PoolClient): Promise<void> {
   const actual = new Map(
     columns.rows.map((r) => [`${r.table_name}.${r.column_name}`, r]),
   );
+  if (catalog.retired.columns.some((c) => actual.has(c)))
+    throw inlinePayloads();
   const present = new Set(columns.rows.map((r) => r.table_name as string));
-  const absent = (table: string) =>
-    additionTables.includes(table) && !present.has(table);
-  const types: Record<string, string> = {
-    UUID: "uuid",
-    TEXT: "text",
-    JSONB: "jsonb",
-    INTEGER: "int4",
-    SMALLINT: "int2",
-    BIGINT: "int8",
-    BIGSERIAL: "int8",
-    TIMESTAMPTZ: "timestamptz",
-  };
-  for (const table of ddl.matchAll(/CREATE TABLE (\w+) \(([\s\S]*?)\n\);/g)) {
-    if (absent(table[1]!)) continue;
-    for (const col of table[2]!.matchAll(
-      /\b(\w+) (UUID|TEXT|JSONB|INTEGER|SMALLINT|BIGINT|BIGSERIAL|TIMESTAMPTZ)(\[\])?([^,\n]*)/g,
-    )) {
-      const row = actual.get(`${table[1]}.${col[1]}`);
-      const expectedDefault = col[4]!.match(/DEFAULT\s+(.+)$/)?.[1] ?? null;
-      const normalizeDefault = (value: string | null) =>
-        value
-          ?.toLowerCase()
-          .replace(/::(?:text|integer|bigint|smallint)/g, "")
-          .replace(/[\s()]/g, "") ?? null;
-      const defaultMatches =
-        col[2] === "BIGSERIAL"
-          ? String(row?.column_default).startsWith("nextval(")
-          : normalizeDefault(row?.column_default ?? null) ===
-            normalizeDefault(expectedDefault);
+  const absentOlder = (table: string) =>
+    allowOlder && addedSince.tables.includes(table) && !present.has(table);
+  for (const table of catalog.tables) {
+    if (absentOlder(table.name)) continue;
+    for (const col of table.columns) {
+      const row = actual.get(`${table.name}.${col.name}`);
       if (
         !row ||
-        row.udt_name !== (col[3] ? "_" : "") + types[col[2]!] ||
-        row.is_nullable !==
-          (/NOT NULL|PRIMARY KEY/.test(col[4]!) ? "NO" : "YES") ||
-        !defaultMatches
-      ) {
+        row.udt_name !== col.type ||
+        (row.is_nullable === "YES") !== col.nullable ||
+        normalizeDefault(row.column_default) !== normalizeDefault(col.default)
+      )
         throw new RunnerQError(
           "configuration",
-          `Incompatible schema: ${table[1]}.${col[1]}; initialize the separate-input RunnerQ schema before connecting`,
+          `Missing or incompatible column ${table.name}.${col.name}; ${initializeHint}`,
         );
-      }
     }
   }
-  if (actual.has("runnerq_activities.payload"))
-    throw new RunnerQError(
-      "configuration",
-      "Inline-payload schemas are unsupported; migrate Go and the database to the separate-input contract first",
-    );
   const indexes = await client.query(
     `SELECT c.relname,i.indisvalid,pg_get_indexdef(c.oid) AS definition
     FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname=current_schema() AND c.relname=ANY($1)`,
-    [indexNames],
+    [[...indexNames, ...catalog.retired.indexes]],
   );
-  for (const expected of ddl.matchAll(
-    /CREATE INDEX (\w+) ON (\w+)[\s\S]*?;/g,
-  )) {
-    if (absent(expected[2]!)) continue;
-    const row = indexes.rows.find((r) => r.relname === expected[1]);
+  for (const expected of catalog.indexes) {
+    const row = indexes.rows.find((r) => r.relname === expected.name);
+    if (
+      !row &&
+      (absentOlder(expected.table) ||
+        (allowOlder && addedSince.indexes.includes(expected.name)))
+    )
+      continue;
     if (
       !row?.indisvalid ||
-      canonicalIndex(row.definition) !== canonicalIndex(expected[0])
+      normalizeIndex(row.definition) !== normalizeIndex(expected.definition)
     )
       throw new RunnerQError(
         "configuration",
-        `Missing or incompatible index ${expected[1]}`,
+        `Missing or incompatible index ${expected.name}; ${initializeHint}`,
       );
   }
+  const retired = indexes.rows.find((r) =>
+    catalog.retired.indexes.includes(r.relname),
+  );
+  if (retired && !allowOlder)
+    throw new RunnerQError(
+      "configuration",
+      `Index ${retired.relname} is replaced in this schema version; ${initializeHint}`,
+    );
   const keys = await client.query(
     `SELECT c.relname,array_agg(a.attname::text ORDER BY k.ordinality) AS columns FROM pg_constraint p
     JOIN pg_class c ON c.oid=p.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -180,26 +180,56 @@ async function verifySchema(client: PoolClient): Promise<void> {
     WHERE p.contype='p' AND n.nspname=current_schema() AND c.relname=ANY($1) GROUP BY c.relname`,
     [tableNames],
   );
-  const expectedKeys: Record<string, string[]> = {
-    runnerq_activities: ["id"],
-    runnerq_inputs: ["activity_id"],
-    runnerq_results: ["activity_id"],
-    runnerq_events: ["id"],
-    runnerq_worker_pools: ["pool_id"],
-    runnerq_idempotency: ["queue_name", "idempotency_key"],
-    runnerq_dependencies: ["queue_name", "waiter_activity_id", "result_id"],
-    runnerq_commands: ["queue_name", "command_id"],
-  };
-  for (const [name, columns] of Object.entries(expectedKeys))
+  for (const table of catalog.tables)
     if (
-      !absent(name) &&
-      JSON.stringify(keys.rows.find((r) => r.relname === name)?.columns) !==
-        JSON.stringify(columns)
+      !absentOlder(table.name) &&
+      JSON.stringify(
+        keys.rows.find((r) => r.relname === table.name)?.columns,
+      ) !== JSON.stringify(table.primary_key)
     )
       throw new RunnerQError(
         "configuration",
-        `Incompatible primary key on ${name}`,
+        `Incompatible primary key on ${table.name}; ${initializeHint}`,
       );
+}
+/** Schema statements can lose deadlocks against live traffic; they are idempotent, so retry. */
+async function retryDeadlock(op: () => Promise<unknown>): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await op();
+      return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "40P01" || attempt >= 4)
+        throw error;
+      await pause(50 << attempt);
+    }
+  }
+}
+/**
+ * Builds the spec's concurrent indexes one statement at a time (CONCURRENTLY can't run in a
+ * transaction): an invalid leftover is dropped and rebuilt, and a replaced index is dropped only
+ * once its successor is valid.
+ */
+async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
+  const schemaName: string = (
+    await client.query("SELECT current_schema() AS s")
+  ).rows[0].s;
+  const ident = (name: string) =>
+    `${client.escapeIdentifier(schemaName)}.${client.escapeIdentifier(name)}`;
+  for (const idx of concurrentIndexes)
+    await retryDeadlock(async () => {
+      const found = await client.query(
+        `SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+        JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2`,
+        [schemaName, idx.name],
+      );
+      const valid: boolean | undefined = found.rows[0]?.indisvalid;
+      if (valid === false)
+        await client.query(`DROP INDEX IF EXISTS ${ident(idx.name)}`);
+      if (valid !== true) await client.query(idx.sql);
+      if (idx.replaces)
+        await client.query(`DROP INDEX IF EXISTS ${ident(idx.replaces)}`);
+    });
 }
 
 export class PostgresStorage
@@ -245,6 +275,10 @@ export class PostgresStorage
       },
     });
   }
+  /**
+   * Creates the schema in an empty database, or brings an existing one up to date, as
+   * runnerq-spec defines it. Refuses a database still on the inline-payload schema.
+   */
   static async initialize(
     config: Omit<PostgresConfig, "queue">,
   ): Promise<void> {
@@ -252,6 +286,8 @@ export class PostgresStorage
     try {
       const client = await pool.connect();
       try {
+        // Index builds on a large table outlast the pool's statement timeout.
+        await client.query("SET statement_timeout = 0");
         const deadline = Date.now() + 30_000;
         while (
           !(
@@ -268,31 +304,31 @@ export class PostgresStorage
             );
           await pause(50);
         }
-        const present = await client.query(
-          "SELECT tablename FROM pg_tables WHERE schemaname=current_schema() AND tablename=ANY($1)",
-          [tableNames],
+        // Even no-op DDL takes table locks: skip it when the schema is current.
+        const current = await verifySchema(client).then(
+          () => true,
+          () => false,
         );
-        const tables = new Set(present.rows.map((r) => r.tablename));
-        // A database from before an addition gets it; IF NOT EXISTS tolerates Go's creating it.
-        const ddl = !tables.size
-          ? schema + additions
-          : additionTables.some((t) => !tables.has(t))
-            ? additions.replace(
-                /CREATE (TABLE|INDEX) /g,
-                "CREATE $1 IF NOT EXISTS ",
-              )
-            : "";
-        if (ddl) {
-          await client.query("BEGIN");
-          try {
-            await client.query(ddl);
-            await client.query("COMMIT");
-          } catch (error) {
-            await client.query("ROLLBACK");
-            throw error;
-          }
+        if (!current) {
+          const retired = await client.query(
+            `SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+            AND table_name || '.' || column_name = ANY($1)`,
+            [catalog.retired.columns],
+          );
+          if (retired.rows.length) throw inlinePayloads();
+          await retryDeadlock(async () => {
+            await client.query("BEGIN");
+            try {
+              await client.query(migrations);
+              await client.query("COMMIT");
+            } catch (error) {
+              await client.query("ROLLBACK");
+              throw error;
+            }
+          });
+          await ensureConcurrentIndexes(client);
+          await verifySchema(client);
         }
-        await verifySchema(client);
       } finally {
         // Destroy the setup session so its advisory lock never returns to a pool.
         client.release(true);
@@ -315,7 +351,7 @@ export class PostgresStorage
     try {
       const client = await storage.pool.connect();
       try {
-        await verifySchema(client);
+        await verifySchema(client, true);
       } finally {
         client.release();
       }

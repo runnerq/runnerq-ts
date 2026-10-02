@@ -1,85 +1,36 @@
-// Baseline only: the separate-input schema is intentionally incompatible with old Go deployments.
-export const schema = `
-CREATE TABLE runnerq_activities (
- id UUID PRIMARY KEY, queue_name TEXT NOT NULL, activity_type TEXT NOT NULL,
- priority INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'pending',
- created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), scheduled_at TIMESTAMPTZ,
- started_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, lease_deadline_ms BIGINT,
- current_worker_id TEXT, last_worker_id TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
- max_retries INTEGER NOT NULL DEFAULT 0, timeout_seconds BIGINT NOT NULL DEFAULT 300,
- retry_delay_seconds BIGINT NOT NULL DEFAULT 60, max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0,
- last_error TEXT, last_error_at TIMESTAMPTZ, metadata JSONB, idempotency_key TEXT,
- parent_activity_id UUID, root_activity_id UUID, depth SMALLINT NOT NULL DEFAULT 0,
- waiting_result_id UUID
-);
-CREATE TABLE runnerq_inputs (
- activity_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, payload JSONB NOT NULL,
- serialization TEXT NOT NULL DEFAULT 'json-v1'
-);
-CREATE TABLE runnerq_idempotency (
- queue_name TEXT NOT NULL, idempotency_key TEXT NOT NULL, activity_id UUID NOT NULL,
- created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
- PRIMARY KEY(queue_name, idempotency_key)
-);
-CREATE TABLE runnerq_events (
- id BIGSERIAL PRIMARY KEY, activity_id UUID NOT NULL, queue_name TEXT NOT NULL,
- event_type TEXT NOT NULL, worker_id TEXT, detail JSONB,
- created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE runnerq_results (
- activity_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, state TEXT NOT NULL,
- data JSONB, serialization TEXT NOT NULL DEFAULT 'json-v1', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), owner_activity_id UUID, step TEXT
-);
-CREATE TABLE runnerq_worker_pools (
- pool_id UUID PRIMARY KEY, queue_name TEXT NOT NULL, max_workers INTEGER NOT NULL,
- activity_types TEXT[], started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
- last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE runnerq_dependencies (
- queue_name TEXT NOT NULL, waiter_activity_id UUID NOT NULL, result_id UUID NOT NULL,
- producer_activity_id UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
- PRIMARY KEY(queue_name, waiter_activity_id, result_id)
-);
-CREATE INDEX idx_runnerq_dequeue_effective_v2 ON runnerq_activities
- (queue_name, activity_type, priority DESC, retry_count DESC, COALESCE(scheduled_at, created_at) ASC)
- WHERE status IN ('pending','scheduled','retrying','waiting');
-CREATE INDEX idx_runnerq_dequeue_order_v2 ON runnerq_activities
- (queue_name, priority DESC, retry_count DESC, COALESCE(scheduled_at, created_at) ASC)
- WHERE status IN ('pending','scheduled','retrying','waiting');
-CREATE INDEX idx_runnerq_activities_processing ON runnerq_activities(queue_name, lease_deadline_ms) WHERE status='processing';
-CREATE INDEX idx_runnerq_completed_non_cron ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)
- WHERE status IN ('completed','failed') AND (metadata->>'source') IS DISTINCT FROM 'cron';
-CREATE INDEX idx_runnerq_completed_cron ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)
- WHERE status IN ('completed','failed') AND metadata->>'source'='cron';
-CREATE INDEX idx_runnerq_dead_letter ON runnerq_activities(queue_name, completed_at DESC) WHERE status='dead_letter';
-CREATE INDEX idx_runnerq_parent_id ON runnerq_activities(parent_activity_id) WHERE parent_activity_id IS NOT NULL;
-CREATE INDEX idx_runnerq_root_id ON runnerq_activities(root_activity_id) WHERE root_activity_id IS NOT NULL;
-CREATE INDEX idx_runnerq_root_only ON runnerq_activities(queue_name, created_at DESC) WHERE parent_activity_id IS NULL;
-CREATE INDEX idx_runnerq_root_status ON runnerq_activities(queue_name, status) WHERE parent_activity_id IS NULL;
-CREATE INDEX idx_runnerq_events_activity ON runnerq_events(activity_id, created_at DESC);
-CREATE INDEX idx_runnerq_events_queue_seq ON runnerq_events(queue_name, id);
-CREATE INDEX idx_runnerq_results_owner ON runnerq_results(queue_name, owner_activity_id) WHERE owner_activity_id IS NOT NULL;
-CREATE INDEX idx_runnerq_root_terminal_age ON runnerq_activities(queue_name, status, completed_at)
- WHERE parent_activity_id IS NULL AND status IN ('completed','failed','dead_letter');
-CREATE INDEX idx_runnerq_worker_pools_queue_alive ON runnerq_worker_pools(queue_name, last_seen_at);
-CREATE INDEX idx_runnerq_dependencies_result ON runnerq_dependencies(queue_name, result_id);
-CREATE INDEX idx_runnerq_dependencies_producer ON runnerq_dependencies(queue_name, producer_activity_id);
-`;
-/**
- * Tables added after the baseline, as Go defines them: initialize creates them in an existing
- * database, and connect accepts a database without them (checking them when present).
- */
-export const additions = `
-CREATE TABLE runnerq_commands (
- queue_name TEXT NOT NULL, command_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
- kind TEXT NOT NULL, result JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
- PRIMARY KEY(queue_name, command_id)
-);
-CREATE INDEX idx_runnerq_commands_created ON runnerq_commands(created_at);
-`;
+// The schema comes from runnerq-spec (src/spec-schema.ts); see the spec's
+// schema/postgres/README.md for how it is applied and checked.
+import {
+  postgresCatalog,
+  postgresConcurrentIndexes,
+  postgresMigrations,
+} from "../spec-schema.js";
+
 export { schemaAdvisoryLockKey as schemaLock } from "../spec.js";
-const names = (sql: string, re: RegExp) =>
-  [...sql.matchAll(re)].map((m) => m[1]!);
-export const tableNames = names(schema + additions, /CREATE TABLE (\w+)/g);
-export const indexNames = names(schema + additions, /CREATE INDEX (\w+)/g);
-export const additionTables = names(additions, /CREATE TABLE (\w+)/g);
+export const catalog = postgresCatalog;
+export const concurrentIndexes = postgresConcurrentIndexes;
+/** Every migration, run as one transaction; each is safe to re-run. */
+export const migrations = postgresMigrations.map((m) => m.sql).join("\n");
+export const tableNames = catalog.tables.map((t) => t.name);
+export const indexNames = catalog.indexes.map((i) => i.name);
+
+/** An index definition, normalized as the spec's vectors/index_definition.json describes. */
+export function normalizeIndex(sql: string): string {
+  return sql
+    .toLowerCase()
+    .replace(/\bon\s+(?:"(?:[^"]|"")+"|[a-z_]\w*)\./g, "on ")
+    .replace(/::text(?:\[\])?/g, "")
+    .replace(/=\s*any\s*\(\s*array\s*\[/g, "in(")
+    .replace(/using btree/g, "")
+    .replace(/\s+asc\b/g, "")
+    .replace(/[\s"()[\];]/g, "");
+}
+/** A column default, normalized as the spec's vectors/column_default.json describes. */
+export function normalizeDefault(value: string | null): string | null {
+  if (value === null) return null;
+  const s = value
+    .toLowerCase()
+    .replace(/::(?:text|integer|bigint|smallint)/g, "")
+    .replace(/[\s()]/g, "");
+  return s.startsWith("nextval") ? "nextval" : s;
+}
