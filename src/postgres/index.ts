@@ -985,7 +985,7 @@ export class PostgresStorage
   async reap(limit: number): Promise<number> {
     const ids = await this.tx(async (c) => {
       const rows = await c.query(
-        `UPDATE runnerq_activities SET retry_count=retry_count+1,
+        `UPDATE runnerq_activities SET retry_count=retry_count+CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN 0 ELSE 1 END,
         status=CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN 'dead_letter' ELSE 'pending' END,
         completed_at=CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN NOW() ELSE NULL END,
         last_error='lease expired before completion; worker presumed crashed or wedged',last_error_at=NOW(),
