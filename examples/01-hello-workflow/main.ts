@@ -1,8 +1,7 @@
-import { activity, RunnerQClient, Worker, NonRetryableError } from "runnerq";
+import { RunnerQClient, Worker } from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
-
-type Account = { user_id: string; email: string };
-const SignupWorkflow = activity<{ email: string }, Account>("SignupWorkflow");
+import { SignupWorkflow } from "./activities.ts";
+import { handleSignupWorkflow } from "./handlers.ts";
 
 async function main() {
   const connectionString =
@@ -16,19 +15,7 @@ async function main() {
   const client = new RunnerQClient({ storage });
   const worker = new Worker({ storage, concurrency: 4 });
   try {
-    worker.register(SignupWorkflow, async (ctx, input) => {
-      if (typeof input?.email !== "string")
-        throw new NonRetryableError("Invalid payload");
-      const user = await ctx.run("create-account", async () => {
-        console.log(`  ▶ creating account for ${input.email}`);
-        return { user_id: "u_1001", email: input.email };
-      });
-      await ctx.run("send-welcome", async () => {
-        console.log(`  ▶ sending welcome email to ${user.email}`);
-        return true;
-      });
-      return user;
-    });
+    worker.register(SignupWorkflow, handleSignupWorkflow);
     await worker.start();
     console.log("starting signup workflow...");
     const handle = await client.execute(SignupWorkflow, {

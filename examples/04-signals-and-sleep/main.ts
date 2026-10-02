@@ -1,4 +1,10 @@
-import { activity, runner, RunnerQClient, Worker } from "runnerq";
+import {
+  activity,
+  runner,
+  RunnerQClient,
+  Worker,
+  type ActivityContext,
+} from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
 const connectionString =
   process.env.DATABASE_URL ??
@@ -10,14 +16,17 @@ const storage = await PostgresStorage.connect({
 });
 const client = new RunnerQClient({ storage });
 const Approval = activity<{ orderId: string }, boolean>("Approval");
-const worker = new Worker({ storage });
-worker.register(Approval, async (ctx) => {
+
+async function handleApproval(ctx: ActivityContext) {
   const decision = await ctx.waitForSignal<{ approved: boolean }>("decision", {
     timeoutMs: 60_000,
   });
   await ctx.sleep("cooling-off", 2_000);
   return decision.approved;
-});
+}
+
+const worker = new Worker({ storage });
+worker.register(Approval, handleApproval);
 try {
   await worker.start();
   const handle = await client.execute(

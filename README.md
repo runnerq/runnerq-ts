@@ -27,9 +27,40 @@ npm install github:runnerq/runnerq-ts
 
 ## Quick start
 
+Keep activity definitions and their handlers in separate modules. Producers import only the definitions; workers import both.
+
 ```ts
-import { activity, runner, RunnerQClient, Worker } from "runnerq";
+// activities.ts: the contract. Producers and workers both import it.
+import { activity } from "runnerq";
+
+export type SignupInput = { email: string };
+export type Account = { user_id: string };
+
+export const Signup = activity<SignupInput, Account>("SignupWorkflow");
+```
+
+```ts
+// handlers.ts: the implementation. Only workers import it.
+import type { ActivityContext } from "runnerq";
+import type { Account, SignupInput } from "./activities.js";
+
+export async function handleSignup(
+  ctx: ActivityContext,
+  input: SignupInput,
+): Promise<Account> {
+  return ctx.run("create-account", async ({ signal }) => {
+    // Call your external service with signal and an idempotency key here.
+    return { user_id: "u_1001" };
+  });
+}
+```
+
+```ts
+// main.ts
+import { runner, RunnerQClient, Worker } from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
+import { Signup } from "./activities.js";
+import { handleSignup } from "./handlers.js";
 
 const connectionString = process.env.DATABASE_URL!;
 
@@ -42,18 +73,10 @@ const storage = await PostgresStorage.connect({
   queue: "orders",
 });
 
-const Signup = activity<{ email: string }, { user_id: string }>(
-  "SignupWorkflow",
-);
 const client = new RunnerQClient({ storage });
 const worker = new Worker({ storage, concurrency: 20 });
 
-worker.register(Signup, async (ctx, input) => {
-  return ctx.run("create-account", async ({ signal }) => {
-    // Call your external service with signal and an idempotency key here.
-    return { user_id: "u_1001" };
-  });
-});
+worker.register(Signup, handleSignup);
 
 await worker.start();
 
