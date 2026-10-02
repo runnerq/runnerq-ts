@@ -1,4 +1,10 @@
-import { activity, runner, RunnerQClient, Worker } from "runnerq";
+import {
+  activity,
+  runner,
+  RunnerQClient,
+  Worker,
+  type ActivityContext,
+} from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
 import { setTimeout } from "node:timers/promises";
 const connectionString =
@@ -11,8 +17,8 @@ const storage = await PostgresStorage.connect({
 });
 const client = new RunnerQClient({ storage });
 const Checkout = activity<{ orderId: string }, string>("Checkout");
-const worker = new Worker({ storage });
-worker.register(Checkout, async (ctx) => {
+
+async function handleCheckout(ctx: ActivityContext) {
   await ctx.run("charge", () => {
     console.log("Charging once per recorded success");
     return "receipt";
@@ -25,7 +31,10 @@ worker.register(Checkout, async (ctx) => {
     console.log("Shipping");
     return "shipment";
   });
-});
+}
+
+const worker = new Worker({ storage });
+worker.register(Checkout, handleCheckout);
 try {
   await worker.start();
   const handle = await client.execute(

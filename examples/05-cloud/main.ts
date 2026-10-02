@@ -4,6 +4,7 @@ import {
   RunnerQClient,
   Worker,
   NonRetryableError,
+  type ActivityContext,
 } from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
 import { startAgent } from "runnerq/conductor";
@@ -38,16 +39,16 @@ const worker = new Worker({
   labels: { example: "05-cloud" },
 });
 
-worker.register(Charge, async (ctx, order) => {
+async function handleCharge(ctx: ActivityContext, order: Order) {
   // Every 5th charge fails once, so the console shows a retry.
   if (order.id % 5 === 0 && ctx.retryCount === 0)
     throw new Error("card network timeout");
   // Every 7th is declined for good: a failed activity.
   if (order.id % 7 === 0) throw new NonRetryableError("card declined");
   return { receipt: `r_${order.id}` };
-});
+}
 
-worker.register(PlaceOrder, async (ctx, order) => {
+async function handlePlaceOrder(ctx: ActivityContext, order: Order) {
   await ctx.run("reserve-stock", async () => `reserved ${order.id}`);
   const charge = await ctx.spawn(
     Charge,
@@ -60,7 +61,10 @@ worker.register(PlaceOrder, async (ctx, order) => {
   await ctx.sleep("pack", 2_000); // a durable timer: the order shows as waiting
   await ctx.run("ship", async () => true);
   return { receipt, shipped: true };
-});
+}
+
+worker.register(Charge, handleCharge);
+worker.register(PlaceOrder, handlePlaceOrder);
 
 await worker.start();
 // Dials out over a WebSocket: the worker appears in Fleet, and the console reads

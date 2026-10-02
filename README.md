@@ -28,8 +28,30 @@ npm install github:runnerq/runnerq-ts
 ## Quick start
 
 ```ts
-import { activity, runner, RunnerQClient, Worker } from "runnerq";
+import {
+  activity,
+  runner,
+  RunnerQClient,
+  Worker,
+  type ActivityContext,
+} from "runnerq";
 import { PostgresStorage } from "runnerq/postgres";
+
+type SignupInput = { email: string };
+type Account = { user_id: string };
+
+const Signup = activity<SignupInput, Account>("SignupWorkflow");
+
+// A handler is a plain function, so it can live in its own module.
+async function handleSignup(
+  ctx: ActivityContext,
+  input: SignupInput,
+): Promise<Account> {
+  return ctx.run("create-account", async ({ signal }) => {
+    // Call your external service with signal and an idempotency key here.
+    return { user_id: "u_1001" };
+  });
+}
 
 const connectionString = process.env.DATABASE_URL!;
 
@@ -42,18 +64,10 @@ const storage = await PostgresStorage.connect({
   queue: "orders",
 });
 
-const Signup = activity<{ email: string }, { user_id: string }>(
-  "SignupWorkflow",
-);
 const client = new RunnerQClient({ storage });
 const worker = new Worker({ storage, concurrency: 20 });
 
-worker.register(Signup, async (ctx, input) => {
-  return ctx.run("create-account", async ({ signal }) => {
-    // Call your external service with signal and an idempotency key here.
-    return { user_id: "u_1001" };
-  });
-});
+worker.register(Signup, handleSignup);
 
 await worker.start();
 
@@ -198,6 +212,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 | 03  | [fan-out](examples/03-fan-out/)                      | children and a durable join with one execution slot                        |
 | 04  | [signals-and-sleep](examples/04-signals-and-sleep/)  | buffered signals, persisted deadlines, a durable timer                     |
 | 05  | [cloud](examples/05-cloud/)                          | a worker connected to RunnerQ Cloud                                        |
+| 06  | [multiple-files](examples/06-multiple-files/)        | definitions, handlers, worker and producer in separate files               |
 
 ## Documentation
 
