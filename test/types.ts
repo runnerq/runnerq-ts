@@ -36,6 +36,9 @@ worker.register(signup, async (ctx, input) => {
   const id: string = step.user_id;
   return { user_id: id };
 });
+new Worker({ storage, activityTypes: [signup, "audit"] });
+// @ts-expect-error activityTypes takes definitions or names
+new Worker({ storage, activityTypes: [42] });
 // @ts-expect-error output contract is enforced
 new Worker({ storage }).register(signup, async () => ({ wrong: true }));
 void result;

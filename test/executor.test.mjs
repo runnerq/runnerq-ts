@@ -126,6 +126,21 @@ test("a worker's snapshot, counters, changes and observers", async () => {
   );
 });
 
+test("activityTypes takes definitions or names", async () => {
+  const charge = activity("charge");
+  const refund = activity("refund");
+  const worker = new Worker({
+    storage: fakeStorage(),
+    activityTypes: [charge, "refund"],
+  });
+  worker.register(charge, () => ({ ok: true }));
+  worker.register(refund, () => ({ ok: true }));
+  worker.register(activity("payout"), () => ({ ok: true }));
+  await worker.start();
+  assert.deepEqual(worker.snapshot().info.activityTypes, ["charge", "refund"]);
+  await worker.stop();
+});
+
 test("ChangeSignal wakes every waiter once", async () => {
   const s = new ChangeSignal();
   s.notify(); // nobody waiting

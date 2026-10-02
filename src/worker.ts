@@ -52,7 +52,13 @@ export interface Metrics {
 export interface WorkerConfig {
   storage: Storage;
   concurrency?: number;
-  activityTypes?: readonly string[];
+  /**
+   * Claims only these registered activities, by definition or by persisted name.
+   * Defaults to every registered activity.
+   */
+  activityTypes?: readonly (
+    string | Pick<ActivityDefinition<unknown, unknown>, "name">
+  )[];
   leaseMs?: number;
   heartbeatMs?: number;
   reaperIntervalMs?: number;
@@ -94,7 +100,9 @@ export class Worker
       | "maxActivityDepth"
     >
   > &
-    WorkerConfig;
+    Omit<WorkerConfig, "activityTypes"> & {
+      activityTypes?: readonly string[];
+    };
   private readonly handlers = new Map<string, Registration>();
   private readonly inFlight = new Set<Promise<void>>();
   private readonly slotFreed = new ChangeSignal();
@@ -161,9 +169,9 @@ export class Worker
         1,
         32767,
       ),
-      activityTypes: config.activityTypes
-        ? [...config.activityTypes]
-        : undefined,
+      activityTypes: config.activityTypes?.map((type) =>
+        typeof type === "string" ? type : type.name,
+      ),
       retention: config.retention ? { ...config.retention } : undefined,
       labels: { ...config.labels },
     };
