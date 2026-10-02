@@ -230,6 +230,8 @@ npm ci
 npm test                  # Build, type tests, unit tests; database tests skip without DSN
 RUNNERQ_TEST_DSN=postgres://postgres:runnerq@localhost:5432/runnerq npm test
 npm run test:integration  # Requires RUNNERQ_TEST_DSN; never silently skips
+# runnerq-spec's cross-language scenarios, through test/conformance-driver.mjs (needs Go):
+go run -C spec/tools/conformance . -dsn "$RUNNERQ_TEST_DSN" -driver ts="node $PWD/test/conformance-driver.mjs"
 npm run format:check
 npm pack --dry-run
 ```
