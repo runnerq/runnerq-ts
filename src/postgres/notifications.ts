@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { Client, type Pool, type ClientConfig } from "pg";
 import { linkSignal, pause } from "../async.js";
+import { resultChannelPrefix, workChannelPrefix } from "../spec.js";
 
 /** Notifications are bounded, lossy hints. Every consumer must recheck stored data. */
 export class Notifications {
@@ -19,8 +20,8 @@ export class Notifications {
     private readonly pool: Pool,
     queue: string,
   ) {
-    this.workChannel = `rq_w_${queue}`;
-    this.resultChannel = `rq_r_${queue}`;
+    this.workChannel = workChannelPrefix + queue;
+    this.resultChannel = resultChannelPrefix + queue;
     // Waiters unsubscribe themselves; callers bound how many there are.
     this.bus.setMaxListeners(0);
   }

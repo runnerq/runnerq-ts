@@ -77,7 +77,7 @@ CREATE TABLE runnerq_commands (
 );
 CREATE INDEX idx_runnerq_commands_created ON runnerq_commands(created_at);
 `;
-export const schemaLock = "5932734182207934753"; // 0x52554E4E45525121, shared with Go.
+export { schemaAdvisoryLockKey as schemaLock } from "../spec.js";
 const names = (sql: string, re: RegExp) =>
   [...sql.matchAll(re)].map((m) => m[1]!);
 export const tableNames = names(schema + additions, /CREATE TABLE (\w+)/g);

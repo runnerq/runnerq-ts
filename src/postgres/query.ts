@@ -2,6 +2,7 @@
 // storage/postgres/query.go). Filters compile to parameterised SQL: only whitelisted
 // expressions are ever spliced into SQL text.
 import { RunnerQError } from "../errors.js";
+import { businessKeyPrefix, stepKeyPrefix } from "../spec.js";
 import {
   businessKey,
   isTimestamp,
@@ -472,9 +473,6 @@ export function clampLimit(
   return Math.min(Math.trunc(limit), max);
 }
 
-const businessKeyPrefix = "rq:key:v2:";
-/** Starts the keys the engine derives for activities spawned by a step. */
-const stepKeyPrefix = "rq:step:";
 /** Decodes a key `businessKey` encoded; anything it could not have produced is undefined. */
 function decodeBusinessKey(
   encoded: string,

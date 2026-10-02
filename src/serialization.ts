@@ -1,9 +1,11 @@
 import SuperJSON, { type SuperJSONResult } from "superjson";
 import { json, nonempty, type JsonValue } from "./codec.js";
 import { RunnerQError } from "./errors.js";
+import type { serializationJson, serializationSuperjson } from "./spec.js";
 
 export type SerializationMode = "native" | "portable";
-export type SerializationFormat = "superjson-v1" | "json-v1";
+export type SerializationFormat =
+  typeof serializationSuperjson | typeof serializationJson;
 export interface SerializedValue {
   serialization: SerializationFormat;
   data: JsonValue;

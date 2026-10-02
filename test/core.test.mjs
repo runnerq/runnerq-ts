@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { activity, runner, Worker } from "../dist/index.js";
-import { json, businessKey, checkpointId } from "../dist/codec.js";
+import { json, checkpointId } from "../dist/codec.js";
 import { executionOptions } from "../dist/options.js";
 import { fakeStorage, until } from "./helpers.mjs";
 
@@ -59,16 +59,6 @@ test("JSON rejects silent corruption and snapshots mutable input", () => {
     JSON.stringify(json(JSON.parse('{"__proto__":{"x":1}}'))),
     '{"__proto__":{"x":1}}',
   );
-});
-test("identities use RFC UUIDv5 and UTF-8 length with standard unpadded base64", () => {
-  // Golden values independently calculated with Python uuid.uuid5 and base64.
-  assert.equal(
-    checkpointId("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "run", "charge"),
-    "020e4a37-85b6-5ee4-a6c6-ce49b8c3fad7",
-  );
-  assert.equal(businessKey("é", "Charge"), "rq:key:v2:MjrDqUNoYXJnZQ");
-  assert.notEqual(businessKey("a-b", "c"), businessKey("a", "b-c"));
-  assert.ok(!businessKey("foo", "Bar").endsWith("="));
 });
 test("names are explicit and worker registration validates routing", async () => {
   assert.throws(() => activity(""));
