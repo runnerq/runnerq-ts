@@ -1,12 +1,31 @@
 # RunnerQ for TypeScript
 
-Durable TypeScript functions, with pluggable storage. PostgreSQL is built in, and `runnerq/storage` exports the contract for custom backends. The runtime uses bounded async concurrency, native event emitters and cooperative cancellation. There is no separate orchestration service.
+**Durable TypeScript functions, with pluggable storage.**
 
-This SDK uses **separate activity inputs**: `runnerq_inputs.payload`, not `runnerq_activities.payload`. It cannot share a schema with the current Go SDK until Go adopts this layout and the serialization format columns. Existing Go databases require a coordinated migration; this package deliberately contains no legacy schema or key-encoding fallback.
+[![SDK checks](https://github.com/runnerq/runnerq-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerq/runnerq-ts/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[Docs](docs/) · [Examples](examples/README.md)
+
+Add durable workflows and background jobs to a Node.js app without running an
+orchestration service. RunnerQ is a library: point it at your storage
+(PostgreSQL is built in) and write workflows as ordinary async functions. Each
+step is checkpointed, so when a process crashes, the workflow resumes where it
+stopped instead of redoing completed work.
+
+## Install
+
+Node.js 22 or later, an ESM application, and PostgreSQL are required.
+PostgreSQL 17 and 18 are covered by CI. The package ships compiled JavaScript
+and TypeScript declarations.
+
+`runnerq` isn't on npm yet. Install it from GitHub:
+
+```bash
+npm install github:runnerq/runnerq-ts
+```
 
 ## Quick start
-
-Node.js 22 or later, an ESM application, and PostgreSQL are required. PostgreSQL 17 and 18 are covered by CI. The package ships compiled JavaScript and TypeScript declarations.
 
 ```ts
 import { activity, runner, RunnerQClient, Worker } from "runnerq";
@@ -60,61 +79,21 @@ try {
 
 `execute()` resolves when submission commits, returning a non-thenable `ActivityHandle`. `handle.result()` awaits completion. Cancelling that wait does not cancel the activity. A workflow is an ordinary activity handler that uses durable primitives.
 
-See [runnable examples](examples/README.md), including the [hello workflow](examples/01-hello-workflow/main.ts).
+## Why RunnerQ
 
-## Activity contracts and options
+- **A workflow is just a function.** Orchestration is normal control flow (loops, conditionals, `try`/`catch`), not a DSL or a DAG.
+- **Steps are checkpointed.** Completed steps return their recorded results on replay instead of running again.
+- **Waiting is free.** Long sleeps and signal waits park in storage and release worker capacity.
+- **No orchestration service.** Workers are your own processes; add more to scale.
 
-Activity definitions contain stable persisted names and portable types, so producers can import them without importing handlers. Never rename a persisted activity or a durable step while existing executions still depend on it; use a new versioned activity name for incompatible changes.
+**Use RunnerQ** when you want durable workflows or queues inside your app with minimal new infrastructure. **Reach for a workflow server** (Temporal) if you want orchestration decoupled from your app and database. **A plain queue** is enough if you only need fire-and-forget tasks without steps, signals or durable timers.
 
-Runtime validators are optional synchronous parsers. TypeScript types alone do not validate data produced by other processes:
+## Features
 
-```ts
-const Signup = activity("SignupWorkflow", {
-  input(value: unknown) {
-    if (
-      !value ||
-      typeof value !== "object" ||
-      !("email" in value) ||
-      typeof value.email !== "string"
-    ) {
-      throw new Error("Expected an email");
-    }
-    return { email: value.email };
-  },
-  output(value: unknown) {
-    if (
-      !value ||
-      typeof value !== "object" ||
-      !("user_id" in value) ||
-      typeof value.user_id !== "string"
-    ) {
-      throw new Error("Expected a user ID");
-    }
-    return { user_id: value.user_id };
-  },
-});
-```
+<details open>
+<summary><strong>Durable steps</strong></summary>
 
-Activity options are immutable values. Later options override earlier ones. These configure the **activity**, not individual `ctx.run` steps.
-
-| Option                                                 | Default / meaning                                                                                |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `runner.priority("high")`                              | `"normal"`; choices: low, normal, high, critical                                                 |
-| `runner.maxAttempts(3)`                                | Default: `"unlimited"`; `3` means three total attempts; `1` means one total attempt (no retries) |
-| `runner.timeoutMs(300_000)`                            | Per-invocation cooperative timeout, in whole seconds expressed as milliseconds                   |
-| `runner.maxRetryDelayMs(3_600_000)`                    | Backoff cap, in whole seconds expressed as milliseconds                                          |
-| `runner.delayMs(5_000)`                                | Delay initial execution; millisecond precision                                                   |
-| `runner.metadata({ source: "webhook" })`               | String-valued metadata                                                                           |
-| `runner.idempotencyKey("order-123", "returnExisting")` | Atomic business-key deduplication within queue and activity type                                 |
-| `runner.step("ship")`                                  | Replay-safe named child; valid only with `ctx.spawn()`                                           |
-| `runner.asRoot()`                                      | Detach a handler-issued child from lineage; still execution-fenced                               |
-| `runner.newOnReplay()`                                 | Explicitly allow a new child on every replay                                                     |
-
-Duplicate policies: `returnExisting` returns the original handle and input; `allowReuse` creates a new activity and repoints the key; `allowReuseOnFailure` does so only after failure/dead-letter; `noReuse` rejects an existing key. Named steps, business idempotency and `newOnReplay()` are mutually exclusive. A named step cannot be detached with `asRoot()`.
-
-Ordinary handler errors retry. `NonRetryableError` goes straight to `failed`. Retryable failures that exhaust the budget go to `dead_letter`. The retry base is one second; the first retry waits two seconds, then four, eight, and so on up to the cap, matching the Go contract. Lease expiry consumes the same attempt budget. Parking and replaying a durable wait do not consume an attempt.
-
-## Durable steps, waits and children
+`ctx.run` checkpoints a step's result. On replay, a completed step returns its recorded value instead of running again.
 
 ```ts
 const receipt = await ctx.run("charge", async ({ signal }) => {
@@ -124,37 +103,34 @@ const receipt = await ctx.run("charge", async ({ signal }) => {
     idempotencyKey: `${ctx.activityId}:charge`,
   });
 });
+```
 
+Execution is **at least once**: a crash after an external effect but before its checkpoint commits can repeat that effect, so pass an idempotency key to the external system.
+
+</details>
+
+<details>
+<summary><strong>Durable timers and signals</strong></summary>
+
+Sleep and signal deadlines persist, so a restart resumes the wait. Long waits park and release the worker.
+
+```ts
 await ctx.sleep("cooling-off", 86_400_000);
 
 const decision = await ctx.waitForSignal<{ approved: boolean }>("approval", {
   timeoutMs: 172_800_000,
 });
 
-const child = await ctx.spawn(ShipOrder, { orderId }, runner.step("ship"));
-return ctx.wait(child);
-```
-
-`ctx.spawn()` returns a `ChildActivityHandle<Output>`. Its `result()` takes no arguments and uses durable waiting, just like `ctx.wait(child)`. Passing `{ signal }` is a TypeScript error. Handles returned by `client.execute()` or `client.handle()` retain `result({ signal })` for external callers; using a signal on those handles inside a handler is still rejected at runtime.
-
-Successful steps and permanent step failures are checkpointed. Retryable step failures are not checkpointed. During a transient checkpoint write failure, the SDK retains the callback's returned JSON value and retries persistence without rerunning the callback. Optional `{ parse }` on `ctx.run` validates recorded values on replay; signal waits accept the same parser option.
-
-Execution remains **at least once**. A crash after an external effect but before checkpoint commit can repeat that effect. Use the external system's idempotency support. Code outside checkpoints, including `finally` blocks, runs again on replay. Only the handler replays; arbitrary JavaScript stacks are not persisted.
-
-Long waits park in PostgreSQL and release capacity and leases. Short waits can complete in-process. Sleep and signal deadlines persist from first arrival. Signal timeout `0` or omission waits indefinitely; repeated signals with the same name overwrite the payload. Signals are buffered even before a handler begins. They do not bypass an initial delay or retry backoff.
-
-```ts
+// From anywhere connected to the same queue:
 await client.signal(handle.id, "approval", { approved: true });
-await client.signalByKey(Checkout, "order-123", "approval", { approved: true });
-
-// In another process, connected to the same queue:
-const restored = client.handle(Checkout, handle.id);
-const result = await restored.result({ signal: AbortSignal.timeout(30_000) });
 ```
 
-Key lookup and signal delivery are separate operations: key reuse can repoint the key between them. Delivery targets the resolved activity ID. Rehydrated handles awaited inside a handler must use that worker's storage instance; AsyncLocalStorage ensures they register dependencies and park correctly.
+</details>
 
-Fan-out uses a controlled durable join:
+<details>
+<summary><strong>Child activities and fan-out</strong></summary>
+
+Named children are replay-safe: a retried parent reattaches to them instead of spawning duplicates. `ctx.waitAll` is a durable join.
 
 ```ts
 const children = [];
@@ -166,224 +142,71 @@ for (const item of items) {
 const results = await ctx.waitAll(children);
 ```
 
-Await all SDK operations. Use `ctx.waitAll` for child joins; concurrent durable waits via `Promise.all`/`race` are unsupported and rejected. Do not overlap a durable wait with a checkpointed effect or nest durable orchestration inside `ctx.run`. Ordinary concurrent I/O within a single step is supported.
+</details>
 
-Suspension uses an internal control-flow exception. Broad catches should rethrow it:
+<details>
+<summary><strong>Deduplicated enqueue</strong></summary>
 
-```ts
-import { isControlFlow } from "runnerq";
-try {
-  await ctx.wait(child);
-} catch (error) {
-  if (isControlFlow(error)) throw error;
-  // Handle a business error.
-}
-```
-
-The runtime remembers suspension even if caught and will not incorrectly complete the activity. It cannot stop arbitrary application side effects after a catch or in a finally block.
-
-## Persisted failures
-
-Terminal handler failures and permanent `ctx.run()` failures retain a portable `failure` record containing `name`, `message`, `stack`, string/integer `code`, optional plain-JSON `data`, and nested `cause`. Retry events retain the same diagnostics. Cause capture stops at eight errors and marks cycles or excessive depth explicitly. Non-JSON error data is replaced with an explanatory string; arbitrary custom properties and custom exception prototypes are not persisted.
-
-`handle.result()` throws `ActivityFailedError` with the recorded exception as a `RecordedError` in `cause`. Replayed permanent steps throw `NonRetryableError` with a `RecordedError` cause. These wrappers preserve SDK failure semantics; the recorded cause exposes the original name, stack, code, data, and cause chain without invoking user constructors. This is separate from returning an `Error` as a successful native value.
+A business idempotency key deduplicates submissions atomically within a queue and activity type, so duplicate webhook deliveries collapse to one activity.
 
 ```ts
-import { ActivityFailedError, RecordedError } from "runnerq";
-
-try {
-  await handle.result();
-} catch (error) {
-  if (
-    error instanceof ActivityFailedError &&
-    error.cause instanceof RecordedError
-  ) {
-    reportFailure(error.cause.name, error.cause.code, error.cause.data);
-  }
-  throw error;
-}
-```
-
-Worker-captured diagnostics live in result/checkpoint records and failure events; `lastError` remains a compact message. Lease expiry cannot capture an exception from a process that is no longer running. No additional schema migration is required for these diagnostics.
-
-## Cancellation and lifecycle
-
-`ctx.signal` aborts on execution timeout, claim loss, or exhausted shutdown grace. Pass it to fetch, cancellable database clients and other I/O. Cancellation cannot terminate synchronous JavaScript or force an uncooperative Promise to settle. Such handlers remain tracked; the SDK does not release local execution capacity by merely racing a timeout Promise. CPU-heavy work belongs in isolated worker processes.
-
-`worker.start()` resolves after startup. `worker.stop({ graceMs })` stops intake, drains handlers and acknowledgements, then aborts unfinished work when the grace expires. Its result is `{ drained, remaining }`. Stop is idempotent. Worker instances are single-use. `worker.closed` resolves when stop completes, including a forced stop; it does not promise that cancellation-ignoring user code has stopped. Storage is caller-owned and closed separately.
-
-The library installs no process signal handlers and never calls `process.exit()`. Applications should explicitly handle their own `SIGTERM`/`SIGINT` lifecycle.
-
-## Worker configuration and observation
-
-```ts
-const worker = new Worker({
-  storage,
-  concurrency: 20,
-  activityTypes: [Checkout.name],
-  leaseMs: 60_000,
-  heartbeatMs: 10_000,
-  reaperIntervalMs: 5_000,
-  reaperBatchSize: 100,
-  waitGraceMs: 2_000,
-  shutdownGraceMs: 30_000,
-  maxActivityDepth: 32,
-  retention: {
-    completedMs: 7 * 86_400_000,
-    failedMs: 30 * 86_400_000,
-    intervalMs: 600_000,
-    batchSize: 100,
-  },
-});
-
-worker.on("activityCompleted", (event) => console.log(event.activityId));
-worker.on("activityDeadLetter", (event) => console.error(event));
-worker.on("workerError", (error) => console.error(error));
-worker.on("listenerError", (error) => console.error("Observer failed", error));
-```
-
-By default a worker claims only its registered types. Separate workers with distinct type registrations provide workload isolation. Each claims at most its free capacity. Database pool size is independent of handler concurrency; default query pool size is 10 plus one lazy dedicated LISTEN connection. Notifications are batched after commit and are only hints; periodic queries recover missed notifications and due schedules.
-
-Worker events are local observations, emitted after corresponding commits where applicable. Listener exceptions and rejected Promises are contained. Synchronous expensive listeners still block the event loop. Reaper dead letters appear in persisted event history, not necessarily a local worker callback. Use durable activities for required follow-up work rather than relying on an event listener.
-
-Retention is disabled by default. It deletes complete terminal trees and their inputs, results, checkpoints, events, keys and dependencies atomically. Live consumer trees pin shared producer results. Completion/failure retention clocks are separate; zero keeps that class forever.
-
-### Executor snapshots
-
-A started worker is an executor: `worker.snapshot()` describes it as it is now, and is
-what RunnerQ Cloud shows in Fleet.
-
-```ts
-const worker = new Worker({ storage, labels: { region: "eu-west-1" } });
-const { info, state, counters } = worker.snapshot();
-// info: id, queue, activityTypes, maxConcurrency, startedAt, hostname, sdk, labels
-// state: running (id, type, attempt, startedAt), draining
-// counters since construction: claimed, succeeded, retried, failed, timedOut,
-//   deadLettered, claimsLost, heartbeatFailures, lastClaimLagMs
-```
-
-`worker.id` is random and fixed for the worker's lifetime. `worker.changed()` resolves at
-the next change (an activity starting or finishing, or a drain beginning), so a reporter
-needn't wait for its interval; `reportExecutor()` is that loop, spacing reports by a
-minimum gap. `worker.observe(observer)` (before `start()`) calls `executorStarted(worker)`
-and `executorStopped(id)`; a storage backend that implements both is attached
-automatically, which is how RunnerQ Cloud's storage adapter reports hosted workers.
-
-## RunnerQ Cloud
-
-The conductor agent connects a worker to RunnerQ Cloud. It dials out over a WebSocket (no
-inbound port), describes the worker, and reports it on an interval and within about a
-second of a change.
-
-```ts
-import { startAgent } from "runnerq/conductor";
-
-await worker.start();
-const agent = startAgent(worker, {
-  url: "wss://cloud.runnerq.dev",
-  apiKey: process.env.RUNNERQ_CONDUCTOR_KEY!,
-});
-// ...
-await agent.close(); // before stopping the worker: the Cloud records a clean shutdown
-await worker.stop();
-```
-
-- The worker shows in Fleet as an executor (`worker.id`), with its host, queue, activity
-  types, capacity, labels, what it's running and its counters.
-- `startAgent` returns at once; the agent reconnects with backoff when the connection
-  drops. `signal` stops it like `close()`.
-- `metadataOnly: true` keeps payloads, results, errors and event details from ever
-  leaving the process, whatever the Cloud asks.
-- Requests beyond `maxConcurrentRequests` (16) are refused rather than queued; each is
-  bounded by `requestTimeoutMs` (30s) or the Cloud's deadline.
-
-### Queries and live events
-
-When the worker's storage implements `QueryStorage` (from `runnerq/storage`;
-`PostgresStorage` does), the agent also answers the Cloud's queries about activities,
-steps, events and trees, and streams live events, across every queue in the database.
-Without it, the agent serves only the executor. Payloads and results are shown as plain
-JSON: a SuperJSON `Date`, `Map` or `bigint` appears as its JSON projection (an ISO
-string, entry pairs, a decimal string).
-
-### Commands
-
-The agent is read-only unless you pass `allowControl: true`. Then, when the storage
-implements `CommandStorage` (`PostgresStorage` does), the Cloud can cancel, retry, run
-now, reschedule, reprioritize, delete and signal activities of the worker's queue.
-Commands are idempotent by id (replayed for at least 24 hours) and work in metadata-only
-mode too. A cancelled activity stops at once when it runs on this worker, or at its next
-heartbeat elsewhere: its `ctx.signal` aborts with a `claim_lost` error, and it counts as a
-lost claim, not a failure. The command ledger is the `runnerq_commands` table, which
-`PostgresStorage.initialize()` adds to an existing database.
-
-## Reading state
-
-The PostgreSQL storage has read methods for scripts and tests. They aren't
-part of the `Storage` contract, so a custom backend needn't provide them.
-
-```ts
-const waiting = await storage.list({ rootsOnly: true, status: "waiting" });
-const activity = await storage.getActivity(activityId);
-const input = await storage.getInput(activityId);
-const steps = await storage.steps(activityId);
-const history = await storage.events(activityId);
-```
-
-List responses omit payloads. Inputs, results and steps come back as stored:
-JSON data together with its `serialization` format, not decoded.
-
-## Serialization and compatibility
-
-Activities use native SuperJSON serialization by default. Inputs, outputs, and signals can contain `Date`, `bigint`, `Map`, `Set`, `Buffer`, `RegExp`, `URL`, `Error`, and `undefined`, including shared references and cycles. Native void results remain `undefined`, distinct from `null`. Functions, symbols, unregistered custom classes, and unsafe integer numbers are rejected; use `bigint` for large integers. Event sequence IDs remain strings.
-
-```ts
-const Checkout = activity<{ orderedAt: Date }, { total: bigint }>("Checkout");
-const handle = await client.execute(Checkout, { orderedAt: new Date() });
-const { total } = await handle.result(); // bigint, including after a restart
-
-// Portable contracts for another SDK: use plain JSON values explicitly.
-const ShipOrder = activity<{ orderId: string }, { shippedAt: string }>(
-  "ShipOrder",
-  { serialization: "portable" },
-);
-await client.signal(
-  shippingId,
-  "approval",
-  { approved: true },
-  {
-    serialization: "portable",
-  },
+await client.execute(
+  ProcessEvent,
+  event,
+  runner.idempotencyKey(event.id, "returnExisting"),
 );
 ```
 
-Portable values must be plain JSON: convert dates to ISO strings and big integers to decimal strings yourself. Portable mode rejects nested undefined, cycles, special objects, non-finite numbers and unsafe integers; top-level void becomes JSON null. `client.signal()` defaults to native serialization; `signalByKey()` uses the supplied activity definition's mode. A signal's own recorded format determines how it is decoded.
+</details>
 
-`ctx.run()` always uses native serialization for successful checkpoints, even inside portable activities. It decodes the captured value before returning it on the first execution, just as on replay. Step parsers receive decoded values. Internal deadlines and failure records remain portable protocol data. Go workers must not resume TS-owned native checkpoints; sharing activity boundaries requires both SDKs to implement the same schema and portable format contract.
+<details>
+<summary><strong>A real queue underneath</strong></summary>
 
-Each input and result row records `serialization` separately from user data: `superjson-v1` or `json-v1`. Output serialization follows the persisted input format, so changing a definition's default does not change an already submitted activity. Clients decode using the row's format. Unknown formats fail explicitly. There is no guessing from payload fields or automatic legacy fallback.
+Priorities, retries with exponential backoff, timeouts, delayed starts, a dead-letter state, retention, and per-worker activity types for workload isolation. See [Activities](docs/activities.md) and [Workers](docs/workers.md).
 
-For custom types, register a versioned recipe in every client and worker process before the first native serialization operation:
+</details>
 
-```ts
-import { registerSerialization } from "runnerq";
+<details>
+<summary><strong>Rich types</strong></summary>
 
-class Money {
-  constructor(readonly cents: bigint) {}
-}
-registerSerialization<Money, string>({
-  name: "myapp.Money.v1",
-  isApplicable: (value): value is Money => value instanceof Money,
-  serialize: (value) => value.cents.toString(),
-  deserialize: (value) => new Money(BigInt(value)),
-});
-```
+Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by default, including after a restart. Use `serialization: "portable"` for plain-JSON contracts another SDK can read. See [Serialization](docs/serialization.md).
 
-Recipe output must be portable JSON. Names are unique and the registry locks on first native use. Keep existing recipe names and decoders available for recorded work; changing their meaning breaks replay. RunnerQ uses an isolated SuperJSON instance, so unrelated application registrations do not change the SDK's format. See [serialization storage and upgrades](docs/architecture.md#serialization) before upgrading an existing database.
+</details>
 
-The schema is [runnerq-spec](https://github.com/runnerq/runnerq-spec)'s, shared with the Go SDK: eight tables (activities, inputs, results, idempotency, dependencies, events, worker pools and the command ledger) and their indexes. `PostgresStorage.initialize` creates it or brings an existing database up to date, building large indexes concurrently; `connect` only checks it, accepting a database an older version of this SDK initialized until `initialize` completes it. Checkpoint identity is UUIDv5 of `(activityId, "kind:name")`; business keys use the final `rq:key:v2:` UTF-8 length-prefixed encoding; named children use `rq:step:<root>:<parent>:<name>`. There are no legacy key readers, inline-payload compatibility paths or unfenced fallback backends. `runnerq/storage` exports the required storage contract for custom backends.
+<details>
+<summary><strong>Pluggable storage</strong></summary>
 
-The database column `max_retries` retains its shared protocol name but is exposed as `maxAttempts`. Read [architecture and guarantees](docs/architecture.md) for transaction and recovery details.
+`PostgresStorage` is built in. `runnerq/storage` exports the contract for custom backends, and [`@runnerq/cloud-storage`](https://github.com/runnerq/cloud-storage-ts) runs workers on RunnerQ Cloud hosted storage.
+
+</details>
+
+<details>
+<summary><strong>RunnerQ Cloud</strong></summary>
+
+The conductor agent (`runnerq/conductor`) connects a worker to RunnerQ Cloud, which shows it in Fleet and can query and, if you allow it, control its activities. `metadataOnly: true` keeps payloads and results in your process. See [RunnerQ Cloud](docs/cloud.md).
+
+</details>
+
+## Examples
+
+Each runs against a local PostgreSQL; see [examples/README.md](examples/README.md) to set it up.
+
+| #   | Example                                              | Shows                                                                      |
+| --- | ---------------------------------------------------- | -------------------------------------------------------------------------- |
+| 01  | [hello-workflow](examples/01-hello-workflow/main.ts) | two checkpointed steps, typed results, graceful cleanup                    |
+| 02  | [crash-and-resume](examples/02-crash-and-resume/)    | **kill it after the charge; on restart it resumes without charging again** |
+| 03  | [fan-out](examples/03-fan-out/)                      | children and a durable join with one execution slot                        |
+| 04  | [signals-and-sleep](examples/04-signals-and-sleep/)  | buffered signals, persisted deadlines, a durable timer                     |
+| 05  | [cloud](examples/05-cloud/)                          | a worker connected to RunnerQ Cloud                                        |
+
+## Documentation
+
+- [Activities](docs/activities.md): contracts, options, retries and recorded failures
+- [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
+- [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
+- [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
+- [RunnerQ Cloud](docs/cloud.md): the conductor agent, queries and commands
+- [Architecture and guarantees](docs/architecture.md): transactions, recovery and replay limitations
 
 ## Development
 
@@ -399,3 +222,7 @@ npm pack --dry-run
 Values and rules shared with the Go SDK (key formats, notification channels, error kinds) come from [runnerq-spec](https://github.com/runnerq/runnerq-spec), checked out as the `spec` submodule: run `git submodule update --init` before testing. `test/spec.test.mjs` checks the SDK against its vectors. After bumping the submodule, `npm run spec:gen` (needs Go) regenerates `src/spec.ts`.
 
 Integration tests use fresh queue names and delete only their test queues. Use a dedicated database. Tests cover real PostgreSQL transactions, multiple clients, process termination/restart, notification-independent recovery, checkpoint replay, capacity release, retention dependencies, cancellation and shutdown. Mixed-language execution remains gated on the Go SDK adopting the new schema.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
