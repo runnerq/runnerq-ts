@@ -396,4 +396,6 @@ npm run format:check
 npm pack --dry-run
 ```
 
+Values and rules shared with the Go SDK (key formats, notification channels, error kinds) come from [runnerq-spec](https://github.com/runnerq/runnerq-spec), checked out as the `spec` submodule: run `git submodule update --init` before testing. `test/spec.test.mjs` checks the SDK against its vectors. After bumping the submodule, `npm run spec:gen` (needs Go) regenerates `src/spec.ts`.
+
 Integration tests use fresh queue names and delete only their test queues. Use a dedicated database. Tests cover real PostgreSQL transactions, multiple clients, process termination/restart, notification-independent recovery, checkpoint replay, capacity release, retention dependencies, cancellation and shutdown. Mixed-language execution remains gated on the Go SDK adopting the new schema.

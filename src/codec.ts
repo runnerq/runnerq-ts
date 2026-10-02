@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { RunnerQError } from "./errors.js";
+import { businessKeyPrefix, stepKeyPrefix } from "./spec.js";
 
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -108,9 +109,13 @@ export function businessKey(key: string, type: string): string {
   nonempty(key, "Idempotency key");
   nonempty(type, "Activity name");
   return (
-    "rq:key:v2:" +
+    businessKeyPrefix +
     Buffer.from(`${Buffer.byteLength(key)}:${key}${type}`)
       .toString("base64")
       .replace(/=+$/, "")
   );
+}
+/** The idempotency key of the activity a step spawns under `parent` in `root`'s tree. */
+export function stepKey(root: string, parent: string, step: string): string {
+  return `${stepKeyPrefix}${root}:${parent}:${step}`;
 }

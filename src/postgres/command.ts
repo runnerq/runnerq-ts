@@ -10,6 +10,7 @@ import {
 } from "../codec.js";
 import { databaseError, RunnerQError } from "../errors.js";
 import { pause } from "../async.js";
+import { storageErrorKind } from "../spec.js";
 import { QueryError, type RecordStatus } from "../query.js";
 import type {
   Command,
@@ -43,9 +44,6 @@ const eligibleSQL: Record<CommandKind, string> = {
   delete: `a.status IN ${terminalSQL} AND a.parent_activity_id IS NULL`,
 };
 
-/** Go's StorageErrorKind numbers, as the shared ledger stores them. */
-const errKinds = { conflict: 1, not_found: 2 } as const;
-
 interface LedgerItem {
   id: string;
   outcome: CommandItem["outcome"];
@@ -70,7 +68,7 @@ function toLedger(r: CommandResult): Ledger {
       const l: LedgerItem = { id: it.id, outcome: it.outcome };
       if (it.status) l.status = it.status;
       if (it.error) {
-        l.err_kind = errKinds[it.error.kind];
+        l.err_kind = storageErrorKind[it.error.kind];
         l.err_message = it.error.message;
       }
       return l;
@@ -89,7 +87,10 @@ function fromLedger(l: Ledger): CommandResult {
       if (it.status) item.status = it.status as RecordStatus;
       if (it.err_message)
         item.error = {
-          kind: it.err_kind === errKinds.not_found ? "not_found" : "conflict",
+          kind:
+            it.err_kind === storageErrorKind.not_found
+              ? "not_found"
+              : "conflict",
           message: it.err_message,
         };
       return item;

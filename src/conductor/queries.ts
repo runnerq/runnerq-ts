@@ -2,6 +2,7 @@
 // served from a QueryStorage: a port of runnerq-go's conductor/handlers.go.
 import { isTimestamp, json, parseUuid, type JsonValue } from "../codec.js";
 import { decode, type SerializationFormat } from "../serialization.js";
+import { serializationSuperjson } from "../spec.js";
 import type { Storage } from "../storage.js";
 import type {
   ActivityRecord,
@@ -136,7 +137,7 @@ const quote = (s: string) => JSON.stringify(s);
  * `json` part without its type metadata. A value that won't decode is shown as stored.
  */
 export function plainJson(serialization: string, data: JsonValue): JsonValue {
-  if (serialization !== "superjson-v1") return data;
+  if (serialization !== serializationSuperjson) return data;
   const part =
     data && typeof data === "object" && !Array.isArray(data) && "json" in data
       ? (data.json ?? null)

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ActivityDefinition } from "./activity.js";
-import { businessKey, uuid } from "./codec.js";
+import { businessKey, stepKey, uuid } from "./codec.js";
 import { ActivityFailedError, RunnerQError } from "./errors.js";
 import {
   encode,
@@ -113,7 +113,7 @@ export async function submit<I, O>(
   }
   const rootId = linked ? scope.claim.rootId : id;
   const key = config.step
-    ? `rq:step:${rootId}:${scope!.claim.id}:${config.step}`
+    ? stepKey(rootId, scope!.claim.id, config.step)
     : config.idempotency
       ? businessKey(config.idempotency.key, definition.name)
       : undefined;

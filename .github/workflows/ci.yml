@@ -24,6 +24,8 @@ jobs:
       RUNNERQ_TEST_DSN: postgres://postgres:runnerq@localhost:5432/runnerq_test
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -33,3 +35,14 @@ jobs:
       - run: npm test
         timeout-minutes: 3
       - run: npm pack --dry-run
+  spec:
+    # src/spec.ts is generated from the pinned runnerq-spec submodule.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: spec/go.mod
+      - run: npm run spec:gen && git diff --exit-code
