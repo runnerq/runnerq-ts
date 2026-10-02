@@ -188,6 +188,17 @@ test("capabilities, and a command round trip through the agent", async (t) => {
       resetAttempts: true,
     },
   ]);
+  // Each command decodes as its own request type: another command's field, even at its
+  // zero value, fails the request before anything is applied.
+  const wrong = await g.call("activities.cancel", {
+    command_id: "c-10",
+    target: data.target,
+    reset_attempts: false,
+  });
+  assert.equal(wrong.error.code, "invalid_argument");
+  assert.deepEqual(wrong.error.details, { field: "reset_attempts" });
+  assert.equal(applied.length, 1);
+
   // Key order doesn't change the fingerprint (Go's: sha256 of re-marshalled JSON).
   assert.equal(
     fingerprint({ command_id: "c-1", target: { ids: ["a"] }, reason: "stuck" }),

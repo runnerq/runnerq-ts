@@ -1,9 +1,11 @@
 import http from "node:http";
 import { WebSocketServer } from "ws";
+import { frameViolations } from "./conductor-schema.mjs";
 import { until } from "./helpers.mjs";
 
 export const key = "rqk_test";
-// fakeGateway is RunnerQ Cloud's side of an agent session.
+// fakeGateway is RunnerQ Cloud's side of an agent session. Every frame the agent sends must
+// conform to the conductor schema.
 export async function fakeGateway(
   t,
   { config = {}, rejectN = 0, frame = 4 << 20 } = {},
@@ -17,6 +19,7 @@ export async function fakeGateway(
     replies: new Map(),
     rejected: 0,
     nextId: 0,
+    invalid: [],
   };
   server.on("upgrade", (req, socket, head) => {
     if (
@@ -33,6 +36,21 @@ export async function fakeGateway(
       ws.on("message", (raw) => {
         const env = JSON.parse(raw.toString());
         Object.defineProperty(env, "bytes", { value: raw.length });
+        const bad = frameViolations(env);
+        if (bad) {
+          // Fail where it happens: a reply becomes an error its caller sees, an event is
+          // dropped. Throwing in the after hook instead would skip the agent's close.
+          const what = `${env.kind} ${env.type} breaks the conductor schema: ${bad}`;
+          g.invalid.push(what);
+          console.error(what);
+          if (env.kind === "res")
+            g.replies.get(env.id)?.({
+              ...env,
+              data: undefined,
+              error: { code: "schema_violation", message: what },
+            });
+          return;
+        }
         if (env.type === "hello") {
           g.hellos.push(env.data);
           ws.send(
@@ -85,6 +103,8 @@ export async function fakeGateway(
     for (const s of g.sockets) s.terminate();
     wss.close();
     await new Promise((r) => server.close(r));
+    // A violation no test waited on still fails the file, without skipping later hooks.
+    if (g.invalid.length) process.exitCode = 1;
   });
   return g;
 }

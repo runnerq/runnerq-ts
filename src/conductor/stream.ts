@@ -9,18 +9,17 @@ import { randomUUID } from "node:crypto";
 import { pause } from "../async.js";
 import { parseInt64 } from "../codec.js";
 import type { EventRecord, QueryFilter, QueryStorage } from "../query.js";
-import { decodeRequest, type Spec } from "./decode.js";
-import { filterSpec, toEvent } from "./queries.js";
-import {
-  WireError,
-  describe,
-  frameSlack,
-  typeEventsSubscribe,
-  typeEventsUnsubscribe,
-  typeStreamEvents,
-  typeStreamGap,
-  type Handler,
-} from "./wire.js";
+import { decodeRequest } from "./decode.js";
+import type {
+  Empty,
+  EventsSubscribe,
+  EventsUnsubscribe,
+  StreamGap,
+  Subscription,
+} from "./protocol.js";
+import { toEvent } from "./queries.js";
+import { specs } from "./specs.js";
+import { WireError, describe, frameSlack, type Handler } from "./wire.js";
 
 export const maxSubscriptions = 4;
 const defaultBatch = 200;
@@ -35,7 +34,7 @@ const maxBuffered = 8 << 20;
 /** Where a session's streams write. */
 export interface StreamOutput {
   /** Writes one event frame with `data` (JSON text); false when the connection can't take it. */
-  send(type: string, data: string): boolean;
+  send(type: StreamType, data: string): boolean;
   /** Bytes queued on the socket and not yet written. */
   buffered(): number;
   frameLimit(): number;
@@ -43,17 +42,7 @@ export interface StreamOutput {
   log: Pick<Console, "warn">;
 }
 
-const subscribeSpec: Spec = {
-  object: {
-    filter: filterSpec,
-    after_cursor: "string",
-    max_batch: "int",
-    max_delay_ms: "int",
-  },
-};
-const unsubscribeSpec: Spec = {
-  object: { subscription_id: "string", cursor: "string" },
-};
+type StreamType = "stream.events" | "stream.gap";
 
 /** One session's subscriptions; they end with the session. */
 export class Streams {
@@ -66,9 +55,9 @@ export class Streams {
   ) {}
 
   handler(type: string): Handler | undefined {
-    if (type === typeEventsSubscribe)
+    if (type === "events.subscribe")
       return (d, signal) => this.subscribe(d, signal);
-    if (type === typeEventsUnsubscribe) return (d) => this.unsubscribe(d);
+    if (type === "events.unsubscribe") return (d) => this.unsubscribe(d);
     return undefined;
   }
 
@@ -81,13 +70,8 @@ export class Streams {
   private async subscribe(
     data: unknown,
     request: AbortSignal,
-  ): Promise<unknown> {
-    const req = decodeRequest<{
-      filter?: QueryFilter;
-      after_cursor?: string;
-      max_batch?: number;
-      max_delay_ms?: number;
-    }>(subscribeSpec, data);
+  ): Promise<Subscription> {
+    const req = decodeRequest<EventsSubscribe>(specs.EventsSubscribe, data);
     const filter = req.filter;
     const batch = Math.min(
       req.max_batch && req.max_batch > 0 ? req.max_batch : defaultBatch,
@@ -142,8 +126,11 @@ export class Streams {
         if (gap)
           await t.push(
             stop.signal,
-            typeStreamGap,
-            JSON.stringify({ subscription_id: id, since_cursor: after }),
+            "stream.gap",
+            JSON.stringify({
+              subscription_id: id,
+              since_cursor: after,
+            } satisfies StreamGap),
           );
         await t.run(stop.signal);
       } catch {
@@ -155,11 +142,8 @@ export class Streams {
     return { subscription_id: id, cursor: cursor.toString() };
   }
 
-  private unsubscribe(data: unknown): unknown {
-    const req = decodeRequest<{ subscription_id?: string }>(
-      unsubscribeSpec,
-      data,
-    );
+  private unsubscribe(data: unknown): Empty {
+    const req = decodeRequest<EventsUnsubscribe>(specs.EventsUnsubscribe, data);
     const id = req.subscription_id ?? "";
     const stop = this.subs.get(id);
     this.subs.delete(id);
@@ -262,7 +246,8 @@ export class Tailer {
       for (const id of ids) if (id > cursor) cursor = id;
       await this.push(
         signal,
-        typeStreamEvents,
+        "stream.events",
+        // A StreamEvents, with its items already JSON text.
         `{"subscription_id":${JSON.stringify(this.id)},"items":[${items.join(",")}],"cursor":"${cursor}"}`,
       );
       for (const id of ids) this.sent.add(id);
@@ -296,7 +281,11 @@ export class Tailer {
    * stops before writing; a started write is never cut short, so an unsubscribe mid-push
    * cannot drop the session.
    */
-  async push(signal: AbortSignal, type: string, data: string): Promise<void> {
+  async push(
+    signal: AbortSignal,
+    type: StreamType,
+    data: string,
+  ): Promise<void> {
     while (this.out.buffered() > maxBuffered) await pause(20, signal);
     signal.throwIfAborted();
     if (!this.out.send(type, data))

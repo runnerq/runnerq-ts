@@ -213,7 +213,7 @@ integration(
       await pool.query(
         `UPDATE runnerq_activities SET created_at='2026-01-01T00:00:00.123Z'::timestamptz + $2 * INTERVAL '1 microsecond',
       priority=$3, completed_at=CASE WHEN $2 < 2 THEN now() END WHERE id=$1`,
-        [id, i, i % 2],
+        [id, i, (i % 2) + 1],
       );
     async function all(sort) {
       const out = [];

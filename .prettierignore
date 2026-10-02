@@ -3,3 +3,5 @@ node_modules
 package-lock.json
 spec/
 src/spec-schema.ts
+src/conductor/protocol.ts
+src/conductor/specs.ts
