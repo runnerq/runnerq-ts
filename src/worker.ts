@@ -183,6 +183,7 @@ export class Worker
     if (config.retention) {
       integer(config.retention.completedMs ?? 0, "completedMs");
       integer(config.retention.failedMs ?? 0, "failedMs");
+      integer(config.retention.eventsMs ?? 0, "eventsMs");
       integer(config.retention.intervalMs ?? 600_000, "retention interval", 1);
       integer(config.retention.batchSize ?? 100, "retention batch", 1);
     }

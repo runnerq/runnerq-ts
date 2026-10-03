@@ -32,7 +32,7 @@ export interface Catalog {
 export const postgresMigrations: readonly PostgresMigration[] = [
   {
     "name": "0001_baseline",
-    "sql": "-- Activities table (permanent - no TTL)\nCREATE TABLE IF NOT EXISTS runnerq_activities (\n    id UUID PRIMARY KEY,\n    queue_name TEXT NOT NULL,\n    activity_type TEXT NOT NULL,\n    priority INTEGER NOT NULL DEFAULT 1,\n    status TEXT NOT NULL DEFAULT 'pending',\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    scheduled_at TIMESTAMPTZ,\n    started_at TIMESTAMPTZ,\n    completed_at TIMESTAMPTZ,\n    lease_deadline_ms BIGINT,\n    current_worker_id TEXT,\n    last_worker_id TEXT,\n    retry_count INTEGER NOT NULL DEFAULT 0,\n    max_retries INTEGER NOT NULL DEFAULT 0,\n    timeout_seconds BIGINT NOT NULL DEFAULT 300,\n    retry_delay_seconds BIGINT NOT NULL DEFAULT 60,\n    max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0,\n    last_error TEXT,\n    last_error_at TIMESTAMPTZ,\n    metadata JSONB,\n    idempotency_key TEXT\n);\n\n-- Inputs, apart from the activity rows that claims, leases and status\n-- changes rewrite: an activity's payload is written once and read when it is\n-- claimed or inspected. serialization names the payload's encoding\n-- ('json-v1': plain JSON, the only one Go writes; the TypeScript SDK also\n-- writes 'superjson-v1').\nCREATE TABLE IF NOT EXISTS runnerq_inputs (\n    activity_id UUID PRIMARY KEY,\n    queue_name TEXT NOT NULL,\n    payload JSONB NOT NULL,\n    serialization TEXT NOT NULL DEFAULT 'json-v1'\n);\n\n-- Migration: payloads used to live in runnerq_activities.payload. Move them\n-- into runnerq_inputs and drop the column, in the schema transaction, so a\n-- database is either wholly before or wholly after the move. Processes on\n-- an older version of this SDK can't use the database afterwards: stop them\n-- before starting this one.\nDO $$\nBEGIN\n    IF EXISTS (SELECT 1 FROM information_schema.columns\n               WHERE table_schema = current_schema()\n                 AND table_name = 'runnerq_activities' AND column_name = 'payload') THEN\n        INSERT INTO runnerq_inputs (activity_id, queue_name, payload)\n            SELECT id, queue_name, payload FROM runnerq_activities\n            ON CONFLICT (activity_id) DO NOTHING;\n        ALTER TABLE runnerq_activities DROP COLUMN payload;\n        ALTER TABLE runnerq_activities ALTER COLUMN max_retries SET DEFAULT 0;\n    END IF;\nEND $$;\n\n-- Indexes for efficient queries\n--\n-- NOTE: the hot dequeue indexes (idx_runnerq_dequeue_effective_v2,\n-- idx_runnerq_dequeue_order_v2) and the query indexes are NOT created here:\n-- see concurrent_indexes.json. A plain CREATE INDEX takes a SHARE lock that\n-- blocks all writes on runnerq_activities for the duration of the build; at\n-- boot, on a hot queue, that stalls every enqueue/dequeue/ack in the cluster.\nCREATE INDEX IF NOT EXISTS idx_runnerq_activities_processing\n    ON runnerq_activities(queue_name, lease_deadline_ms)\n    WHERE status = 'processing';\nCREATE INDEX IF NOT EXISTS idx_runnerq_completed_non_cron\n    ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)\n    WHERE status IN ('completed', 'failed')\n      AND (metadata-\u003e\u003e'source') IS DISTINCT FROM 'cron';\nCREATE INDEX IF NOT EXISTS idx_runnerq_completed_cron\n    ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)\n    WHERE status IN ('completed', 'failed')\n      AND metadata-\u003e\u003e'source' = 'cron';\nCREATE INDEX IF NOT EXISTS idx_runnerq_dead_letter\n    ON runnerq_activities(queue_name, completed_at DESC)\n    WHERE status = 'dead_letter';\n\n-- Migration: add column for existing deployments (idempotent, metadata-only on PG 11+).\nALTER TABLE runnerq_activities\n    ADD COLUMN IF NOT EXISTS max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0;\n\n-- Lineage columns for parent/child activity tracking.\nALTER TABLE runnerq_activities\n    ADD COLUMN IF NOT EXISTS parent_activity_id UUID,\n    ADD COLUMN IF NOT EXISTS root_activity_id UUID,\n    ADD COLUMN IF NOT EXISTS depth SMALLINT NOT NULL DEFAULT 0,\n    ADD COLUMN IF NOT EXISTS waiting_result_id UUID;\n\nCREATE INDEX IF NOT EXISTS idx_runnerq_parent_id\n    ON runnerq_activities(parent_activity_id)\n    WHERE parent_activity_id IS NOT NULL;\nCREATE INDEX IF NOT EXISTS idx_runnerq_root_id\n    ON runnerq_activities(root_activity_id)\n    WHERE root_activity_id IS NOT NULL;\n-- Partial index for the workflows-list view (parent IS NULL = roots only),\n-- ordered for the typical \"newest first\" query.\nCREATE INDEX IF NOT EXISTS idx_runnerq_root_only\n    ON runnerq_activities(queue_name, created_at DESC)\n    WHERE parent_activity_id IS NULL;\nCREATE INDEX IF NOT EXISTS idx_runnerq_root_status\n    ON runnerq_activities(queue_name, status)\n    WHERE parent_activity_id IS NULL;\n\n-- Idempotency keys table\nCREATE TABLE IF NOT EXISTS runnerq_idempotency (\n    queue_name TEXT NOT NULL,\n    idempotency_key TEXT NOT NULL,\n    activity_id UUID NOT NULL,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, idempotency_key)\n);\n\n-- Events table (permanent - full history)\nCREATE TABLE IF NOT EXISTS runnerq_events (\n    id BIGSERIAL PRIMARY KEY,\n    activity_id UUID NOT NULL,\n    queue_name TEXT NOT NULL,\n    event_type TEXT NOT NULL,\n    worker_id TEXT,\n    detail JSONB,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\nCREATE INDEX IF NOT EXISTS idx_runnerq_events_activity\n    ON runnerq_events(activity_id, created_at DESC);\n-- Cursor tailing for the live event stream (EventStream reads id \u003e cursor).\nCREATE INDEX IF NOT EXISTS idx_runnerq_events_queue_seq\n    ON runnerq_events(queue_name, id);\n\n-- Results table. Rows live until the retention sweeper deletes their\n-- workflow tree (or forever when retention is not configured).\nCREATE TABLE IF NOT EXISTS runnerq_results (\n    activity_id UUID PRIMARY KEY,\n    queue_name TEXT NOT NULL,\n    state TEXT NOT NULL,\n    data JSONB,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\n-- owner_activity_id ties every result row to the activity whose lifetime\n-- governs it. For normal activity results it equals activity_id; for Run/\n-- Sleep checkpoints (whose activity_id is a synthetic UUIDv5 matching no\n-- activity row) it is the handler's activity — without it, checkpoint rows\n-- could never be garbage-collected. NULL on legacy rows (never swept).\nALTER TABLE runnerq_results\n    ADD COLUMN IF NOT EXISTS owner_activity_id UUID;\nCREATE INDEX IF NOT EXISTS idx_runnerq_results_owner\n    ON runnerq_results(queue_name, owner_activity_id)\n    WHERE owner_activity_id IS NOT NULL;\n\n-- step is the human identity of a checkpoint row, \"kind:name\" (e.g.\n-- \"run:create-transfer\", \"sleep:retry-backoff\") — the same string the checkpoint\n-- ID is derived from, persisted so the console can show a workflow's durable\n-- step history (the checkpoint ID itself is a one-way hash). NULL for an\n-- activity's own final result and for legacy rows. No dedicated index: read only\n-- by owner (already indexed above) on the console path, never on a hot path.\nALTER TABLE runnerq_results\n    ADD COLUMN IF NOT EXISTS step TEXT;\n\n-- serialization names the result data's encoding, as for inputs.\nALTER TABLE runnerq_results\n    ADD COLUMN IF NOT EXISTS serialization TEXT NOT NULL DEFAULT 'json-v1';\n\n-- Retention sweep: find roots that have been terminal longer than the TTL.\nCREATE INDEX IF NOT EXISTS idx_runnerq_root_terminal_age\n    ON runnerq_activities(queue_name, status, completed_at)\n    WHERE parent_activity_id IS NULL\n      AND status IN ('completed', 'failed', 'dead_letter');\n\n-- Worker pools: one row per live engine instance. Heartbeats let us tell\n-- which pools are still alive for cluster-wide capacity reporting.\nCREATE TABLE IF NOT EXISTS runnerq_worker_pools (\n    pool_id        UUID PRIMARY KEY,\n    queue_name     TEXT NOT NULL,\n    max_workers    INTEGER NOT NULL,\n    activity_types TEXT[],\n    started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS idx_runnerq_worker_pools_queue_alive\n    ON runnerq_worker_pools(queue_name, last_seen_at);\n\n-- Command ledger: applied RunnerQ Cloud commands and their results, so a\n-- repeated command_id replays its result instead of applying twice. Rows are\n-- pruned after a week (commands must be replayable for at least 24 hours).\nCREATE TABLE IF NOT EXISTS runnerq_commands (\n    queue_name  TEXT NOT NULL,\n    command_id  TEXT NOT NULL,\n    fingerprint TEXT NOT NULL,\n    kind        TEXT NOT NULL,\n    result      JSONB NOT NULL,\n    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, command_id)\n);\nCREATE INDEX IF NOT EXISTS idx_runnerq_commands_created\n    ON runnerq_commands(created_at);\n\n-- Durable references survive handler replay and are removed with consumer trees.\nCREATE TABLE IF NOT EXISTS runnerq_dependencies (\n queue_name TEXT NOT NULL,\n waiter_activity_id UUID NOT NULL,\n result_id UUID NOT NULL,\n producer_activity_id UUID,\n created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n PRIMARY KEY (queue_name, waiter_activity_id, result_id)\n);\nCREATE INDEX IF NOT EXISTS idx_runnerq_dependencies_result\n ON runnerq_dependencies(queue_name, result_id);\nCREATE INDEX IF NOT EXISTS idx_runnerq_dependencies_producer\n ON runnerq_dependencies(queue_name, producer_activity_id);\n"
+    "sql": "-- Activities table (permanent - no TTL)\nCREATE TABLE IF NOT EXISTS runnerq_activities (\n    id UUID PRIMARY KEY,\n    queue_name TEXT NOT NULL,\n    activity_type TEXT NOT NULL,\n    priority INTEGER NOT NULL DEFAULT 1,\n    status TEXT NOT NULL DEFAULT 'pending',\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    scheduled_at TIMESTAMPTZ,\n    started_at TIMESTAMPTZ,\n    completed_at TIMESTAMPTZ,\n    lease_deadline_ms BIGINT,\n    current_worker_id TEXT,\n    last_worker_id TEXT,\n    retry_count INTEGER NOT NULL DEFAULT 0,\n    max_retries INTEGER NOT NULL DEFAULT 0,\n    timeout_seconds BIGINT NOT NULL DEFAULT 300,\n    retry_delay_seconds BIGINT NOT NULL DEFAULT 60,\n    max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0,\n    last_error TEXT,\n    last_error_at TIMESTAMPTZ,\n    metadata JSONB,\n    idempotency_key TEXT\n);\n\n-- Inputs, apart from the activity rows that claims, leases and status\n-- changes rewrite: an activity's payload is written once and read when it is\n-- claimed or inspected. serialization names the payload's encoding\n-- ('json-v1': plain JSON, the only one Go writes; the TypeScript SDK also\n-- writes 'superjson-v1').\nCREATE TABLE IF NOT EXISTS runnerq_inputs (\n    activity_id UUID PRIMARY KEY,\n    queue_name TEXT NOT NULL,\n    payload JSONB NOT NULL,\n    serialization TEXT NOT NULL DEFAULT 'json-v1'\n);\n\n-- Migration: payloads used to live in runnerq_activities.payload. Move them\n-- into runnerq_inputs and drop the column, in the schema transaction, so a\n-- database is either wholly before or wholly after the move. Processes on\n-- an older version of this SDK can't use the database afterwards: stop them\n-- before starting this one.\nDO $$\nBEGIN\n    IF EXISTS (SELECT 1 FROM information_schema.columns\n               WHERE table_schema = current_schema()\n                 AND table_name = 'runnerq_activities' AND column_name = 'payload') THEN\n        INSERT INTO runnerq_inputs (activity_id, queue_name, payload)\n            SELECT id, queue_name, payload FROM runnerq_activities\n            ON CONFLICT (activity_id) DO NOTHING;\n        ALTER TABLE runnerq_activities DROP COLUMN payload;\n        ALTER TABLE runnerq_activities ALTER COLUMN max_retries SET DEFAULT 0;\n    END IF;\nEND $$;\n\n-- Indexes for efficient queries\n--\n-- NOTE: indexes on runnerq_activities and runnerq_results are NOT created\n-- here: see concurrent_indexes.json. A plain CREATE INDEX takes a SHARE lock\n-- that blocks all writes on the table for the duration of the build; at boot,\n-- on a hot queue, that stalls every enqueue/dequeue/ack in the cluster.\n--\n-- Every index on runnerq_activities is written again by each status change,\n-- so an index must earn its place. Room left on each page lets lease renewals,\n-- which change no indexed column, update in place (HOT).\nALTER TABLE runnerq_activities SET (fillfactor = 85);\n\n-- Migration: add column for existing deployments (idempotent, metadata-only on PG 11+).\nALTER TABLE runnerq_activities\n    ADD COLUMN IF NOT EXISTS max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0;\n\n-- Lineage columns for parent/child activity tracking.\nALTER TABLE runnerq_activities\n    ADD COLUMN IF NOT EXISTS parent_activity_id UUID,\n    ADD COLUMN IF NOT EXISTS root_activity_id UUID,\n    ADD COLUMN IF NOT EXISTS depth SMALLINT NOT NULL DEFAULT 0,\n    ADD COLUMN IF NOT EXISTS waiting_result_id UUID;\n\nCREATE INDEX IF NOT EXISTS idx_runnerq_parent_id\n    ON runnerq_activities(parent_activity_id)\n    WHERE parent_activity_id IS NOT NULL;\n\n-- Idempotency keys table\nCREATE TABLE IF NOT EXISTS runnerq_idempotency (\n    queue_name TEXT NOT NULL,\n    idempotency_key TEXT NOT NULL,\n    activity_id UUID NOT NULL,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, idempotency_key)\n);\n\n-- Events: what the activity row can't say (events.schema.json). Retention\n-- removes them with their tree, or sooner with an events window.\nCREATE TABLE IF NOT EXISTS runnerq_events (\n    id BIGSERIAL PRIMARY KEY,\n    activity_id UUID NOT NULL,\n    queue_name TEXT NOT NULL,\n    event_type TEXT NOT NULL,\n    worker_id TEXT,\n    detail JSONB,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\nCREATE INDEX IF NOT EXISTS idx_runnerq_events_activity\n    ON runnerq_events(activity_id, created_at DESC);\n-- Per-queue log order: the live stream's tail (id \u003e cursor) and the events\n-- retention walk.\nCREATE INDEX IF NOT EXISTS idx_runnerq_events_queue_seq\n    ON runnerq_events(queue_name, id);\n\n-- Results table. Rows live until the retention sweeper deletes their\n-- workflow tree (or forever when retention is not configured).\nCREATE TABLE IF NOT EXISTS runnerq_results (\n    activity_id UUID PRIMARY KEY,\n    queue_name TEXT NOT NULL,\n    state TEXT NOT NULL,\n    data JSONB,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\n-- owner_activity_id ties every result row to the activity whose lifetime\n-- governs it. For normal activity results it equals activity_id; for Run/\n-- Sleep checkpoints (whose activity_id is a synthetic UUIDv5 matching no\n-- activity row) it is the handler's activity — without it, checkpoint rows\n-- could never be garbage-collected. NULL on legacy rows (never swept).\nALTER TABLE runnerq_results\n    ADD COLUMN IF NOT EXISTS owner_activity_id UUID;\n\n-- step is the human identity of a checkpoint row, \"kind:name\" (e.g.\n-- \"run:create-transfer\", \"sleep:retry-backoff\") — the same string the checkpoint\n-- ID is derived from, persisted so the console can show a workflow's durable\n-- step history (the checkpoint ID itself is a one-way hash). NULL for an\n-- activity's own final result and for legacy rows. No dedicated index: read only\n-- by owner (idx_runnerq_results_by_owner) on the console path, never on a hot path.\nALTER TABLE runnerq_results\n    ADD COLUMN IF NOT EXISTS step TEXT;\n\n-- serialization names the result data's encoding, as for inputs.\nALTER TABLE runnerq_results\n    ADD COLUMN IF NOT EXISTS serialization TEXT NOT NULL DEFAULT 'json-v1';\n\n-- Worker pools: one row per live engine instance. Heartbeats let us tell\n-- which pools are still alive for cluster-wide capacity reporting.\nCREATE TABLE IF NOT EXISTS runnerq_worker_pools (\n    pool_id        UUID PRIMARY KEY,\n    queue_name     TEXT NOT NULL,\n    max_workers    INTEGER NOT NULL,\n    activity_types TEXT[],\n    started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS idx_runnerq_worker_pools_queue_alive\n    ON runnerq_worker_pools(queue_name, last_seen_at);\n\n-- Command ledger: applied RunnerQ Cloud commands and their results, so a\n-- repeated command_id replays its result instead of applying twice. Rows are\n-- pruned after a week (commands must be replayable for at least 24 hours).\nCREATE TABLE IF NOT EXISTS runnerq_commands (\n    queue_name  TEXT NOT NULL,\n    command_id  TEXT NOT NULL,\n    fingerprint TEXT NOT NULL,\n    kind        TEXT NOT NULL,\n    result      JSONB NOT NULL,\n    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, command_id)\n);\nCREATE INDEX IF NOT EXISTS idx_runnerq_commands_created\n    ON runnerq_commands(created_at);\n\n-- Durable references survive handler replay and are removed with consumer trees.\nCREATE TABLE IF NOT EXISTS runnerq_dependencies (\n queue_name TEXT NOT NULL,\n waiter_activity_id UUID NOT NULL,\n result_id UUID NOT NULL,\n producer_activity_id UUID,\n created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n PRIMARY KEY (queue_name, waiter_activity_id, result_id)\n);\nCREATE INDEX IF NOT EXISTS idx_runnerq_dependencies_result\n ON runnerq_dependencies(queue_name, result_id);\n"
   }
 ];
 /** Built in order after the migrations. */
@@ -56,16 +56,34 @@ export const postgresConcurrentIndexes: readonly PostgresConcurrentIndex[] = [
     "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_created\nON runnerq_activities (created_at DESC, id DESC)"
   },
   {
-    "name": "idx_runnerq_query_status_created",
+    "name": "idx_runnerq_query_status",
     "table": "runnerq_activities",
-    "replaces": "",
-    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_status_created\nON runnerq_activities (status, created_at DESC, id DESC)"
+    "replaces": "idx_runnerq_query_status_created",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_status\nON runnerq_activities (status, created_at DESC, id DESC)\nWHERE status \u003c\u003e 'completed'"
   },
   {
-    "name": "idx_runnerq_query_type_created",
+    "name": "idx_runnerq_processing",
     "table": "runnerq_activities",
-    "replaces": "",
-    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_type_created\nON runnerq_activities (activity_type, created_at DESC, id DESC)"
+    "replaces": "idx_runnerq_activities_processing",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_processing\nON runnerq_activities (queue_name)\nWHERE status = 'processing'"
+  },
+  {
+    "name": "idx_runnerq_root_children",
+    "table": "runnerq_activities",
+    "replaces": "idx_runnerq_root_id",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_root_children\nON runnerq_activities (root_activity_id)\nWHERE parent_activity_id IS NOT NULL"
+  },
+  {
+    "name": "idx_runnerq_root_terminal",
+    "table": "runnerq_activities",
+    "replaces": "idx_runnerq_root_terminal_age",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_root_terminal\nON runnerq_activities (queue_name, status, completed_at)\nWHERE parent_activity_id IS NULL\n  AND status IN ('completed', 'failed', 'dead_letter', 'cancelled')"
+  },
+  {
+    "name": "idx_runnerq_results_by_owner",
+    "table": "runnerq_results",
+    "replaces": "idx_runnerq_results_owner",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_results_by_owner\nON runnerq_results (owner_activity_id)\nWHERE owner_activity_id IS NOT NULL"
   }
 ];
 /** schema/postgres/catalog.json. */
@@ -539,34 +557,9 @@ export const postgresCatalog: Catalog = {
   ],
   "indexes": [
     {
-      "name": "idx_runnerq_activities_processing",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_activities_processing ON runnerq_activities USING btree (queue_name, lease_deadline_ms) WHERE (status = 'processing'::text)"
-    },
-    {
       "name": "idx_runnerq_commands_created",
       "table": "runnerq_commands",
       "definition": "CREATE INDEX idx_runnerq_commands_created ON runnerq_commands USING btree (created_at)"
-    },
-    {
-      "name": "idx_runnerq_completed_cron",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_completed_cron ON runnerq_activities USING btree (queue_name, completed_at DESC, created_at DESC) WHERE ((status = ANY (ARRAY['completed'::text, 'failed'::text])) AND ((metadata -\u003e\u003e 'source'::text) = 'cron'::text))"
-    },
-    {
-      "name": "idx_runnerq_completed_non_cron",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_completed_non_cron ON runnerq_activities USING btree (queue_name, completed_at DESC, created_at DESC) WHERE ((status = ANY (ARRAY['completed'::text, 'failed'::text])) AND ((metadata -\u003e\u003e 'source'::text) IS DISTINCT FROM 'cron'::text))"
-    },
-    {
-      "name": "idx_runnerq_dead_letter",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_dead_letter ON runnerq_activities USING btree (queue_name, completed_at DESC) WHERE (status = 'dead_letter'::text)"
-    },
-    {
-      "name": "idx_runnerq_dependencies_producer",
-      "table": "runnerq_dependencies",
-      "definition": "CREATE INDEX idx_runnerq_dependencies_producer ON runnerq_dependencies USING btree (queue_name, producer_activity_id)"
     },
     {
       "name": "idx_runnerq_dependencies_result",
@@ -599,44 +592,34 @@ export const postgresCatalog: Catalog = {
       "definition": "CREATE INDEX idx_runnerq_parent_id ON runnerq_activities USING btree (parent_activity_id) WHERE (parent_activity_id IS NOT NULL)"
     },
     {
+      "name": "idx_runnerq_processing",
+      "table": "runnerq_activities",
+      "definition": "CREATE INDEX idx_runnerq_processing ON runnerq_activities USING btree (queue_name) WHERE (status = 'processing'::text)"
+    },
+    {
       "name": "idx_runnerq_query_created",
       "table": "runnerq_activities",
       "definition": "CREATE INDEX idx_runnerq_query_created ON runnerq_activities USING btree (created_at DESC, id DESC)"
     },
     {
-      "name": "idx_runnerq_query_status_created",
+      "name": "idx_runnerq_query_status",
       "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_query_status_created ON runnerq_activities USING btree (status, created_at DESC, id DESC)"
+      "definition": "CREATE INDEX idx_runnerq_query_status ON runnerq_activities USING btree (status, created_at DESC, id DESC) WHERE (status \u003c\u003e 'completed'::text)"
     },
     {
-      "name": "idx_runnerq_query_type_created",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_query_type_created ON runnerq_activities USING btree (activity_type, created_at DESC, id DESC)"
-    },
-    {
-      "name": "idx_runnerq_results_owner",
+      "name": "idx_runnerq_results_by_owner",
       "table": "runnerq_results",
-      "definition": "CREATE INDEX idx_runnerq_results_owner ON runnerq_results USING btree (queue_name, owner_activity_id) WHERE (owner_activity_id IS NOT NULL)"
+      "definition": "CREATE INDEX idx_runnerq_results_by_owner ON runnerq_results USING btree (owner_activity_id) WHERE (owner_activity_id IS NOT NULL)"
     },
     {
-      "name": "idx_runnerq_root_id",
+      "name": "idx_runnerq_root_children",
       "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_root_id ON runnerq_activities USING btree (root_activity_id) WHERE (root_activity_id IS NOT NULL)"
+      "definition": "CREATE INDEX idx_runnerq_root_children ON runnerq_activities USING btree (root_activity_id) WHERE (parent_activity_id IS NOT NULL)"
     },
     {
-      "name": "idx_runnerq_root_only",
+      "name": "idx_runnerq_root_terminal",
       "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_root_only ON runnerq_activities USING btree (queue_name, created_at DESC) WHERE (parent_activity_id IS NULL)"
-    },
-    {
-      "name": "idx_runnerq_root_status",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_root_status ON runnerq_activities USING btree (queue_name, status) WHERE (parent_activity_id IS NULL)"
-    },
-    {
-      "name": "idx_runnerq_root_terminal_age",
-      "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_root_terminal_age ON runnerq_activities USING btree (queue_name, status, completed_at) WHERE ((parent_activity_id IS NULL) AND (status = ANY (ARRAY['completed'::text, 'failed'::text, 'dead_letter'::text])))"
+      "definition": "CREATE INDEX idx_runnerq_root_terminal ON runnerq_activities USING btree (queue_name, status, completed_at) WHERE ((parent_activity_id IS NULL) AND (status = ANY (ARRAY['completed'::text, 'failed'::text, 'dead_letter'::text, 'cancelled'::text])))"
     },
     {
       "name": "idx_runnerq_worker_pools_queue_alive",
@@ -650,7 +633,19 @@ export const postgresCatalog: Catalog = {
     ],
     "indexes": [
       "idx_runnerq_dequeue_effective",
-      "idx_runnerq_dequeue_order"
+      "idx_runnerq_dequeue_order",
+      "idx_runnerq_query_status_created",
+      "idx_runnerq_activities_processing",
+      "idx_runnerq_root_id",
+      "idx_runnerq_root_terminal_age",
+      "idx_runnerq_results_owner",
+      "idx_runnerq_completed_non_cron",
+      "idx_runnerq_completed_cron",
+      "idx_runnerq_dead_letter",
+      "idx_runnerq_root_only",
+      "idx_runnerq_root_status",
+      "idx_runnerq_query_type_created",
+      "idx_runnerq_dependencies_producer"
     ]
   }
 };

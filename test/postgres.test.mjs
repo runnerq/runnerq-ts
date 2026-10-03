@@ -165,10 +165,7 @@ integration(
         code: "checkpoint_conflict",
       },
     );
-    assert.equal(
-      (await storage.events(a.id)).filter((e) => e.type === "Completed").length,
-      1,
-    );
+    assert.deepEqual(await storage.events(a.id), [], "success stores no event");
     const b = submission(),
       bf = await claim(storage, b);
     assert.equal(await storage.fail(bf, "oops", true), "retrying");

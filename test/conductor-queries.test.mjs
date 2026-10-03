@@ -15,7 +15,8 @@ import { dsn, quiet, setup, submission, until } from "./helpers.mjs";
 
 const integration = (name, fn) =>
   test(name, { skip: !dsn, timeout: 60_000 }, fn);
-const created = "activity.created";
+// Submissions store no events; a signal does.
+const signaled = "signal.received";
 
 /** An agent for a worker on `storage`, connected to a fake gateway. */
 async function connect(t, storage, { config, frame, metadataOnly } = {}) {
@@ -61,6 +62,13 @@ async function enqueue(storage, { type = "Echo", payload = {}, parent } = {}) {
   }
   await storage.submit(a);
   return a.id;
+}
+
+/** enqueue, then signal the activity, which stores an event. */
+async function enqueueSignaled(storage, options) {
+  const id = await enqueue(storage, options);
+  await storage.signal(id, "go", { serialization: "json-v1", data: {} });
+  return id;
 }
 
 /** Scopes a filter to the test's queue (queries span every queue). */
@@ -112,8 +120,11 @@ integration("queries are answered from storage", async (t) => {
   ])
     assert.ok(hello.capabilities[type], `capability ${type}`);
 
-  const id = await enqueue(storage, { payload: { n: 1 } });
-  const child = await enqueue(storage, { payload: { n: 2 }, parent: id });
+  const id = await enqueueSignaled(storage, { payload: { n: 1 } });
+  const child = await enqueueSignaled(storage, {
+    payload: { n: 2 },
+    parent: id,
+  });
   for (let i = 0; i < 3; i++) await enqueue(storage, { type: "Other" });
 
   const echo = inQueue(queue, { field: "type", op: "eq", value: "Echo" });
@@ -143,8 +154,8 @@ integration("queries are answered from storage", async (t) => {
   assert.equal(act.max_attempts, undefined, "unlimited attempts");
   assert.equal(act.timeout_ms, 300_000);
   assert.deepEqual(act.payload, { n: 1 });
-  assert.equal(act.events[0].type, created);
-  assert.deepEqual(act.steps, []);
+  assert.equal(act.events[0].type, signaled);
+  assert.equal(act.steps.length, 1, "the signal's result");
   await g.fails("activities.get", { id: randomUUID() }, "not_found");
   await g.fails("activities.get", { id: "not-an-id" }, "not_found");
 
@@ -303,15 +314,6 @@ integration("a running worker's activities, steps and results", async (t) => {
     }),
     { count: 1, exact: true },
   );
-  const started = await g.ok("events.list", {
-    filter: {
-      and: [
-        { field: "activity_id", op: "eq", value: h.id },
-        { field: "type", op: "eq", value: "attempt.started" },
-      ],
-    },
-  });
-  assert.equal(started.items[0].executor_id, worker.id);
 
   release();
   await h.result({ signal: AbortSignal.timeout(10_000) });
@@ -335,6 +337,16 @@ integration("a running worker's activities, steps and results", async (t) => {
     include: ["last_error", "result"],
   });
   assert.equal(failed.status, "failed");
+  // The failed attempt's event names its executor.
+  const ended = await g.ok("events.list", {
+    filter: {
+      and: [
+        { field: "activity_id", op: "eq", value: refused.id },
+        { field: "type", op: "eq", value: "attempt.failed" },
+      ],
+    },
+  });
+  assert.equal(ended.items[0].executor_id, worker.id);
   assert.equal(failed.last_error.message, "card declined");
   assert.equal(failed.last_error.kind, "non_retryable");
   assert.deepEqual(failed.result, {
@@ -440,9 +452,11 @@ for (const [name, options] of [
       filter: queueFilter(queue),
       max_delay_ms: 50,
     });
-    const later = await enqueue(storage, { payload: { secret: "pii" } });
+    const later = await enqueueSignaled(storage, {
+      payload: { secret: "pii" },
+    });
     const { frames } = await collect(g, sub.subscription_id, [
-      `${later}/${created}`,
+      `${later}/${signaled}`,
     ]);
     assert.doesNotMatch(JSON.stringify(frames.map((f) => f.data)), /detail/);
   });
@@ -465,18 +479,21 @@ integration(
   async (t) => {
     const { storage, queue } = await setup(t);
     const { g } = await connect(t, storage);
-    const before = await enqueue(storage); // before the subscription: not streamed
+    const before = await enqueueSignaled(storage); // before the subscription: not streamed
     const sub = await g.ok("events.subscribe", {
       filter: queueFilter(queue),
       max_delay_ms: 50,
     });
     assert.match(sub.subscription_id, /^sub_[0-9a-f-]{36}$/);
     assert.match(sub.cursor, /^\d+$/);
-    const first = await enqueue(storage);
+    const first = await enqueueSignaled(storage);
     const { seen, cursor } = await collect(g, sub.subscription_id, [
-      `${first}/${created}`,
+      `${first}/${signaled}`,
     ]);
-    assert.ok(!seen.has(`${before}/${created}`), "an older event was streamed");
+    assert.ok(
+      !seen.has(`${before}/${signaled}`),
+      "an older event was streamed",
+    );
     assert.deepEqual(
       await g.ok("events.unsubscribe", {
         subscription_id: sub.subscription_id,
@@ -491,7 +508,7 @@ integration(
 
     // Events while nobody is subscribed reach a subscription resuming after the last
     // cursor; nothing already delivered is repeated.
-    const missed = await enqueue(storage);
+    const missed = await enqueueSignaled(storage);
     const again = await g.ok("events.subscribe", {
       filter: queueFilter(queue),
       after_cursor: cursor,
@@ -499,10 +516,10 @@ integration(
     });
     assert.equal(again.cursor, cursor);
     const resumed = await collect(g, again.subscription_id, [
-      `${missed}/${created}`,
+      `${missed}/${signaled}`,
     ]);
     assert.ok(
-      !resumed.seen.has(`${first}/${created}`),
+      !resumed.seen.has(`${first}/${signaled}`),
       "a resumed stream repeated an event before its cursor",
     );
   },
@@ -524,14 +541,14 @@ integration(
       await client.query("BEGIN");
       const late = randomUUID();
       await client.query(
-        `INSERT INTO runnerq_events (activity_id, queue_name, event_type) VALUES ($1, $2, 'Enqueued')`,
+        `INSERT INTO runnerq_events (activity_id, queue_name, event_type) VALUES ($1, $2, 'Signaled')`,
         [late, queue],
       );
-      const after = await enqueue(storage);
-      await collect(g, sub.subscription_id, [`${after}/${created}`]);
+      const after = await enqueueSignaled(storage);
+      await collect(g, sub.subscription_id, [`${after}/${signaled}`]);
       await client.query("COMMIT");
       const { seen } = await collect(g, sub.subscription_id, [
-        `${late}/${created}`,
+        `${late}/${signaled}`,
       ]);
       for (const [k, n] of seen)
         assert.equal(n, 1, `${k} delivered ${n} times`);
@@ -581,21 +598,21 @@ integration("stream gaps, limits and filters", async (t) => {
     "resource_exhausted",
   );
 
-  // Filters apply to the stream: only this queue's "created" events, read from the start
+  // Filters apply to the stream: only this queue's signal events, read from the start
   // of the log.
   await g.ok("events.unsubscribe", { subscription_id: sub.subscription_id });
-  const id = await enqueue(storage);
+  const id = await enqueueSignaled(storage);
   const filtered = await g.ok("events.subscribe", {
     after_cursor: "0",
     max_delay_ms: 50,
-    filter: inQueue(queue, { field: "type", op: "eq", value: created }),
+    filter: inQueue(queue, { field: "type", op: "eq", value: signaled }),
   });
   assert.equal(filtered.cursor, "0");
   const { frames } = await collect(g, filtered.subscription_id, [
-    `${id}/${created}`,
+    `${id}/${signaled}`,
   ]);
   for (const f of frames)
-    for (const ev of f.data.items) assert.equal(ev.type, created);
+    for (const ev of f.data.items) assert.equal(ev.type, signaled);
 });
 
 // A catch-up batch bigger than the Cloud's frame limit goes out as several frames, each
@@ -616,14 +633,14 @@ integration("a stream splits batches to the frame limit", async (t) => {
     want.set(id, size);
     await pool.query(
       `INSERT INTO runnerq_events (activity_id, queue_name, event_type, detail)
-      VALUES ($1, $2, 'Enqueued', jsonb_build_object('blob', repeat('x', $3::int)))`,
+      VALUES ($1, $2, 'Signaled', jsonb_build_object('blob', repeat('x', $3::int)))`,
       [id, queue, size],
     );
   }
   const { frames } = await collect(
     g,
     sub.subscription_id,
-    [...want.keys()].map((id) => `${id}/${created}`),
+    [...want.keys()].map((id) => `${id}/${signaled}`),
   );
   let last = 0n;
   const count = new Map();
@@ -661,7 +678,7 @@ integration(
     for (let i = 0; i < 3; i++)
       await pool.query(
         `INSERT INTO runnerq_events (activity_id, queue_name, event_type, detail)
-      VALUES ($1, $2, 'Enqueued', jsonb_build_object('blob', repeat('x', 1000000)))`,
+      VALUES ($1, $2, 'Signaled', jsonb_build_object('blob', repeat('x', 1000000)))`,
         [randomUUID(), queue],
       );
     await g.until(
@@ -694,9 +711,9 @@ integration(
           max_delay_ms: 50,
         }),
       );
-    const id = await enqueue(storage);
+    const id = await enqueueSignaled(storage);
     for (const s of subs)
-      await collect(g, s.subscription_id, [`${id}/${created}`]);
+      await collect(g, s.subscription_id, [`${id}/${signaled}`]);
     assert.ok(
       !g.events
         .slice(mark)

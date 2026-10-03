@@ -27,6 +27,7 @@ const worker = new Worker({
   retention: {
     completedMs: 7 * 86_400_000,
     failedMs: 30 * 86_400_000,
+    eventsMs: 86_400_000,
     intervalMs: 600_000,
     batchSize: 100,
   },
@@ -42,7 +43,7 @@ By default a worker claims only its registered types. Separate workers with dist
 
 Worker events are local observations, emitted after corresponding commits where applicable. Listener exceptions and rejected Promises are contained. Synchronous expensive listeners still block the event loop. Reaper dead letters appear in persisted event history, not necessarily a local worker callback. Use durable activities for required follow-up work rather than relying on an event listener.
 
-Retention is disabled by default. It deletes complete terminal trees and their inputs, results, checkpoints, events, keys and dependencies atomically. Live consumer trees pin shared producer results. Completion/failure retention clocks are separate; zero keeps that class forever.
+Retention is disabled by default. It deletes complete terminal trees and their inputs, results, checkpoints, events, keys and dependencies atomically. Live consumer trees pin shared producer results. Completion/failure retention clocks are separate; zero keeps that class forever. `eventsMs` trims the events of finished activities sooner than their tree; zero keeps them with the tree.
 
 ### Executor snapshots
 

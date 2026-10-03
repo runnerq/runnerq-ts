@@ -59,6 +59,12 @@ export interface Park {
 export interface Retention {
   completedMs?: number;
   failedMs?: number;
+  /**
+   * How long the events of finished activities are kept, when that should be shorter than
+   * their tree. 0 (the default) keeps them with the tree; events of unfinished activities
+   * are always kept.
+   */
+  eventsMs?: number;
   intervalMs?: number;
   batchSize?: number;
 }
