@@ -60,7 +60,7 @@ const activityFields: Record<string, Field> = {
   queue: { expr: "a.queue_name", kind: "string" },
   status: { expr: "a.status", kind: "status" },
   priority: { expr: "a.priority", kind: "int" },
-  root_id: { expr: "COALESCE(a.root_activity_id, a.id)", kind: "uuid" },
+  root_id: { expr: "a.root_activity_id", kind: "uuid" },
   parent_id: { expr: "a.parent_activity_id", kind: "uuid", nullable: true },
   depth: { expr: "a.depth", kind: "int" },
   idempotency_key: {
@@ -134,18 +134,12 @@ export function canonicalStatus(internal: string): RecordStatus {
 
 /** Internal event names (Go's and TypeScript's are the same) to canonical event types. */
 const canonicalEvents: Record<string, string> = {
-  Enqueued: RecordEvent.created,
-  Scheduled: RecordEvent.scheduled,
-  Dequeued: RecordEvent.attemptStarted,
-  Completed: RecordEvent.attemptSucceeded,
   Failed: RecordEvent.attemptFailed,
   Retrying: RecordEvent.attemptFailed,
   DeadLetter: RecordEvent.deadLetter,
   Requeued: RecordEvent.leaseExpired,
   Yielded: RecordEvent.waitParked,
   Signaled: RecordEvent.signalReceived,
-  LeaseExtended: RecordEvent.leaseExtended,
-  ResultStored: RecordEvent.resultStored,
   SpawnLinked: RecordEvent.childLinked,
   Cancelled: RecordEvent.cancelled,
   Retried: RecordEvent.retried,
@@ -270,7 +264,17 @@ export class SqlBuilder {
         const negate = f.op === "ne" || f.op === "nin";
         // Nothing can match (e.g. an id that is not a UUID).
         if (!vals) return String(negate);
-        const cond = `${fd.expr} = ANY(${this.arg(vals.values, vals.type + "[]")})`;
+        let cond: string;
+        if (fd.kind === "status")
+          // Literals, not a parameter: Postgres proves a partial index's predicate
+          // (idx_runnerq_query_status) only from constants. The values are canonicalStatuses'.
+          cond = `${fd.expr} IN (${(vals.values as string[]).map((v) => `'${v.replaceAll("'", "''")}'`).join(", ")})`;
+        else if (name === "root_id") {
+          // Roots aren't in idx_runnerq_root_children; they're found by id.
+          const p = this.arg(vals.values, "uuid[]");
+          cond = `(a.id = ANY(${p}) OR (a.root_activity_id = ANY(${p}) AND a.parent_activity_id IS NOT NULL))`;
+        } else
+          cond = `${fd.expr} = ANY(${this.arg(vals.values, vals.type + "[]")})`;
         return negate ? `(NOT COALESCE(${cond}, false))` : cond;
       }
       case "lt":
@@ -348,7 +352,7 @@ export class SqlBuilder {
     const vals = convertValues(name, "uuid", raw);
     if (!vals) return "false";
     const p = this.arg(vals.values, "uuid[]");
-    return `e.activity_id IN (SELECT x.id FROM runnerq_activities x WHERE x.id = ANY(${p}) OR x.root_activity_id = ANY(${p}))`;
+    return `e.activity_id IN (SELECT x.id FROM runnerq_activities x WHERE x.id = ANY(${p}) OR (x.root_activity_id = ANY(${p}) AND x.parent_activity_id IS NOT NULL))`;
   }
 }
 
@@ -934,7 +938,7 @@ export class PostgresQueries {
     const { cols, joins } = activitySelect(inc);
     const rows = await this.run(
       `SELECT ${cols} FROM runnerq_activities a${joins}
-      WHERE a.id = $1::uuid OR a.root_activity_id = $1::uuid
+      WHERE a.id = $1::uuid OR (a.root_activity_id = $1::uuid AND a.parent_activity_id IS NOT NULL)
       ORDER BY a.depth, a.created_at, a.id LIMIT ${max + 1}`,
       [root],
     );

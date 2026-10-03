@@ -634,7 +634,8 @@ export class PostgresCommands {
       return skipped(row, "still running: cancel it first");
     const live = await c.query(
       `SELECT EXISTS(SELECT 1 FROM runnerq_activities
-      WHERE queue_name=$1 AND root_activity_id=$2 AND status NOT IN ${terminalSQL}) AS live`,
+      WHERE queue_name=$1 AND root_activity_id=$2 AND parent_activity_id IS NOT NULL
+      AND status NOT IN ${terminalSQL}) AS live`,
       [queue, row.id],
     );
     if (live.rows[0].live)

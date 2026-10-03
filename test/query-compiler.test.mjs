@@ -58,12 +58,11 @@ test("filters compile to parameterised SQL", () => {
   });
   assert.equal(
     sql,
-    "(a.status = ANY($1::text[]) AND a.activity_type = ANY($2::text[]) AND a.created_at >= $3::timestamptz" +
-      " AND (a.metadata->>$4::text) = ANY($5::text[]) AND (NOT a.parent_activity_id IS NOT NULL)" +
-      " AND (a.priority > $6::bigint OR left(a.queue_name, char_length($7::text)) = $7::text))",
+    "(a.status IN ('scheduled', 'retrying', 'processing') AND a.activity_type = ANY($1::text[]) AND a.created_at >= $2::timestamptz" +
+      " AND (a.metadata->>$3::text) = ANY($4::text[]) AND (NOT a.parent_activity_id IS NOT NULL)" +
+      " AND (a.priority > $5::bigint OR left(a.queue_name, char_length($6::text)) = $6::text))",
   );
   assert.deepEqual(args, [
-    ["scheduled", "retrying", "processing"],
     ["charge_card"],
     "2026-09-01T00:00:00Z",
     "tenant",
@@ -232,21 +231,16 @@ test("event filters: canonical types, roots and seq", () => {
   assert.equal(
     sql,
     "(e.event_type = ANY($1::text[]) AND e.activity_id IN (SELECT x.id FROM runnerq_activities x" +
-      " WHERE x.id = ANY($2::uuid[]) OR x.root_activity_id = ANY($2::uuid[])) AND e.id > $3::bigint)",
+      " WHERE x.id = ANY($2::uuid[]) OR (x.root_activity_id = ANY($2::uuid[]) AND x.parent_activity_id IS NOT NULL)) AND e.id > $3::bigint)",
   );
   assert.deepEqual(args, [["Failed", "Retrying", "custom"], [id], "10"]);
 });
 
 test("every event the TypeScript storage writes has a canonical type", () => {
   const written = [
-    "Enqueued",
-    "Scheduled",
-    "Dequeued",
-    "Completed",
     "Retrying",
     "DeadLetter",
     "Failed",
-    "ResultStored",
     "Yielded",
     "Signaled",
     "SpawnLinked",
@@ -264,8 +258,6 @@ test("every event the TypeScript storage writes has a canonical type", () => {
     assert.ok(!canonical.startsWith("other."), `${name} has no canonical type`);
     assert.ok(internalEvents(canonical).includes(name));
   }
-  assert.equal(canonicalEvent("Enqueued"), "activity.created");
-  assert.equal(canonicalEvent("Dequeued"), "attempt.started");
   assert.equal(canonicalEvent("Requeued"), "attempt.lease_expired");
   assert.equal(canonicalEvent("Brand New"), "other.brand new");
   assert.equal(canonicalEvent("constructor"), "other.constructor");

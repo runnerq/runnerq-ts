@@ -112,6 +112,7 @@ const ops = {
       count: await storage.cleanup({
         completedMs: (a.completed_s ?? 0) * 1000,
         failedMs: (a.failed_s ?? 0) * 1000,
+        eventsMs: (a.events_s ?? 0) * 1000,
         batchSize: a.batch ?? 1,
       }),
     };

@@ -96,14 +96,21 @@ integration(
   async (t) => {
     const { connectionString, pool } = await freshSchema(t);
     await PostgresStorage.initialize({ connectionString });
-    // What older versions of this SDK created: no ledger, no query indexes.
+    // What older versions of this SDK created: no ledger, none of the newer indexes, and
+    // an index since retired.
     await pool.query("DROP TABLE runnerq_commands");
     for (const name of [
       "idx_runnerq_query_created",
-      "idx_runnerq_query_status_created",
-      "idx_runnerq_query_type_created",
+      "idx_runnerq_query_status",
+      "idx_runnerq_processing",
+      "idx_runnerq_root_children",
+      "idx_runnerq_root_terminal",
+      "idx_runnerq_results_by_owner",
     ])
       await pool.query(`DROP INDEX ${name}`);
+    await pool.query(
+      "CREATE INDEX idx_runnerq_root_status ON runnerq_activities(queue_name, status) WHERE parent_activity_id IS NULL",
+    );
     const storage = await PostgresStorage.connect({
       connectionString,
       queue: "older",

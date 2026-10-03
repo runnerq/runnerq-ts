@@ -62,6 +62,9 @@ export type RecordStatus =
 /**
  * Canonical event types. Backends map their internal event names onto these; events with
  * no canonical equivalent keep a namespaced name of their own ("other.<name>").
+ *
+ * `created`, `scheduled`, `attemptStarted` and `attemptSucceeded` are never stored: an
+ * activity's createdAt, scheduledAt, startedAt and completedAt say them.
  */
 export const RecordEvent = {
   created: "activity.created",
@@ -72,10 +75,8 @@ export const RecordEvent = {
   attemptFailed: "attempt.failed",
   attemptTimedOut: "attempt.timed_out",
   leaseExpired: "attempt.lease_expired",
-  leaseExtended: "attempt.lease_extended",
   waitParked: "wait.parked",
   signalReceived: "signal.received",
-  resultStored: "result.stored",
   childLinked: "child.linked",
   deadLetter: "dead_letter.entered",
   redriven: "dead_letter.redriven",

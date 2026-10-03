@@ -54,7 +54,13 @@ import type {
 } from "../query.js";
 import { Notifications } from "./notifications.js";
 import { PostgresCommands } from "./command.js";
-import { deleteTree, lockTree, terminalSQL } from "./trees.js";
+import {
+  deleteTree,
+  expiredRootSQL,
+  lockExpiredRootSQL,
+  lockTree,
+  trimEventsSQL,
+} from "./trees.js";
 import { attemptsRemain, retryDelaySeconds } from "../retry.js";
 
 export interface PostgresConfig {
@@ -69,6 +75,9 @@ const lost = () =>
   new RunnerQError("claim_lost", "Execution no longer owns this activity");
 const iso = (v: Date | string | null): string | null =>
   v === null ? null : new Date(v).toISOString();
+/** The started_at an event ending an attempt records. Every claim sets it. */
+const attemptStart = (v: Date | null): string =>
+  (v ?? new Date(0)).toISOString();
 function poolConfig(config: Omit<PostgresConfig, "queue">): PoolConfig {
   return {
     connectionString: config.connectionString,
@@ -99,8 +108,11 @@ const addedSince = {
   indexes: [
     "idx_runnerq_commands_created",
     "idx_runnerq_query_created",
-    "idx_runnerq_query_status_created",
-    "idx_runnerq_query_type_created",
+    "idx_runnerq_query_status",
+    "idx_runnerq_processing",
+    "idx_runnerq_root_children",
+    "idx_runnerq_root_terminal",
+    "idx_runnerq_results_by_owner",
   ],
 };
 /**
@@ -170,7 +182,7 @@ async function verifySchema(
   if (retired && !allowOlder)
     throw new RunnerQError(
       "configuration",
-      `Index ${retired.relname} is replaced in this schema version; ${initializeHint}`,
+      `Index ${retired.relname} is retired in this schema version; ${initializeHint}`,
     );
   const keys = await client.query(
     `SELECT c.relname,array_agg(a.attname::text ORDER BY k.ordinality) AS columns FROM pg_constraint p
@@ -208,7 +220,7 @@ async function retryDeadlock(op: () => Promise<unknown>): Promise<void> {
 /**
  * Builds the spec's concurrent indexes one statement at a time (CONCURRENTLY can't run in a
  * transaction): an invalid leftover is dropped and rebuilt, and a replaced index is dropped only
- * once its successor is valid.
+ * once its successor is valid. Then drops the retired indexes.
  */
 async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
   const schemaName: string = (
@@ -230,6 +242,11 @@ async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
       if (idx.replaces)
         await client.query(`DROP INDEX IF EXISTS ${ident(idx.replaces)}`);
     });
+  // Retired indexes go once their successors are built.
+  for (const name of catalog.retired.indexes)
+    await retryDeadlock(() =>
+      client.query(`DROP INDEX IF EXISTS ${ident(name)}`),
+    );
 }
 
 export class PostgresStorage
@@ -512,17 +529,14 @@ export class PostgresStorage
       const o = a.options;
       const priority =
         ["low", "normal", "high", "critical"].indexOf(o.priority) + 1;
-      // One statement for the activity, its input, the parent link and the event.
+      // One statement for the activity, its input and the parent link.
       await c.query(
         `WITH activity AS (INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
         timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)
-        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)
-        RETURNING scheduled_at),
-        input AS (INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$15::jsonb,$16)),
+        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)),
         link AS (INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
         SELECT $2,$12,$1,$1 WHERE $12::uuid IS NOT NULL ON CONFLICT DO NOTHING)
-        INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail) SELECT $2,$1,$17,NULL,
-        jsonb_strip_nulls(jsonb_build_object('activity_type',$3::text,'priority',$4::int,'scheduled_at',scheduled_at)) FROM activity`,
+        INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$15::jsonb,$16)`,
         [
           a.id,
           this.queue,
@@ -540,7 +554,6 @@ export class PostgresStorage
           a.depth,
           JSON.stringify(a.payload),
           a.serialization,
-          o.delayMs > 0 ? "Scheduled" : "Enqueued",
         ],
       );
       return a.id;
@@ -568,8 +581,8 @@ export class PostgresStorage
         types.length === 1
           ? "activity_type=$5"
           : "activity_type=ANY($5::text[])";
-      // One statement claims, logs Dequeued and reads the inputs (one round trip for the
-      // batch); the order is the claim order, which UPDATE RETURNING alone doesn't keep.
+      // One statement claims and reads the inputs (one round trip for the batch); the
+      // order is the claim order, which UPDATE RETURNING alone doesn't keep.
       const r = await c.query(
         `WITH picked AS (SELECT id FROM runnerq_activities
         WHERE queue_name=$1 AND status IN ('pending','scheduled','retrying','waiting')
@@ -579,10 +592,7 @@ export class PostgresStorage
         claimed AS (UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
         started_at=NOW(),waiting_result_id=NULL,
         lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
-        FROM picked WHERE a.id=picked.id RETURNING a.*),
-        dequeued AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
-        SELECT $1,id,'Dequeued',current_worker_id,jsonb_build_object('activity_type',activity_type,'lease_deadline_ms',lease_deadline_ms) FROM claimed
-        ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC)
+        FROM picked WHERE a.id=picked.id RETURNING a.*)
         SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
         c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,
         i.activity_id AS input_id,i.payload,i.serialization
@@ -661,9 +671,7 @@ export class PostgresStorage
         stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
         SELECT id,$1,'Ok',$4::jsonb,id,NULL,$5 FROM done
         ON CONFLICT(activity_id) DO UPDATE SET data=excluded.data,state=excluded.state,serialization=excluded.serialization,created_at=NOW(),step=excluded.step
-        WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id),
-        logged AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
-        SELECT $1,id,'Completed',$3,'{"result_stored":true}'::jsonb FROM done)
+        WHERE runnerq_results.queue_name=excluded.queue_name AND runnerq_results.owner_activity_id=excluded.owner_activity_id)
         SELECT id FROM done`,
         [this.queue, f.ownerId, f.token, data, value.serialization],
       );
@@ -762,7 +770,11 @@ export class PostgresStorage
           delay,
           result,
           again ? "Retrying" : retry ? "DeadLetter" : "Failed",
-          JSON.stringify({ error: reason, ...(failure ? { failure } : {}) }),
+          JSON.stringify({
+            started_at: attemptStart(a.started_at),
+            error: reason,
+            ...(failure ? { failure } : {}),
+          }),
         ],
       );
       if (!again) await this.wake(c, f.ownerId);
@@ -778,16 +790,14 @@ export class PostgresStorage
     step: string,
   ): Promise<void> {
     await this.tx(async (c) => {
-      // The fence, the result and (only when the result is new) its ResultStored event:
-      // one statement. The fence's row lock is taken first, as a statement of its own would.
+      // The fence and the result in one statement. The fence's row lock is taken first, as a
+      // statement of its own would.
       const r = await c.query(
         `WITH fenced AS (SELECT id FROM runnerq_activities
         WHERE queue_name=$2 AND id=$5 AND status='processing' AND current_worker_id=$8 FOR UPDATE),
         stored AS (INSERT INTO runnerq_results(activity_id,queue_name,state,data,owner_activity_id,step,serialization)
         SELECT $1::uuid,$2,$3,$4::jsonb,$5::uuid,NULLIF($6,''),$7 WHERE EXISTS(SELECT 1 FROM fenced)
-        ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id),
-        logged AS (INSERT INTO runnerq_events(queue_name,activity_id,event_type,worker_id,detail)
-        SELECT $2,activity_id,'ResultStored',$8,$9::jsonb FROM stored)
+        ON CONFLICT(activity_id) DO NOTHING RETURNING activity_id)
         SELECT EXISTS(SELECT 1 FROM fenced) AS fenced,EXISTS(SELECT 1 FROM stored) AS stored`,
         [
           id,
@@ -798,7 +808,6 @@ export class PostgresStorage
           step,
           result.serialization,
           f.token,
-          JSON.stringify({ state: result.state }),
         ],
       );
       if (!r.rows[0].fenced) throw lost();
@@ -984,15 +993,18 @@ export class PostgresStorage
   }
   async reap(limit: number): Promise<number> {
     const ids = await this.tx(async (c) => {
+      // The expired attempt's worker and start come from the locked rows, before the update
+      // clears them, for the events.
       const rows = await c.query(
-        `UPDATE runnerq_activities SET retry_count=retry_count+CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN 0 ELSE 1 END,
-        status=CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN 'dead_letter' ELSE 'pending' END,
-        completed_at=CASE WHEN max_retries>0 AND retry_count+1>=max_retries THEN NOW() ELSE NULL END,
+        `UPDATE runnerq_activities a SET retry_count=a.retry_count+CASE WHEN a.max_retries>0 AND a.retry_count+1>=a.max_retries THEN 0 ELSE 1 END,
+        status=CASE WHEN a.max_retries>0 AND a.retry_count+1>=a.max_retries THEN 'dead_letter' ELSE 'pending' END,
+        completed_at=CASE WHEN a.max_retries>0 AND a.retry_count+1>=a.max_retries THEN NOW() ELSE NULL END,
         last_error='lease expired before completion; worker presumed crashed or wedged',last_error_at=NOW(),
-        last_worker_id=current_worker_id,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL,waiting_result_id=NULL
-        WHERE id IN (SELECT id FROM runnerq_activities WHERE queue_name=$1 AND status='processing'
-          AND lease_deadline_ms<(EXTRACT(EPOCH FROM NOW())*1000)::bigint LIMIT $2 FOR UPDATE SKIP LOCKED)
-        RETURNING id,status,last_error,retry_count`,
+        last_worker_id=a.current_worker_id,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL,waiting_result_id=NULL
+        FROM (SELECT id,current_worker_id,started_at FROM runnerq_activities WHERE queue_name=$1 AND status='processing'
+          AND lease_deadline_ms<(EXTRACT(EPOCH FROM NOW())*1000)::bigint LIMIT $2 FOR UPDATE SKIP LOCKED) expired
+        WHERE a.id=expired.id
+        RETURNING a.id,a.status,a.last_error,a.retry_count,expired.current_worker_id AS worker,expired.started_at AS attempt_started`,
         [this.queue, integer(limit, "reaper limit", 1)],
       );
       for (const a of rows.rows) {
@@ -1016,10 +1028,15 @@ export class PostgresStorage
           c,
           a.id,
           a.status === "dead_letter" ? "DeadLetter" : "Requeued",
-          null,
+          a.worker,
           a.status === "dead_letter"
-            ? { reason: "lease_expired", error: a.last_error }
+            ? {
+                started_at: attemptStart(a.attempt_started),
+                reason: "lease_expired",
+                error: a.last_error,
+              }
             : {
+                started_at: attemptStart(a.attempt_started),
                 reason: "lease_expired",
                 error: a.last_error,
                 retry_count: a.retry_count,
@@ -1034,9 +1051,10 @@ export class PostgresStorage
   }
   async cleanup(policy: Retention): Promise<number> {
     const completed = integer(policy.completedMs ?? 0, "completedMs"),
-      failed = integer(policy.failedMs ?? 0, "failedMs");
+      failed = integer(policy.failedMs ?? 0, "failedMs"),
+      events = integer(policy.eventsMs ?? 0, "eventsMs");
     const batch = integer(policy.batchSize ?? 100, "batchSize", 1);
-    if (!completed && !failed) return 0;
+    if (!completed && !failed && !events) return 0;
     return this.tx(async (c) => {
       if (
         !(
@@ -1056,18 +1074,28 @@ export class PostgresStorage
         examined++
       ) {
         await c.query("SAVEPOINT candidate");
-        const r = await c.query(
-          `SELECT r.id FROM runnerq_activities r WHERE r.queue_name=$1 AND r.parent_activity_id IS NULL
-          AND r.id<>ALL($4::uuid[]) AND ((r.status='completed' AND $2::bigint>0 AND r.completed_at<NOW()-$2*INTERVAL '1 millisecond')
-          OR (r.status IN ('failed','dead_letter','cancelled') AND $3::bigint>0 AND r.completed_at<NOW()-$3*INTERVAL '1 millisecond'))
-          AND NOT EXISTS(SELECT 1 FROM runnerq_activities a WHERE a.queue_name=$1 AND a.root_activity_id=r.id AND a.status NOT IN ${terminalSQL})
-          ORDER BY r.completed_at LIMIT 1 FOR UPDATE SKIP LOCKED`,
-          [this.queue, completed, failed, skipped],
-        );
+        const r = await c.query(expiredRootSQL, [
+          this.queue,
+          completed,
+          failed,
+          skipped,
+        ]);
         const root = r.rows[0]?.id;
         if (!root) {
           await c.query("RELEASE SAVEPOINT candidate");
           break;
+        }
+        // The candidate was read unlocked: lock it, and recheck it, now.
+        const locked = await c.query(lockExpiredRootSQL, [
+          this.queue,
+          completed,
+          failed,
+          root,
+        ]);
+        if (!locked.rows[0].locked) {
+          skipped.push(root);
+          await c.query("RELEASE SAVEPOINT candidate");
+          continue;
         }
         if (await lockTree(c, this.queue, root)) {
           skipped.push(root);
@@ -1079,6 +1107,8 @@ export class PostgresStorage
         await c.query("RELEASE SAVEPOINT candidate");
         removed++;
       }
+      if (events)
+        await c.query(trimEventsSQL, [this.queue, events, batch * 10]);
       return removed;
     });
   }
@@ -1116,13 +1146,19 @@ export class PostgresStorage
     for (const [column, value] of [
       ["status", options.status],
       ["parent_activity_id", options.parentId],
-      ["root_activity_id", options.rootId],
       ["metadata->>'source'", options.source],
     ]) {
       if (value !== undefined) {
         values.push(value);
         predicates.push(`${column}=$${values.length}`);
       }
+    }
+    if (options.rootId !== undefined) {
+      values.push(options.rootId);
+      const p = `$${values.length}`;
+      predicates.push(
+        `(id=${p} OR (root_activity_id=${p} AND parent_activity_id IS NOT NULL))`,
+      );
     }
     values.push(
       integer(options.limit ?? 50, "limit", 1, 1000),
