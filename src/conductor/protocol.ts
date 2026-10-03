@@ -144,6 +144,12 @@ export interface SessionConfig {
   data_mode?: DataMode;
   /** How often to send executor.report. */
   report_interval_ms?: number;
+  /**
+   * Send activity.notices. The gateway turns it on while someone is watching
+   * the app and off when no one is. Absent in a welcome is off; absent in a
+   * config.update is unchanged.
+   */
+  notices?: boolean;
 }
 
 /** The gateway's answer to hello. */
@@ -762,6 +768,43 @@ export interface StreamGap {
   since_cursor: string;
 }
 
+/**
+ * A lifecycle change no event is stored for: the activity's own times say it.
+ */
+export type NoticeType = "activity.created" | "activity.scheduled" | "attempt.started" | "attempt.succeeded";
+
+/** Every NoticeType. */
+export const noticeTypeValues = ["activity.created", "activity.scheduled", "attempt.started", "attempt.succeeded"] as const;
+
+/**
+ * A lifecycle change an executor made, announced live. Never stored and never
+ * resent: it has no cursor, and a consumer that missed it reads the activity
+ * instead.
+ */
+export interface Notice {
+  activity_id: string;
+  type: NoticeType;
+  at: string;
+  queue: string;
+  activity_type: string;
+  /** The activity's workflow root; the activity's own id for a root. */
+  root_id: string;
+  /** For attempt.started and attempt.succeeded. */
+  attempt?: number;
+  /** The executor that made the change, when it was one. */
+  executor_id?: string;
+}
+
+/** A batch of notices, oldest first. */
+export interface ActivityNotices {
+  items: Notice[];
+  /**
+   * Notices this agent discarded since its last batch, when it produced them
+   * faster than it could send.
+   */
+  dropped?: number;
+}
+
 /** Each message's kind, sender, data and (for requests) response. */
 export interface Messages {
   "hello": {
@@ -900,6 +943,12 @@ export interface Messages {
     kind: "evt";
     from: "agent";
     data: ExecutorState;
+    response: never;
+  };
+  "activity.notices": {
+    kind: "evt";
+    from: "agent";
+    data: ActivityNotices;
     response: never;
   };
   "config.update": {
