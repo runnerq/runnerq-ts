@@ -59,7 +59,9 @@ export type SpecName =
   | "Subscription"
   | "EventsUnsubscribe"
   | "StreamEvents"
-  | "StreamGap";
+  | "StreamGap"
+  | "Notice"
+  | "ActivityNotices";
 
 /** A decode spec per object definition. */
 export const specs: Record<SpecName, Spec> = {
@@ -72,7 +74,7 @@ export const specs: Record<SpecName, Spec> = {
   Limits: { object: { max_frame_bytes: "int", max_concurrent_requests: "int" } },
   Hello: { object: { protocol_versions: { array: "int" }, sdk: () => specs.SDKInfo, executor: () => specs.ExecutorInfo, capabilities: "any", limits: () => specs.Limits } },
   AppRef: { object: { id: "string", name: "string" } },
-  SessionConfig: { object: { data_mode: "string", report_interval_ms: "int" } },
+  SessionConfig: { object: { data_mode: "string", report_interval_ms: "int", notices: "bool" } },
   Welcome: { object: { version: "int", session_id: "string", app: () => specs.AppRef, config: () => specs.SessionConfig, limits: () => specs.Limits } },
   Goodbye: { object: { reason: "string" } },
   Filter: { object: { and: { array: () => specs.Filter }, or: { array: () => specs.Filter }, not: () => specs.Filter, field: "string", op: "string", value: "any" } },
@@ -119,4 +121,6 @@ export const specs: Record<SpecName, Spec> = {
   EventsUnsubscribe: { object: { subscription_id: "string" } },
   StreamEvents: { object: { subscription_id: "string", items: { array: () => specs.Event }, cursor: "string" } },
   StreamGap: { object: { subscription_id: "string", since_cursor: "string" } },
+  Notice: { object: { activity_id: "string", type: "string", at: "string", queue: "string", activity_type: "string", root_id: "string", attempt: "int", executor_id: "string" } },
+  ActivityNotices: { object: { items: { array: () => specs.Notice }, dropped: "int" } },
 };

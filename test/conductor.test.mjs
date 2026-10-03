@@ -46,7 +46,10 @@ test("the agent introduces the worker and reports it", async (t) => {
   assert.equal(hello.executor.max_concurrency, 3);
   assert.ok(hello.executor.started_at.endsWith("Z"));
   assert.deepEqual(hello.executor.labels, { region: "eu", deploy: "v7" });
-  assert.deepEqual(Object.keys(hello.capabilities), ["executor.describe"]);
+  assert.deepEqual(Object.keys(hello.capabilities), [
+    "executor.describe",
+    "activity.notices",
+  ]);
   assert.equal(hello.limits.max_frame_bytes, 4 << 20);
   await g.until(
     () => agent.connected && agent.sessionId === "sess-1",

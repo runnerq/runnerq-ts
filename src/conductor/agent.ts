@@ -1,12 +1,13 @@
 import { RunnerQError } from "../errors.js";
 import { linkSignal, pause } from "../async.js";
 import { reportExecutor } from "../executor.js";
-import { interruptActivity, type Worker } from "../worker.js";
+import { announceTo, interruptActivity, type Worker } from "../worker.js";
 import { isCommandStorage } from "../storage.js";
 import { Commands } from "./commands.js";
 import { isQueryStorage, QueryError, type QueryStorage } from "../query.js";
 import { Queries } from "./queries.js";
 import { Streams } from "./stream.js";
+import { Notices } from "./notices.js";
 import {
   conductorVersion,
   type Capability,
@@ -89,6 +90,9 @@ export class Agent {
   private reportEveryMs = defaultReportIntervalMs;
   private cloudMetadataOnly = false;
   private peerFrameLimit = maxMessageBytes;
+  /** The session's notices and whether the Cloud wants them (config.notices). */
+  private notices?: Notices;
+  private wantNotices = false;
   private inFlight = 0;
   private readonly closeOnAbort = () => void this.close();
   /** The worker's storage, when queryable; queries and streams read it. */
@@ -112,6 +116,7 @@ export class Agent {
     this.handle("executor.describe", { v: 1 }, () =>
       stateOf(this.worker.snapshot(), this.started, true),
     );
+    this.caps["activity.notices"] = { v: 1 };
     const storage = worker.storage;
     if (isQueryStorage(storage)) {
       this.qs = storage;
@@ -264,6 +269,35 @@ export class Agent {
               metadataOnly: () => this.metadataOnly,
               log: this.log,
             });
+          const { info } = this.worker.snapshot();
+          const notices = new Notices(info.queue, info.id);
+          this.notices = notices;
+          this.syncNotices();
+          notices.start(
+            {
+              send: (data) =>
+                this.send(
+                  ws,
+                  {
+                    v: conductorVersion,
+                    kind: "evt",
+                    type: "activity.notices",
+                  },
+                  data,
+                ),
+              frameLimit: () => this.peerFrameLimit,
+            },
+            session.signal,
+          );
+          session.signal.addEventListener(
+            "abort",
+            () => {
+              if (this.notices !== notices) return;
+              this.notices = undefined;
+              this.syncNotices();
+            },
+            { once: true },
+          );
           void reportExecutor({
             signal: session.signal,
             source: this.worker,
@@ -319,6 +353,8 @@ export class Agent {
     const frame = welcome.limits?.max_frame_bytes ?? 0;
     this.peerFrameLimit =
       frame > 0 ? Math.min(frame, maxMessageBytes) : maxMessageBytes;
+    // A welcome without notices means off, unlike a config.update.
+    this.wantNotices = false;
     this.applyConfig(welcome.config);
     this.session = welcome.session_id;
   }
@@ -328,6 +364,17 @@ export class Agent {
       this.cloudMetadataOnly = config.data_mode === "metadata_only";
     if (config?.report_interval_ms && config.report_interval_ms > 0)
       this.reportEveryMs = Math.max(config.report_interval_ms, 1_000);
+    if (config?.notices !== undefined) {
+      this.wantNotices = config.notices;
+      this.syncNotices();
+    }
+  }
+
+  /** Points the worker's announcements at the session's notices while the Cloud wants them. */
+  private syncNotices(): void {
+    this.worker[announceTo](
+      this.wantNotices ? this.notices?.announce : undefined,
+    );
   }
 
   private dispatch(

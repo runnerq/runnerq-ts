@@ -22,6 +22,22 @@ import {
 
 /** Internal: the agent's handle on `Worker`'s interrupt (not exported from the package). */
 export const interruptActivity = Symbol("runnerq.interruptActivity");
+/** Internal: the agent's handle on `Worker`'s lifecycle announcements. */
+export const announceTo = Symbol("runnerq.announceTo");
+
+/** Internal: a lifecycle change no event is stored for, as this worker made it. */
+export interface Change {
+  type:
+    | "activity.created"
+    | "activity.scheduled"
+    | "attempt.started"
+    | "attempt.succeeded";
+  activityId: string;
+  activityType: string;
+  rootId: string;
+  attempt?: number;
+  at: Date;
+}
 
 export interface StopSummary {
   drained: boolean;
@@ -135,6 +151,7 @@ export class Worker
   private startedAt?: Date;
   private servedTypes?: string[];
   private readonly hostname = thisHostname();
+  private announcer?: (change: Change) => void;
   constructor(config: WorkerConfig) {
     super({ captureRejections: true });
     this.config = {
@@ -426,6 +443,7 @@ export class Worker
       waitActive: false,
       activeEffects: 0,
       wait: (id) => context.waitStored(id),
+      announce: (change) => this.announcer?.(change),
       recover: <T>(
         fn: () => Promise<T>,
         persistence = false,
@@ -462,6 +480,14 @@ export class Worker
       );
     this.changes.notify();
     this.publish("activityStarted", event);
+    this.announcer?.({
+      type: "attempt.started",
+      activityId: claim.id,
+      activityType: claim.type,
+      rootId: claim.rootId,
+      attempt: claim.retryCount + 1,
+      at: startedAt,
+    });
     const started = performance.now();
     let output: unknown,
       error: unknown,
@@ -541,6 +567,14 @@ export class Worker
           await scope.recover(() => storage.complete(fence, data!), true);
           this.counters.succeeded++;
           this.publish("activityCompleted", event);
+          this.announcer?.({
+            type: "attempt.succeeded",
+            activityId: claim.id,
+            activityType: claim.type,
+            rootId: claim.rootId,
+            attempt: claim.retryCount + 1,
+            at: new Date(),
+          });
           return;
         }
       }
@@ -646,6 +680,13 @@ export class Worker
    * whether one was running. For a cancel from this worker's own agent: the heartbeat would
    * notice within an interval; this makes it immediate.
    */
+  /**
+   * Sends every lifecycle change this worker makes from now on to `fn`: claims, successes and
+   * submissions from its handlers. undefined stops. For this worker's own agent.
+   */
+  [announceTo](fn?: (change: Change) => void): void {
+    this.announcer = fn;
+  }
   [interruptActivity](activityId: string): boolean {
     const attempt = this.attempts.get(activityId);
     if (!attempt || attempt.signal.aborted) return false;

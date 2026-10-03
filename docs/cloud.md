@@ -37,6 +37,12 @@ Without it, the agent serves only the executor. Payloads and results are shown a
 JSON: a SuperJSON `Date`, `Map` or `bigint` appears as its JSON projection (an ISO
 string, entry pairs, a decimal string).
 
+Submissions, claims and successes store no event (the activity's own times record them).
+While someone is watching the app in the Cloud, the agent announces them live instead: what
+this worker claims and completes, and what its handlers spawn. A `RunnerQClient` in a
+process without an agent announces nothing; its activities still appear once a worker
+claims them. Announcements are best effort and never stored.
+
 ## Commands
 
 The agent is read-only unless you pass `allowControl: true`. Then, when the storage

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Claim, Fence, Park, Storage, StoredResult } from "./storage.js";
 import { RunnerQError } from "./errors.js";
+import type { Change } from "./worker.js";
 export interface AttemptScope {
   storage: Storage;
   claim: Claim;
@@ -19,6 +20,8 @@ export interface AttemptScope {
   activeEffects: number;
   violation?: RunnerQError;
   wait(id: string): Promise<StoredResult>;
+  /** Tells the worker's agent, if it asked, of a lifecycle change this attempt made. */
+  announce(change: Change): void;
   recover<T>(
     fn: () => Promise<T>,
     persistence?: boolean,

@@ -132,6 +132,14 @@ export async function submit<I, O>(
   const existing = scope
     ? await scope.recover(() => storage.submit(activity))
     : await storage.submit(activity);
+  if (scope && existing === id)
+    scope.announce({
+      type: config.delayMs > 0 ? "activity.scheduled" : "activity.created",
+      activityId: id,
+      activityType: definition.name,
+      rootId,
+      at: new Date(),
+    });
   return new ActivityHandle(existing, storage, definition.output);
 }
 export class RunnerQClient {
