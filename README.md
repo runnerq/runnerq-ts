@@ -190,14 +190,14 @@ Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by defa
 <details>
 <summary><strong>Pluggable storage</strong></summary>
 
-`PostgresStorage` is built in. `runnerq/storage` exports the contract for custom backends, and [`@runnerq/cloud-storage`](https://github.com/runnerq/cloud-storage-ts) runs workers on RunnerQ Cloud hosted storage.
+`PostgresStorage` is built in, and `runnerq/storage` exports the contract for custom backends.
 
 </details>
 
 <details>
-<summary><strong>RunnerQ Cloud</strong></summary>
+<summary><strong>A console for your workers</strong></summary>
 
-The conductor agent (`runnerq/conductor`) connects a worker to RunnerQ Cloud, which shows it in Fleet and can query and, if you allow it, control its activities. `metadataOnly: true` keeps payloads and results in your process. See [RunnerQ Cloud](docs/cloud.md).
+The conductor agent (`runnerq/conductor`) connects a worker to a console that can query and, if you allow it, control its activities. `metadataOnly: true` keeps payloads and results in your process. See [Conductor agent](docs/conductor.md).
 
 </details>
 
@@ -211,7 +211,6 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 | 02  | [crash-and-resume](examples/02-crash-and-resume/)    | **kill it after the charge; on restart it resumes without charging again** |
 | 03  | [fan-out](examples/03-fan-out/)                      | children and a durable join with one execution slot                        |
 | 04  | [signals-and-sleep](examples/04-signals-and-sleep/)  | buffered signals, persisted deadlines, a durable timer                     |
-| 05  | [cloud](examples/05-cloud/)                          | a worker connected to RunnerQ Cloud                                        |
 | 06  | [multiple-files](examples/06-multiple-files/)        | definitions, handlers, worker and producer in separate files               |
 
 ## Documentation
@@ -220,7 +219,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
-- [RunnerQ Cloud](docs/cloud.md): the conductor agent, queries and commands
+- [Conductor agent](docs/conductor.md): connecting workers to a console
 - [Architecture and guarantees](docs/architecture.md): transactions, recovery and replay limitations
 
 ## Development

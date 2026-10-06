@@ -1,11 +1,10 @@
-// The read surface RunnerQ Cloud queries: activities, events and steps (filter, sort,
-// paginate, aggregate) in its backend-neutral model; a port of runnerq-go's QueryStorage.
+// A backend's read surface for dashboards and tooling: activities, events and steps (filter,
+// sort, paginate, aggregate) in a backend-neutral model; a port of runnerq-go's QueryStorage.
 import type { JsonValue } from "./codec.js";
 
 /**
- * What a backend implements so RunnerQ Cloud can query it (optional: without it the agent
- * serves only executor messages). Queries span every queue in the database, so every
- * executor of an app answers alike. Backends advertise what they evaluate efficiently in
+ * What a backend implements to be queried (optional). Queries span every queue in the
+ * database. Backends advertise what they evaluate efficiently in
  * `queryCapabilities()` and reject anything else with a `QueryError` ("unsupported"), never
  * silently ignoring a filter.
  */

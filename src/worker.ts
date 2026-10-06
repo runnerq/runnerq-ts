@@ -10,7 +10,6 @@ import { executionScope, type AttemptScope } from "./scope.js";
 import type { Storage, Claim, Fence, Retention } from "./storage.js";
 import {
   ChangeSignal,
-  isExecutorObserver,
   thisHostname,
   thisSdk,
   type ExecutorCounters,
@@ -84,7 +83,7 @@ export interface WorkerConfig {
   maxActivityDepth?: number;
   retention?: Retention;
   metrics?: Metrics;
-  /** Free-form tags (region, deploy version) that RunnerQ Cloud shows in Fleet. */
+  /** Free-form tags (region, deploy version), carried in the worker's snapshots. */
   labels?: Readonly<Record<string, string>>;
 }
 export type ActivityHandler<I, O> = (
@@ -101,7 +100,7 @@ export class Worker
   extends EventEmitter<WorkerEvents>
   implements ExecutorSource
 {
-  /** Random, fixed at construction; RunnerQ Cloud's executor id. */
+  /** Random, fixed at construction: the executor id in its snapshots. */
   readonly id = randomUUID();
   private readonly config: Required<
     Pick<
@@ -259,7 +258,7 @@ export class Worker
   changed(): Promise<void> {
     return this.changes.changed();
   }
-  /** Tells `observer` of start and stop (call before `start()`); observer storages join unasked. */
+  /** Tells `observer` of start and stop (call before `start()`). */
   observe(observer: ExecutorObserver): this {
     if (this.state !== "idle")
       throw new RunnerQError(
@@ -291,8 +290,6 @@ export class Worker
       this.state = "running";
       this.startedAt = new Date();
       this.servedTypes = [...types].sort();
-      if (isExecutorObserver(this.config.storage))
-        this.observers.push(this.config.storage);
       this.maintenance = [
         this.loop(this.config.reaperIntervalMs, () =>
           this.config.storage.reap(this.config.reaperBatchSize),
@@ -676,17 +673,17 @@ export class Worker
     return summary;
   }
   /**
-   * Stops the attempt running `activityId` here as if its claim were lost, and reports
-   * whether one was running. For a cancel from this worker's own agent: the heartbeat would
-   * notice within an interval; this makes it immediate.
-   */
-  /**
    * Sends every lifecycle change this worker makes from now on to `fn`: claims, successes and
    * submissions from its handlers. undefined stops. For this worker's own agent.
    */
   [announceTo](fn?: (change: Change) => void): void {
     this.announcer = fn;
   }
+  /**
+   * Stops the attempt running `activityId` here as if its claim were lost, and reports
+   * whether one was running. For a cancel from this worker's own agent: the heartbeat would
+   * notice within an interval; this makes it immediate.
+   */
   [interruptActivity](activityId: string): boolean {
     const attempt = this.attempts.get(activityId);
     if (!attempt || attempt.signal.aborted) return false;

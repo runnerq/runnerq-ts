@@ -153,8 +153,7 @@ export interface Storage {
 }
 
 /**
- * Applies RunnerQ Cloud commands to the backend's own queue (optional: the agent advertises
- * commands only for a backend that has it). Commands are idempotent by `Command.id`: the
+ * Applies operator commands to the backend's own queue (optional). Commands are idempotent by `Command.id`: the
  * result is kept for at least 24 hours and replayed for the same id, and the same id with a
  * different `fingerprint` is a `conflict`. Per-target problems (not found, wrong state) are
  * reported per item and do not fail the command; a rejected promise means nothing was applied.

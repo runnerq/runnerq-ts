@@ -1,4 +1,4 @@
-# RunnerQ Cloud
+# Conductor agent
 
 Connecting workers to RunnerQ Cloud with the conductor agent.
 

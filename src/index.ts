@@ -5,11 +5,7 @@ export type { ResultOptions, ChildActivityHandle } from "./client.js";
 export { ActivityContext } from "./context.js";
 export type { StepContext } from "./context.js";
 export { Worker } from "./worker.js";
-export {
-  ChangeSignal,
-  reportExecutor,
-  isExecutorObserver,
-} from "./executor.js";
+export { ChangeSignal, reportExecutor } from "./executor.js";
 export type {
   ExecutorInfo,
   ExecutorSdk,
