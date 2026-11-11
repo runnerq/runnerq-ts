@@ -2,7 +2,7 @@
 // PostgresStorage, one JSON request per stdin line, one reply per stdout line.
 import { createInterface } from "node:readline";
 import { PostgresStorage } from "../dist/postgres/index.js";
-import { businessKey } from "../dist/codec.js";
+import { businessKey, commandFingerprint } from "../dist/codec.js";
 
 const priorities = ["low", "normal", "high", "critical"];
 const policies = {
@@ -118,9 +118,8 @@ const ops = {
     };
   },
   async command(a) {
-    const res = await storage.applyCommand({
+    const command = {
       id: a.command_id,
-      fingerprint: a.fingerprint,
       kind: a.kind,
       target: {
         ...(a.ids && { ids: a.ids }),
@@ -135,7 +134,9 @@ const ops = {
       priority: a.priority,
       signalName: a.name,
       ...(a.payload !== undefined && { signalPayload: a.payload }),
-    });
+    };
+    command.fingerprint = a.fingerprint ?? commandFingerprint(command);
+    const res = await storage.applyCommand(command);
     return {
       matched: res.matched,
       applied: res.applied,

@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { ActivityDefinition } from "./activity.js";
-import { businessKey, stepKey, uuid } from "./codec.js";
+import { businessKey, commandFingerprint, stepKey, uuid } from "./codec.js";
 import { ActivityFailedError, RunnerQError } from "./errors.js";
 import {
   encode,
@@ -431,20 +431,7 @@ export class RunnerQClient {
       ...(options.reason && { reason: options.reason }),
       ...extra,
     };
-    cmd.fingerprint = createHash("sha256")
-      .update(
-        JSON.stringify([
-          cmd.kind,
-          cmd.target,
-          cmd.dryRun,
-          cmd.reason ?? "",
-          cmd.cascadeChildren ?? false,
-          cmd.resetAttempts ?? false,
-          cmd.at instanceof Date ? cmd.at.toISOString() : "",
-          cmd.priority ?? 0,
-        ]),
-      )
-      .digest("hex");
+    cmd.fingerprint = commandFingerprint(cmd);
     let res;
     try {
       res = await this.storage.applyCommand(cmd);
