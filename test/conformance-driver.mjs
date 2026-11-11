@@ -117,6 +117,39 @@ const ops = {
       }),
     };
   },
+  async command(a) {
+    const res = await storage.applyCommand({
+      id: a.command_id,
+      fingerprint: a.fingerprint,
+      kind: a.kind,
+      target: {
+        ...(a.ids && { ids: a.ids }),
+        ...(a.filter && { filter: a.filter }),
+        ...(a.max !== undefined && { max: a.max }),
+      },
+      dryRun: a.dry_run,
+      reason: a.reason,
+      cascadeChildren: a.cascade,
+      resetAttempts: a.reset_attempts,
+      at: a.at,
+      priority: a.priority,
+      signalName: a.name,
+      ...(a.payload !== undefined && { signalPayload: a.payload }),
+    });
+    return {
+      matched: res.matched,
+      applied: res.applied,
+      cascaded: res.cascaded,
+      more: res.more,
+      replayed: res.replayed,
+      items: res.items.map((it) => ({
+        id: it.id,
+        outcome: it.outcome,
+        ...(it.status && { status: it.status }),
+        ...(it.error && { error: it.error.kind }),
+      })),
+    };
+  },
   async get_result(a) {
     const r = await storage.getResult(a.id);
     return {
@@ -141,7 +174,7 @@ for await (const line of lines) {
     if (op !== "open" && !storage) throw new Error("open first");
     reply = { ok: await ops[op](args ?? {}) };
   } catch (error) {
-    const code = error?.code ?? "internal";
+    const code = error?.code ?? error?.kind ?? "internal";
     reply = {
       error: {
         kind: kinds[code] ?? code,

@@ -7,7 +7,13 @@ import { message, retryable, RunnerQError, captureFailure } from "./errors.js";
 import { integer } from "./options.js";
 import { maxTimerMs, pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
-import type { Storage, Claim, Fence, Retention } from "./storage.js";
+import {
+  isResultNotifier,
+  type Storage,
+  type Claim,
+  type Fence,
+  type Retention,
+} from "./storage.js";
 import {
   ChangeSignal,
   thisHostname,
@@ -400,14 +406,21 @@ export class Worker
       }
     };
     const beatMs = Math.min(config.heartbeatMs, maxTimerMs);
+    // A hint during a renewal beats again once it settles: the renewal may predate the cancel.
+    let inFlight = false,
+      hinted = false;
     const heartbeat = () => {
+      inFlight = true;
+      hinted = false;
       renewing = storage.renew(fence, config.leaseMs).then(
         (owned) => {
+          inFlight = false;
           if (!owned) attempt.abort(reclaimed());
           else if (beating && !signal.aborted)
-            beat = setTimeout(heartbeat, beatMs);
+            beat = setTimeout(heartbeat, hinted ? 0 : beatMs);
         },
         (error) => {
+          inFlight = false;
           if (!beating || signal.aborted) return;
           this.counters.heartbeatFailures++;
           this.report(error);
@@ -415,6 +428,17 @@ export class Worker
         },
       );
     };
+    // A cancel stores the activity's result: renew now to find out whether the claim is gone.
+    const unwatch = isResultNotifier(storage)
+      ? storage.notifyResult(claim.id, () => {
+          if (!beating || signal.aborted) return;
+          if (inFlight) hinted = true;
+          else {
+            clearTimeout(beat);
+            heartbeat();
+          }
+        })
+      : undefined;
     if (!signal.aborted) {
       beat = setTimeout(heartbeat, beatMs);
       expire();
@@ -531,6 +555,7 @@ export class Worker
     }
     scope.closed = true;
     beating = false;
+    unwatch?.();
     clearTimeout(beat);
     clearTimeout(expiry);
     await renewing;

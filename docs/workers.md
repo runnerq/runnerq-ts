@@ -4,7 +4,7 @@ Running, configuring and observing workers, and reading stored state.
 
 ## Cancellation and lifecycle
 
-`ctx.signal` aborts on execution timeout, claim loss, or exhausted shutdown grace. Pass it to fetch, cancellable database clients and other I/O. Cancellation cannot terminate synchronous JavaScript or force an uncooperative Promise to settle. Such handlers remain tracked; the SDK does not release local execution capacity by merely racing a timeout Promise. CPU-heavy work belongs in isolated worker processes.
+`ctx.signal` aborts on execution timeout, claim loss (including a cancel from any process, see [Managing work](managing-work.md)), or exhausted shutdown grace. Pass it to fetch, cancellable database clients and other I/O. Cancellation cannot terminate synchronous JavaScript or force an uncooperative Promise to settle. Such handlers remain tracked; the SDK does not release local execution capacity by merely racing a timeout Promise. CPU-heavy work belongs in isolated worker processes.
 
 `worker.start()` resolves after startup. `worker.stop({ graceMs })` stops intake, drains handlers and acknowledgements, then aborts unfinished work when the grace expires. Its result is `{ drained, remaining }`. Stop is idempotent. Worker instances are single-use. `worker.closed` resolves when stop completes, including a forced stop; it does not promise that cancellation-ignoring user code has stopped. Storage is caller-owned and closed separately.
 
