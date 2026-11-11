@@ -1,6 +1,7 @@
 name: Release
 
-# Publishes runnerq to npm, with provenance, when a v* tag is pushed.
+# Publishes runnerq to npm, with provenance, when a v* tag is pushed, then
+# publishes the drafted GitHub release.
 # See RELEASING.md for the one-time npm setup and the release steps.
 on:
   push:
@@ -47,3 +48,21 @@ jobs:
           # Empty once trusted publishing is configured on npmjs.com; npm then
           # authenticates with the workflow's OIDC token instead.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    # Turns the draft that release-drafter keeps up to date on main into the
+    # published GitHub release for this tag, once the package is on npm.
+    needs: npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: release-drafter/release-drafter@v6
+        with:
+          publish: true
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
