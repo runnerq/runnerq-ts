@@ -19,11 +19,11 @@ Node.js 22 or later, an ESM application, and PostgreSQL are required.
 PostgreSQL 17 and 18 are covered by CI. The package ships compiled JavaScript
 and TypeScript declarations.
 
-`runnerq` isn't on npm yet. Install it from GitHub:
-
 ```bash
-npm install github:runnerq/runnerq-ts
+npm install runnerq
 ```
+
+The package is on npm from v0.6.0.
 
 ## Quick start
 

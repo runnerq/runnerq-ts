@@ -34,7 +34,23 @@ jobs:
       - run: npm run format:check
       - run: npm test
         timeout-minutes: 3
-      - run: npm pack --dry-run
+  package:
+    # What `npm publish` would upload. The version is replaced by a throwaway
+    # prerelease so the dry run doesn't fail once package.json's version is on npm.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run pack:check
+      - run: npm version --no-git-tag-version "$(node -p 'require("./package.json").version')-ci.${{ github.run_number }}"
+      - run: npm publish --dry-run --access public --tag ci
+
   spec:
     # src/spec.ts, src/spec-schema.ts and src/conductor/{protocol,specs}.ts are generated
     # from the pinned runnerq-spec submodule (npm run spec:gen).
