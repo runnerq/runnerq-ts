@@ -16,6 +16,8 @@ Go SDK's next release.
   Install with `npm install runnerq` instead of the GitHub URL.
 - A release process: this changelog, `RELEASING.md` and release notes
   drafted from PR labels.
+- Security checks in CI (`npm audit` on runtime dependencies, CodeQL),
+  Dependabot, and `SECURITY.md` with private vulnerability reporting.
 
 ### Breaking
 
