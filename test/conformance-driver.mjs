@@ -2,7 +2,7 @@
 // PostgresStorage, one JSON request per stdin line, one reply per stdout line.
 import { createInterface } from "node:readline";
 import { PostgresStorage } from "../dist/postgres/index.js";
-import { businessKey } from "../dist/codec.js";
+import { businessKey, commandFingerprint } from "../dist/codec.js";
 
 const priorities = ["low", "normal", "high", "critical"];
 const policies = {
@@ -158,6 +158,40 @@ const ops = {
   },
   async fire_schedules(a) {
     return { count: await storage.fireSchedules(a.limit ?? 100) };
+  },
+  async command(a) {
+    const command = {
+      id: a.command_id,
+      kind: a.kind,
+      target: {
+        ...(a.ids && { ids: a.ids }),
+        ...(a.filter && { filter: a.filter }),
+        ...(a.max !== undefined && { max: a.max }),
+      },
+      dryRun: a.dry_run,
+      reason: a.reason,
+      cascadeChildren: a.cascade,
+      resetAttempts: a.reset_attempts,
+      at: a.at,
+      priority: a.priority,
+      signalName: a.name,
+      ...(a.payload !== undefined && { signalPayload: a.payload }),
+    };
+    command.fingerprint = a.fingerprint ?? commandFingerprint(command);
+    const res = await storage.applyCommand(command);
+    return {
+      matched: res.matched,
+      applied: res.applied,
+      cascaded: res.cascaded,
+      more: res.more,
+      replayed: res.replayed,
+      items: res.items.map((it) => ({
+        id: it.id,
+        outcome: it.outcome,
+        ...(it.status && { status: it.status }),
+        ...(it.error && { error: it.error.kind }),
+      })),
+    };
   },
   async get_result(a) {
     const r = await storage.getResult(a.id);

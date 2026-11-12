@@ -7,7 +7,13 @@ import { message, retryable, RunnerQError, captureFailure } from "./errors.js";
 import { integer } from "./options.js";
 import { maxTimerMs, pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
-import type { Storage, Claim, Fence, Retention } from "./storage.js";
+import {
+  isResultNotifier,
+  type Storage,
+  type Claim,
+  type Fence,
+  type Retention,
+} from "./storage.js";
 import {
   isScheduleStorage,
   scheduleDefinition,
@@ -24,6 +30,26 @@ import {
   type ExecutorSource,
   type RunningActivity,
 } from "./executor.js";
+import {
+  isLabeledMetrics,
+  jsonLogger,
+  startSpan,
+  unlabeledMetrics,
+  type LabeledMetrics,
+  type Logger,
+  type Metrics,
+  type MetricLabels,
+  type Tracer,
+  type TraceSpan,
+} from "./observability.js";
+import {
+  metricNames as m,
+  spanAttributes as attr,
+  spanNames,
+  spanOutcomes as outcomes,
+  traceparentKey,
+} from "./observability-spec.js";
+import { isQueryStorage } from "./query.js";
 
 /** Internal: the agent's handle on `Worker`'s interrupt (not exported from the package). */
 export const interruptActivity = Symbol("runnerq.interruptActivity");
@@ -69,10 +95,6 @@ export interface WorkerEvents {
   activityYielded: [event: ExecutionEvent];
   claimLost: [event: ExecutionEvent];
 }
-export interface Metrics {
-  increment(name: string, value: number): void;
-  duration(name: string, milliseconds: number): void;
-}
 export interface WorkerConfig {
   storage: Storage;
   concurrency?: number;
@@ -91,7 +113,24 @@ export interface WorkerConfig {
   shutdownGraceMs?: number;
   maxActivityDepth?: number;
   retention?: Retention;
-  metrics?: Metrics;
+  /**
+   * Receives every metric of `metricCatalog`. A `Metrics` (names only) is adapted with
+   * `unlabeledMetrics`. `runnerq/otel` provides one for OpenTelemetry.
+   */
+  metrics?: Metrics | LabeledMetrics;
+  /** Traces this worker's attempts and the activities its handlers enqueue (see `Tracer`). */
+  tracer?: Tracer;
+  /**
+   * Where the worker logs. Defaults to `jsonLogger()`: JSON lines on stderr at info and above,
+   * with the messages and fields the Go SDK logs through slog.
+   */
+  logger?: Logger;
+  /**
+   * Samples the gauges (queue depth by status, oldest pending age, in-flight count) about this
+   * often, jittered by up to a fifth. Queue depth and age need a storage that answers queries.
+   * 0, the default, leaves them off.
+   */
+  gaugeIntervalMs?: number;
   /** Free-form tags (region, deploy version), carried in the worker's snapshots. */
   labels?: Readonly<Record<string, string>>;
 }
@@ -161,6 +200,9 @@ export class Worker
   private servedTypes?: string[];
   private readonly hostname = thisHostname();
   private announcer?: (change: Change) => void;
+  private readonly metrics?: LabeledMetrics;
+  private readonly log: Logger;
+  private readonly gaugeIntervalMs: number;
   constructor(config: WorkerConfig) {
     super({ captureRejections: true });
     this.config = {
@@ -216,6 +258,18 @@ export class Worker
     this.closed = new Promise((resolve) => {
       this.resolveClosed = resolve;
     });
+    this.metrics = config.metrics
+      ? isLabeledMetrics(config.metrics)
+        ? config.metrics
+        : unlabeledMetrics(config.metrics)
+      : undefined;
+    this.log = config.logger ?? jsonLogger();
+    this.gaugeIntervalMs = integer(
+      config.gaugeIntervalMs ?? 0,
+      "gaugeIntervalMs",
+      0,
+      maxTimerMs,
+    );
   }
   register<I, O>(
     definition: ActivityDefinition<I, O>,
@@ -338,18 +392,25 @@ export class Worker
         this.maintenance.push(
           this.loop(scheduleIntervalMs, async () => {
             const n = await store.fireSchedules(100);
-            if (n)
-              this.metric(() =>
-                this.config.metrics?.increment("schedule_fires", n),
-              );
+            if (n) this.count("schedule_fires", { queue: this.queue }, n);
           }),
         );
       if (this.config.retention)
         this.maintenance.push(
-          this.loop(this.config.retention.intervalMs ?? 600_000, () =>
-            this.config.storage.cleanup(this.config.retention!),
-          ),
+          this.loop(this.config.retention.intervalMs ?? 600_000, async () => {
+            const swept = await this.config.storage.cleanup(
+              this.config.retention!,
+            );
+            if (swept > 0)
+              this.count(m.activityTreesSwept, { queue: this.queue }, swept);
+          }),
         );
+      if (this.gaugeIntervalMs > 0)
+        this.maintenance.push(this.sampleGauges(this.gaugeIntervalMs, types));
+      this.log.info("Starting worker engine", {
+        queue: this.queue,
+        max_concurrent_activities: this.config.concurrency,
+      });
       this.dispatch = this.dispatcher(types);
       for (const observer of this.observers)
         try {
@@ -449,21 +510,40 @@ export class Worker
       }
     };
     const beatMs = Math.min(config.heartbeatMs, maxTimerMs);
+    // A hint during a renewal beats again once it settles: the renewal may predate the cancel.
+    let inFlight = false,
+      hinted = false;
     const heartbeat = () => {
+      inFlight = true;
+      hinted = false;
       renewing = storage.renew(fence, config.leaseMs).then(
         (owned) => {
+          inFlight = false;
           if (!owned) attempt.abort(reclaimed());
           else if (beating && !signal.aborted)
-            beat = setTimeout(heartbeat, beatMs);
+            beat = setTimeout(heartbeat, hinted ? 0 : beatMs);
         },
         (error) => {
+          inFlight = false;
           if (!beating || signal.aborted) return;
           this.counters.heartbeatFailures++;
+          this.count(m.activityHeartbeatFailed, labels);
           this.report(error);
           beat = setTimeout(heartbeat, beatMs);
         },
       );
     };
+    // A cancel stores the activity's result: renew now to find out whether the claim is gone.
+    const unwatch = isResultNotifier(storage)
+      ? storage.notifyResult(claim.id, () => {
+          if (!beating || signal.aborted) return;
+          if (inFlight) hinted = true;
+          else {
+            clearTimeout(beat);
+            heartbeat();
+          }
+        })
+      : undefined;
     if (!signal.aborted) {
       beat = setTimeout(heartbeat, beatMs);
       expire();
@@ -473,7 +553,30 @@ export class Worker
       activityType: claim.type,
       retryCount: claim.retryCount,
     };
-    const metrics = config.metrics;
+    const labels: MetricLabels = {
+      queue: storage.queue,
+      activityType: claim.type,
+    };
+    const fields = { activity_id: claim.id, activity_type: claim.type };
+    const stored = claim.metadata[traceparentKey];
+    const span = startSpan(
+      config.tracer,
+      spanNames.attempt,
+      stored || undefined,
+      () => {
+        const a: Record<string, string | number> = {
+          [attr.queue]: storage.queue,
+          [attr.activityType]: claim.type,
+          [attr.activityId]: claim.id,
+          [attr.rootId]: claim.rootId,
+          [attr.attempt]: claim.retryCount + 1,
+        };
+        if (claim.parentId) a[attr.parentId] = claim.parentId;
+        return a;
+      },
+    );
+    let outcome: string = outcomes.error,
+      outcomeError: unknown;
     const scope: AttemptScope = {
       storage,
       claim,
@@ -490,6 +593,9 @@ export class Worker
       activeEffects: 0,
       wait: (id) => context.waitStored(id),
       announce: (change) => this.announcer?.(change),
+      tracer: config.tracer,
+      span,
+      metrics: this.metrics,
       recover: <T>(
         fn: () => Promise<T>,
         persistence = false,
@@ -499,7 +605,7 @@ export class Worker
           fn,
           within ?? (persistence ? this.lifetime.signal : signal),
           async () => {
-            this.metric(() => metrics?.increment("storage_retry", 1));
+            this.count(m.storageRetry, labels);
             // An uncertain write may have landed: only a failed renew means ownership is lost.
             try {
               const owned = await storage.renew(fence, config.leaseMs);
@@ -519,11 +625,18 @@ export class Worker
       startedAt,
     });
     this.counters.claimed++;
-    if (claim.dueAt)
+    this.count(m.activityStarted, labels);
+    if (claim.dueAt) {
       this.counters.lastClaimLagMs = Math.max(
         0,
         startedAt.getTime() - new Date(claim.dueAt).getTime(),
       );
+      this.histogram(
+        m.activityClaimLag,
+        labels,
+        this.counters.lastClaimLagMs / 1000,
+      );
+    }
     this.changes.notify();
     this.publish("activityStarted", event);
     this.announcer?.({
@@ -553,9 +666,9 @@ export class Worker
           cause,
         });
       }
-      output = await executionScope.run(scope, () =>
-        registration.handler(context, input),
-      );
+      const run = () =>
+        executionScope.run(scope, () => registration.handler(context, input));
+      output = await (span ? span.run(run) : run());
       if (registration.output) {
         try {
           output = registration.output(output);
@@ -580,14 +693,16 @@ export class Worker
     }
     scope.closed = true;
     beating = false;
+    unwatch?.();
     clearTimeout(beat);
     clearTimeout(expiry);
     await renewing;
+    let caught: unknown;
     try {
       const reason = signal.reason;
       if (reason instanceof RunnerQError && reason.code === "claim_lost") {
-        this.counters.claimsLost++;
-        this.publish("claimLost", event);
+        this.claimLost(event, labels, fields);
+        outcome = outcomes.claimLost;
         return;
       }
       if (this.lifetime.signal.aborted) return;
@@ -595,8 +710,16 @@ export class Worker
         error = scope.violation;
         failed = true;
       } else if (scope.suspension) {
-        await scope.recover(() => storage.park(fence, scope.suspension!), true);
+        const park = scope.suspension;
+        await scope.recover(() => storage.park(fence, park), true);
+        this.count(m.activityYielded, labels);
+        this.log.debug("Activity yielded for durable wait", {
+          ...fields,
+          step: park.step,
+          wake_at: park.wakeAt,
+        });
         this.publish("activityYielded", event);
+        outcome = outcomes.yielded;
         return;
       }
       // Checkpoint recovery may outlive the deadline; a captured result still commits under
@@ -610,8 +733,31 @@ export class Worker
           failed = true;
         }
         if (!failed) {
-          await scope.recover(() => storage.complete(fence, data!), true);
+          const persisting = performance.now();
+          this.count(m.activityCompletionPendingStarted, labels);
+          try {
+            await scope.recover(() => storage.complete(fence, data!), true);
+          } catch (error) {
+            if (error instanceof RunnerQError && error.code === "claim_lost")
+              throw error;
+            this.count(m.activityCompletionError, labels);
+            this.log.error("Failed to confirm activity completion", {
+              ...fields,
+              error: message(error),
+            });
+            throw error;
+          } finally {
+            this.count(m.activityCompletionPendingFinished, labels);
+            this.histogram(
+              m.activityCompletionPersistence,
+              labels,
+              (performance.now() - persisting) / 1000,
+            );
+          }
           this.counters.succeeded++;
+          this.count(m.activityCompleted, labels);
+          this.log.info("Activity completed successfully", fields);
+          outcome = outcomes.completed;
           this.publish("activityCompleted", event);
           this.announcer?.({
             type: "attempt.succeeded",
@@ -625,8 +771,8 @@ export class Worker
         }
       }
       if (error instanceof RunnerQError && error.code === "claim_lost") {
-        this.counters.claimsLost++;
-        this.publish("claimLost", event);
+        this.claimLost(event, labels, fields);
+        outcome = outcomes.claimLost;
         return;
       }
       const failure = captureFailure(error);
@@ -635,10 +781,37 @@ export class Worker
         true,
       );
       // As Go counts them: a timeout is a timeout, not also a retry.
-      if (timedOut) this.counters.timedOut++;
-      else if (status === "failed") this.counters.failed++;
-      else this.counters.retried++;
-      if (status === "dead_letter") this.counters.deadLettered++;
+      if (timedOut) {
+        this.counters.timedOut++;
+        this.count(m.activityTimeout, labels);
+        this.log.error("Activity timed out", {
+          ...fields,
+          timeout: `${claim.timeoutMs / 1000}s`,
+        });
+        outcome = outcomes.timeout;
+      } else if (status === "failed") {
+        this.counters.failed++;
+        this.count(m.activityFailedNonRetry, labels);
+        this.log.error("Activity failed", {
+          ...fields,
+          reason: failure.message,
+        });
+        outcome = outcomes.failed;
+      } else {
+        this.counters.retried++;
+        this.count(m.activityRetry, labels);
+        this.log.warn("Activity requesting retry", {
+          ...fields,
+          reason: failure.message,
+        });
+        outcome = outcomes.retry;
+      }
+      if (status === "dead_letter") {
+        this.counters.deadLettered++;
+        this.count(m.activityDeadLettered, labels);
+        outcome = outcomes.deadLetter;
+      }
+      outcomeError = error;
       this.publish(
         status === "retrying"
           ? "activityRetrying"
@@ -647,15 +820,21 @@ export class Worker
             : "activityDeadLetter",
         event,
       );
+    } catch (error) {
+      caught = error;
+      throw error;
     } finally {
       if (this.attempts.get(claim.id) === attempt) {
         this.attempts.delete(claim.id);
         this.running.delete(claim.id);
       }
       this.changes.notify();
-      this.metric(() =>
-        metrics?.duration("activity_execution", performance.now() - started),
+      this.histogram(
+        m.activityExecution,
+        labels,
+        (performance.now() - started) / 1000,
       );
+      span?.end(outcome, outcome === outcomes.error ? caught : outcomeError);
     }
   }
   stop(options: { graceMs?: number } = {}): Promise<StopSummary> {
@@ -717,6 +896,7 @@ export class Worker
       }),
     );
     const summary = { drained, remaining: this.inFlight.size };
+    this.log.info("Worker engine stopped", { queue: this.queue });
     this.publish("stopped", summary);
     this.resolveClosed();
     return summary;
@@ -742,21 +922,133 @@ export class Worker
     return true;
   }
   private report(error: unknown): void {
+    this.log.error("Worker error", { error: message(error) });
     this.publish("workerError", asError(error));
   }
-  private metric(fn: () => void): void {
+  private get queue(): string {
+    return this.config.storage.queue;
+  }
+  private count(name: string, labels: MetricLabels, value = 1): void {
+    if (!this.metrics) return;
     try {
-      fn();
+      this.metrics.addCounter(name, value, labels);
     } catch (error) {
       this.report(error);
     }
+  }
+  private histogram(name: string, labels: MetricLabels, value: number): void {
+    if (!this.metrics) return;
+    try {
+      this.metrics.recordHistogram(name, value, labels);
+    } catch (error) {
+      this.report(error);
+    }
+  }
+  private gauge(name: string, labels: MetricLabels, value: number): void {
+    if (!this.metrics) return;
+    try {
+      this.metrics.setGauge(name, value, labels);
+    } catch (error) {
+      this.report(error);
+    }
+  }
+  private claimLost(
+    event: ExecutionEvent,
+    labels: MetricLabels,
+    fields: Record<string, string>,
+  ): void {
+    this.counters.claimsLost++;
+    this.count(m.activityClaimLost, labels);
+    this.log.warn("Activity execution lost its claim", fields);
+    this.publish("claimLost", event);
+  }
+  /** Sets the gauges every `ms`, jittered by up to a fifth either way, until intake stops. */
+  private async sampleGauges(
+    ms: number,
+    types: readonly string[],
+  ): Promise<void> {
+    const reported = new Map<string, MetricLabels>();
+    while (!this.intake.signal.aborted) {
+      try {
+        await pause(
+          Math.round(ms * (0.8 + 0.4 * Math.random())),
+          this.intake.signal,
+        );
+        await this.sampleGaugesOnce(types, reported);
+      } catch (error) {
+        if (!this.intake.signal.aborted) this.report(error);
+      }
+    }
+  }
+  private async sampleGaugesOnce(
+    types: readonly string[],
+    reported: Map<string, MetricLabels>,
+  ): Promise<void> {
+    const queue = this.queue;
+    const inFlight = new Map<string, number>();
+    for (const a of this.running.values())
+      inFlight.set(a.type, (inFlight.get(a.type) ?? 0) + 1);
+    for (const type of types)
+      this.gauge(
+        m.activitiesInFlight,
+        { queue, activityType: type },
+        inFlight.get(type) ?? 0,
+      );
+    const storage = this.config.storage;
+    if (!isQueryStorage(storage)) return;
+    const rows = await storage.aggregateActivities({
+      filter: {
+        and: [
+          { field: "queue", op: "eq", value: queue },
+          { field: "status", op: "in", value: [...gaugeStatuses] },
+        ],
+      },
+      groupBy: ["type", "status"],
+      count: true,
+      limit: 1000,
+    });
+    const seen = new Map<string, MetricLabels>();
+    for (const row of rows.rows) {
+      const labels = {
+        queue,
+        activityType: row.key?.type ?? "",
+        status: row.key?.status ?? "",
+      };
+      const key = `${labels.activityType}\u0000${labels.status}`;
+      seen.set(key, labels);
+      this.gauge(m.queueDepth, labels, row.count);
+    }
+    for (const [key, labels] of reported)
+      if (!seen.has(key)) {
+        this.gauge(m.queueDepth, labels, 0);
+        reported.delete(key);
+      }
+    for (const [key, labels] of seen) reported.set(key, labels);
+    const page = await storage.queryActivities({
+      filter: {
+        and: [
+          { field: "queue", op: "eq", value: queue },
+          { field: "status", op: "eq", value: "pending" },
+        ],
+      },
+      sort: { field: "created_at", desc: false },
+      limit: 1,
+    });
+    const oldest = page.items[0];
+    let age = 0;
+    if (oldest) {
+      const due = Math.max(
+        oldest.createdAt.getTime(),
+        oldest.scheduledFor?.getTime() ?? 0,
+      );
+      age = Math.max(0, (Date.now() - due) / 1000);
+    }
+    this.gauge(m.queueOldestPendingAge, { queue }, age);
   }
   private publish<K extends keyof WorkerEvents>(
     name: K,
     ...args: WorkerEvents[K]
   ): void {
-    if (name.startsWith("activity") || name === "claimLost")
-      this.metric(() => this.config.metrics?.increment(name, 1));
     // A copy of the raw listeners keeps once() wrappers; each is isolated so a throw cannot
     // skip later listeners or change a committed outcome.
     for (const listener of this.rawListeners(name)) {
@@ -783,6 +1075,14 @@ export class Worker
     this.observerError(error, "workerError");
   }
 }
+/** The statuses `queue_depth` reports. */
+const gaugeStatuses = [
+  "pending",
+  "scheduled",
+  "running",
+  "waiting",
+  "dead_letter",
+] as const;
 const asError = (error: unknown): Error =>
   error instanceof Error ? error : new Error(message(error));
 const reclaimed = () =>

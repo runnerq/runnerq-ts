@@ -2,7 +2,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { businessKey, checkpointId, stepKey } from "../dist/codec.js";
+import {
+  businessKey,
+  checkpointId,
+  commandFingerprint,
+  stepKey,
+} from "../dist/codec.js";
 import {
   applicationIdempotencyKey,
   canonicalEvent,
@@ -41,6 +46,26 @@ test("spec: checkpoint IDs", () => {
 test("spec: business keys", () => {
   for (const { name, input, output } of cases("vectors/business_key.json"))
     assert.equal(businessKey(input.key, input.activity_type), output, name);
+});
+
+test("spec: command fingerprints", () => {
+  for (const { name, input, output } of cases(
+    "vectors/command_fingerprint.json",
+  )) {
+    const command = {
+      kind: input.kind,
+      target: { ids: input.ids, filter: input.filter, max: input.max },
+      dryRun: input.dry_run,
+      cascadeChildren: input.cascade,
+      resetAttempts: input.reset_attempts,
+      reason: input.reason,
+      signalName: input.name,
+      at: input.at,
+      priority: input.priority,
+      signalPayload: input.payload,
+    };
+    assert.equal(commandFingerprint(command), output.fingerprint, name);
+  }
 });
 
 test("spec: application keys", () => {

@@ -140,6 +140,18 @@ export class ActivityFailedError extends RunnerQError {
     );
   }
 }
+/**
+ * Whether `error` is an awaited activity's cancellation (`RunnerQClient.cancel`), as
+ * `ActivityHandle.result()` rejects with it.
+ */
+export function isCancelled(error: unknown): error is ActivityFailedError {
+  return (
+    error instanceof ActivityFailedError &&
+    typeof error.detail === "object" &&
+    error.detail !== null &&
+    (error.detail as { type?: unknown }).type === "cancelled"
+  );
+}
 export function message(error: unknown): string {
   const text = property(error, "message");
   if (typeof text === "string") return text;
