@@ -218,6 +218,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 - [Activities](docs/activities.md): contracts, options, retries and recorded failures
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
+- [Observability](docs/observability.md): logger, labelled metrics and gauges, tracing and `runnerq/otel`
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
 - [Conductor agent](docs/conductor.md): connecting workers to a console
 - [Architecture and guarantees](docs/architecture.md): transactions, recovery and replay limitations

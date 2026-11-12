@@ -39,6 +39,8 @@ worker.on("workerError", (error) => console.error(error));
 worker.on("listenerError", (error) => console.error("Observer failed", error));
 ```
 
+`logger`, `metrics`, `tracer` and `gaugeIntervalMs` are covered in [Observability](observability.md).
+
 By default a worker claims only its registered types. Separate workers with distinct type registrations provide workload isolation. Each claims at most its free capacity. Database pool size is independent of handler concurrency; default query pool size is 10 plus one lazy dedicated LISTEN connection. Notifications are batched after commit and are only hints; periodic queries recover missed notifications and due schedules.
 
 Worker events are local observations, emitted after corresponding commits where applicable. Listener exceptions and rejected Promises are contained. Synchronous expensive listeners still block the event loop. Reaper dead letters appear in persisted event history, not necessarily a local worker callback. Use durable activities for required follow-up work rather than relying on an event listener.

@@ -22,6 +22,13 @@ Go SDK's next release.
   work (a sleep, a signal wait, a parent waiting on a child, a delayed
   start); this version migrates the database and must finish it, running
   each remaining step once. CI also covers PostgreSQL 14 to 18.
+- Observability: a `logger` option (structured JSON lines on stderr by
+  default, the same messages and fields as the Go SDK; `silentLogger` turns
+  it off), labelled metrics (`LabeledMetrics`) with gauges for queue depth,
+  oldest pending age and activities in flight (`gaugeIntervalMs`, off by
+  default), and a `Tracer` option on `Worker` and `RunnerQClient` that
+  carries the W3C `traceparent` in activity metadata. OpenTelemetry is the
+  `runnerq/otel` export, with `@opentelemetry/api` as an optional peer.
 
 ### Breaking
 
@@ -30,3 +37,5 @@ Go SDK's next release.
   `isExecutorObserver` is removed.
 - The schema follows `runnerq-spec`'s neutral schema: `runnerq_worker_pools`
   is dropped.
+- Metric names are runnerq-spec's catalog names, not the worker's event
+  names. Workers log to stderr by default.

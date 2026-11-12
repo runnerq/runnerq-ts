@@ -11,6 +11,18 @@ import {
 import { executionOptions, type ActivityOption } from "./options.js";
 import type { Storage, StoredResult, Submission } from "./storage.js";
 import { executionScope, guard, track, type AttemptScope } from "./scope.js";
+import {
+  startSpan,
+  withTraceparent,
+  type Tracer,
+  type TraceAttributeValue,
+} from "./observability.js";
+import {
+  spanAttributes as attr,
+  spanNames,
+  spanOutcomes,
+  traceparentKey,
+} from "./observability-spec.js";
 
 export interface ResultOptions {
   signal?: AbortSignal;
@@ -68,6 +80,7 @@ export async function submit<I, O>(
   options: readonly ActivityOption[],
   scope?: AttemptScope,
   child = false,
+  tracer: Tracer | undefined = scope?.tracer,
 ): Promise<ActivityHandle<O>> {
   const config = executionOptions(options);
   if (!scope && (config.step || config.asRoot || config.replay))
@@ -117,21 +130,50 @@ export async function submit<I, O>(
     : config.idempotency
       ? businessKey(config.idempotency.key, definition.name)
       : undefined;
+  const parentId = linked ? scope.claim.id : null;
+  const span = startSpan(tracer, spanNames.enqueue, scope?.span, () => {
+    const a: Record<string, TraceAttributeValue> = {
+      [attr.queue]: storage.queue,
+      [attr.activityType]: definition.name,
+      [attr.activityId]: id,
+      [attr.rootId]: rootId,
+    };
+    if (parentId) a[attr.parentId] = parentId;
+    return a;
+  });
   const activity: Submission = {
     id,
     type: definition.name,
     payload: payload.data,
     serialization: payload.serialization,
-    options: config,
-    parentId: linked ? scope.claim.id : null,
+    options: {
+      ...config,
+      metadata: withTraceparent(
+        config.metadata,
+        span?.traceparent,
+        scope?.claim.metadata[traceparentKey],
+      ),
+    },
+    parentId,
     rootId,
     depth,
     key,
     fence: scope?.fence,
   };
-  const existing = scope
-    ? await scope.recover(() => storage.submit(activity))
-    : await storage.submit(activity);
+  let existing: string;
+  try {
+    existing = scope
+      ? await scope.recover(() => storage.submit(activity))
+      : await storage.submit(activity);
+  } catch (error) {
+    span?.end(spanOutcomes.error, error);
+    throw error;
+  }
+  if (existing === id) span?.end(spanOutcomes.enqueued);
+  else
+    span?.end(spanOutcomes.existing, undefined, {
+      [attr.activityId]: existing,
+    });
   if (scope && existing === id)
     scope.announce({
       type: config.delayMs > 0 ? "activity.scheduled" : "activity.created",
@@ -144,8 +186,11 @@ export async function submit<I, O>(
 }
 export class RunnerQClient {
   readonly storage: Storage;
-  constructor({ storage }: { storage: Storage }) {
+  /** Traces this client's submissions and signals (see `Tracer`). */
+  readonly tracer?: Tracer;
+  constructor({ storage, tracer }: { storage: Storage; tracer?: Tracer }) {
     this.storage = storage;
+    this.tracer = tracer;
   }
   execute<I, O>(
     definition: ActivityDefinition<I, O>,
@@ -162,10 +207,26 @@ export class RunnerQClient {
           ),
         );
       return track(scope, () =>
-        submit(this.storage, definition, payload, options, scope),
+        submit(
+          this.storage,
+          definition,
+          payload,
+          options,
+          scope,
+          false,
+          this.tracer ?? scope.tracer,
+        ),
       );
     }
-    return submit(this.storage, definition, payload, options);
+    return submit(
+      this.storage,
+      definition,
+      payload,
+      options,
+      undefined,
+      false,
+      this.tracer,
+    );
   }
   handle<O = unknown>(id: string): ActivityHandle<O>;
   handle<I, O>(
@@ -186,11 +247,29 @@ export class RunnerQClient {
     payload: unknown = null,
     options: { serialization?: SerializationMode } = {},
   ): Promise<void> {
-    await this.storage.signal(
-      uuid(id),
-      name,
-      encode(payload, serializationFormat(options.serialization ?? "native")),
+    const target = uuid(id);
+    const value = encode(
+      payload,
+      serializationFormat(options.serialization ?? "native"),
     );
+    const span = startSpan(
+      this.tracer,
+      spanNames.signalSend,
+      undefined,
+      () => ({
+        [attr.activityId]: target,
+        [attr.signalName]: name,
+      }),
+    );
+    try {
+      await (span
+        ? span.run(() => this.storage.signal(target, name, value))
+        : this.storage.signal(target, name, value));
+    } catch (error) {
+      span?.end(spanOutcomes.error, error);
+      throw error;
+    }
+    span?.end(spanOutcomes.sent);
   }
   async signalByKey<I, O>(
     definition: ActivityDefinition<I, O>,
