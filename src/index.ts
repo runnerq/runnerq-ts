@@ -23,6 +23,8 @@ export type {
   ScheduleExecution,
   CatchUp,
 } from "./schedule.js";
+export { Limits } from "./limit.js";
+export type { Limit, LimitRecord } from "./limit.js";
 export { ChangeSignal, reportExecutor } from "./executor.js";
 export type {
   ExecutorInfo,
@@ -42,6 +44,7 @@ export type {
   StopSummary,
   ExecutionEvent,
   ActivityHandler,
+  RegisterOptions,
 } from "./worker.js";
 export {
   jsonLogger,

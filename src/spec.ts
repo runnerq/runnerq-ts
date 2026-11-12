@@ -67,6 +67,21 @@ export const scheduleCatchUpGraceSeconds = 60;
 export const scheduleCatchUpLimitDefault = 100;
 
 /**
+ * How stale a worker's knowledge of which activity types of its queue have a
+ * limit may be: a limit added to an unlimited type binds every worker within
+ * this many milliseconds (limits.md). Changes to an existing limit, and its
+ * removal, bind the next claim.
+ */
+export const limitsRefreshMs = 1000;
+
+/**
+ * How soon a worker claims again after a limit held back work that was
+ * otherwise claimable, instead of waiting for a work notice: a slot freed
+ * elsewhere or a refilled rate token announces nothing (limits.md).
+ */
+export const limitProbeMs = 200;
+
+/**
  * The kinds of storage error. The numbers are stored (runnerq_commands
  * err_kind) and sent on the wire, so they never change.
  */

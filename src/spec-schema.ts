@@ -41,6 +41,10 @@ export const postgresMigrations: readonly PostgresMigration[] = [
   {
     "name": "0003_schedules",
     "sql": "-- Cron schedules (schedules.md). A schedule belongs to a queue and is named\n-- within it. Workers fire due schedules: in one transaction each claims the\n-- row (FOR UPDATE SKIP LOCKED), enqueues an activity per fire time with the\n-- idempotency key schedule:\u003cname\u003e:\u003cfire time\u003e, and advances next_fire_at, so\n-- a tick fires once however many workers race for it.\n--\n-- payload and serialization are the fired activity's input, as in\n-- runnerq_inputs. options holds the fired activity's execution options\n-- (priority, max_retries, timeout_seconds, retry_delay_seconds,\n-- max_retry_delay_seconds, metadata); an absent key takes the default\n-- schedules.md gives. catch_up is 'skip', 'one' or 'all'; catch_up_limit\n-- caps how many due ticks 'all' fires at once.\nCREATE TABLE IF NOT EXISTS runnerq_schedules (\n    queue_name TEXT NOT NULL,\n    name TEXT NOT NULL,\n    cron TEXT NOT NULL,\n    timezone TEXT NOT NULL DEFAULT 'UTC',\n    activity_type TEXT NOT NULL,\n    payload JSONB NOT NULL DEFAULT 'null'::jsonb,\n    serialization TEXT NOT NULL DEFAULT 'json-v1',\n    options JSONB NOT NULL DEFAULT '{}'::jsonb,\n    catch_up TEXT NOT NULL DEFAULT 'one',\n    catch_up_limit INTEGER NOT NULL DEFAULT 100,\n    paused BOOLEAN NOT NULL DEFAULT FALSE,\n    next_fire_at TIMESTAMPTZ NOT NULL,\n    last_fire_at TIMESTAMPTZ,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, name)\n);\n\n-- The due scan: WHERE queue_name = $1 AND NOT paused AND next_fire_at \u003c= NOW()\n-- ORDER BY next_fire_at. Paused schedules are left out.\nCREATE INDEX IF NOT EXISTS idx_runnerq_schedules_due\n    ON runnerq_schedules (queue_name, next_fire_at)\n    WHERE NOT paused;\n"
+  },
+  {
+    "name": "0005_limits",
+    "sql": "-- Concurrency and rate limits (limits.md). A limit applies to one activity\n-- type within a queue; a type without a row is unlimited.\n--\n-- max_concurrent caps the type's running ('processing') activities across\n-- every worker of the queue. It is not a counter: a claim counts the running\n-- rows (idx_runnerq_processing_v2) while it holds this row's lock, so a\n-- worker that dies leaves nothing to drift.\n--\n-- rate_tokens and rate_per_seconds are a token bucket: at most rate_tokens\n-- claims in a burst, refilled continuously at rate_tokens per\n-- rate_per_seconds. tokens and refilled_at are the bucket's level and when it\n-- was last brought up to date, by the database clock; a claim updates them\n-- under the same lock. Both rate columns are set or both are null.\n--\n-- updated_at is when the definition (max_concurrent, rate_tokens,\n-- rate_per_seconds) last changed.\nCREATE TABLE IF NOT EXISTS runnerq_limits (\n    queue_name TEXT NOT NULL,\n    activity_type TEXT NOT NULL,\n    max_concurrent INTEGER,\n    rate_tokens INTEGER,\n    rate_per_seconds DOUBLE PRECISION,\n    tokens DOUBLE PRECISION NOT NULL DEFAULT 0,\n    refilled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, activity_type),\n    CHECK (max_concurrent IS NULL OR max_concurrent \u003e= 1),\n    CHECK ((rate_tokens IS NULL) = (rate_per_seconds IS NULL)),\n    CHECK (rate_tokens IS NULL OR (rate_tokens \u003e= 1 AND rate_per_seconds \u003e 0)),\n    CHECK (max_concurrent IS NOT NULL OR rate_tokens IS NOT NULL)\n);\n"
   }
 ];
 /** Built in order after the migrations. */
@@ -70,10 +74,10 @@ export const postgresConcurrentIndexes: readonly PostgresConcurrentIndex[] = [
     "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_status\nON runnerq_activities (status, created_at DESC, id DESC)\nWHERE status \u003c\u003e 'completed'"
   },
   {
-    "name": "idx_runnerq_processing",
+    "name": "idx_runnerq_processing_v2",
     "table": "runnerq_activities",
-    "replaces": "idx_runnerq_activities_processing",
-    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_processing\nON runnerq_activities (queue_name)\nWHERE status = 'processing'"
+    "replaces": "idx_runnerq_processing",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_processing_v2\nON runnerq_activities (queue_name, activity_type)\nWHERE status = 'processing'"
   },
   {
     "name": "idx_runnerq_root_children",
@@ -463,6 +467,63 @@ export const postgresCatalog: Catalog = {
       ]
     },
     {
+      "name": "runnerq_limits",
+      "columns": [
+        {
+          "name": "activity_type",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "max_concurrent",
+          "type": "int4",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "queue_name",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "rate_per_seconds",
+          "type": "float8",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "rate_tokens",
+          "type": "int4",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "refilled_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        },
+        {
+          "name": "tokens",
+          "type": "float8",
+          "nullable": false,
+          "default": "0"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        }
+      ],
+      "primary_key": [
+        "queue_name",
+        "activity_type"
+      ]
+    },
+    {
       "name": "runnerq_results",
       "columns": [
         {
@@ -655,9 +716,9 @@ export const postgresCatalog: Catalog = {
       "definition": "CREATE INDEX idx_runnerq_parent_id ON runnerq_activities USING btree (parent_activity_id) WHERE (parent_activity_id IS NOT NULL)"
     },
     {
-      "name": "idx_runnerq_processing",
+      "name": "idx_runnerq_processing_v2",
       "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_processing ON runnerq_activities USING btree (queue_name) WHERE (status = 'processing'::text)"
+      "definition": "CREATE INDEX idx_runnerq_processing_v2 ON runnerq_activities USING btree (queue_name, activity_type) WHERE (status = 'processing'::text)"
     },
     {
       "name": "idx_runnerq_query_created",
@@ -698,7 +759,7 @@ export const postgresCatalog: Catalog = {
       "idx_runnerq_dequeue_effective",
       "idx_runnerq_dequeue_order",
       "idx_runnerq_query_status_created",
-      "idx_runnerq_activities_processing",
+      "idx_runnerq_processing",
       "idx_runnerq_root_id",
       "idx_runnerq_root_terminal_age",
       "idx_runnerq_results_owner",
@@ -708,7 +769,8 @@ export const postgresCatalog: Catalog = {
       "idx_runnerq_root_only",
       "idx_runnerq_root_status",
       "idx_runnerq_query_type_created",
-      "idx_runnerq_dependencies_producer"
+      "idx_runnerq_dependencies_producer",
+      "idx_runnerq_activities_processing"
     ]
   }
 };

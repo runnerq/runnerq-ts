@@ -102,7 +102,7 @@ integration(
     for (const name of [
       "idx_runnerq_query_created",
       "idx_runnerq_query_status",
-      "idx_runnerq_processing",
+      "idx_runnerq_processing_v2",
       "idx_runnerq_root_children",
       "idx_runnerq_root_terminal",
       "idx_runnerq_results_by_owner",
