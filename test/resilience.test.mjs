@@ -255,3 +255,20 @@ integration(
     }
   },
 );
+
+integration(
+  "a connection lost while checked out fails its query without crashing the process",
+  async (t) => {
+    const { storage } = await setup(t);
+    const c = await storage.pool.connect();
+    const {
+      rows: [{ pid }],
+    } = await c.query("SELECT pg_backend_pid() AS pid");
+    const ended = new Promise((resolve) => c.once("end", resolve));
+    await storage.pool.query("SELECT pg_terminate_backend($1)", [pid]);
+    await ended;
+    await assert.rejects(c.query("SELECT 1"));
+    c.release(true);
+    assert.equal((await storage.pool.query("SELECT 1 AS one")).rows[0].one, 1);
+  },
+);

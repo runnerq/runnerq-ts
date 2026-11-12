@@ -93,6 +93,15 @@ function poolConfig(config: Omit<PostgresConfig, "queue">): PoolConfig {
     idle_in_transaction_session_timeout: 10_000,
   };
 }
+// pg emits a lost connection as an 'error' event on a checked-out client
+// (pg-pool listens only while it is idle), and an unheard 'error' event ends
+// the process. The client's pending and next queries reject anyway, so the
+// event needs no handling of its own.
+function newPool(config: Omit<PostgresConfig, "queue">): Pool {
+  const pool = new Pool(poolConfig(config));
+  pool.on("connect", (client) => client.on("error", () => {}));
+  return pool;
+}
 const initializeHint = "run PostgresStorage.initialize to bring it up to date";
 const inlinePayloads = () =>
   new RunnerQError(
@@ -264,7 +273,7 @@ export class PostgresStorage
   private constructor(config: PostgresConfig) {
     super();
     this.queue = config.queue;
-    this.pool = new Pool(poolConfig(config));
+    this.pool = newPool(config);
     this.pool.on("error", (error) => {
       for (const listener of this.rawListeners("storageError")) {
         try {
@@ -299,7 +308,7 @@ export class PostgresStorage
   static async initialize(
     config: Omit<PostgresConfig, "queue">,
   ): Promise<void> {
-    const pool = new Pool(poolConfig(config));
+    const pool = newPool(config);
     try {
       const client = await pool.connect();
       try {
