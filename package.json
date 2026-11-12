@@ -2,6 +2,21 @@
   "name": "runnerq",
   "version": "0.1.0",
   "description": "Durable TypeScript functions, with pluggable storage",
+  "keywords": [
+    "durable-execution",
+    "workflow",
+    "queue",
+    "postgres",
+    "background-jobs"
+  ],
+  "homepage": "https://github.com/runnerq/runnerq-ts#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/runnerq/runnerq-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/runnerq/runnerq-ts/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -41,10 +56,12 @@
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "npm run build && npm run typecheck && node --test test/*.test.mjs",
     "test:integration": "npm run build && npm run typecheck && node scripts/test-integration.mjs",
+    "test:upgrade": "npm run build && node test/upgrade/run.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "spec:gen": "go run -C spec ./tools/gen -lang ts -out ../src/spec.ts && go run -C spec ./tools/gen -lang ts -part schema -out ../src/spec-schema.ts && go run -C spec ./tools/gen -lang ts -part observability -out ../src/observability-spec.ts && go run -C spec ./tools/gen -part conductor -lang ts -out ../src/conductor/protocol.ts && go run -C spec ./tools/gen -part conductor -lang ts-specs -spec-import ./decode.js -out ../src/conductor/specs.ts",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "pack:check": "node scripts/check-pack.mjs"
   },
   "dependencies": {
     "pg": "^8.16.3",
@@ -70,5 +87,8 @@
     "typescript": "^5.9.3",
     "ws": "^8.22.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }
