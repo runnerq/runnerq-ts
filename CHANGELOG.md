@@ -12,6 +12,19 @@ Go SDK's next release.
 
 ### Added
 
+- Version pinning ([docs/versions.md](docs/versions.md)): a `Worker`'s
+  `version` pins the roots its new `worker.client` submits, its handlers'
+  `asRoot` spawns and the schedules it declares, and makes it claim only
+  unstamped work and its own version's; `serves` adds older versions.
+  `RunnerQClient`'s `version` option pins a standalone client's submissions
+  and schedules. Children take their root's version. `client.repin` moves work
+  to another version through the command ledger. The `version` query field
+  and aggregate key, gauges `activities_by_version` and
+  `activities_unserved`, and a warning for runnable work no local version
+  serves show draining and stranded work. A worker's version is its executor
+  label `version` and `snapshot().info.version`, over the conductor too.
+  Needs schema migration `0004_code_version` (one nullable column, applied by
+  `PostgresStorage.initialize`). Without a version nothing changes.
 - `runnerq` is published to npm, with provenance, from CI on a `v*` tag.
   Install with `npm install runnerq` instead of the GitHub URL.
 - A release process: this changelog, `RELEASING.md`, and GitHub releases
@@ -46,6 +59,10 @@ Go SDK's next release.
 
 ### Breaking
 
+- `Storage.claim` takes an optional
+  `versions` filter after `executorId`, which a backend must honour for
+  workers with a version, and `submit` must store a child's root's version
+  (`Submission.version` is the root's). `ActivitySnapshot.codeVersion` is new.
 - Storage that implements `ExecutorObserver` is no longer attached on its
   own; pass it to `worker.observe` like any other observer.
   `isExecutorObserver` is removed.

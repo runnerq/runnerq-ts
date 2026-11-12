@@ -41,6 +41,10 @@ export const postgresMigrations: readonly PostgresMigration[] = [
   {
     "name": "0003_schedules",
     "sql": "-- Cron schedules (schedules.md). A schedule belongs to a queue and is named\n-- within it. Workers fire due schedules: in one transaction each claims the\n-- row (FOR UPDATE SKIP LOCKED), enqueues an activity per fire time with the\n-- idempotency key schedule:\u003cname\u003e:\u003cfire time\u003e, and advances next_fire_at, so\n-- a tick fires once however many workers race for it.\n--\n-- payload and serialization are the fired activity's input, as in\n-- runnerq_inputs. options holds the fired activity's execution options\n-- (priority, max_retries, timeout_seconds, retry_delay_seconds,\n-- max_retry_delay_seconds, metadata); an absent key takes the default\n-- schedules.md gives. catch_up is 'skip', 'one' or 'all'; catch_up_limit\n-- caps how many due ticks 'all' fires at once.\nCREATE TABLE IF NOT EXISTS runnerq_schedules (\n    queue_name TEXT NOT NULL,\n    name TEXT NOT NULL,\n    cron TEXT NOT NULL,\n    timezone TEXT NOT NULL DEFAULT 'UTC',\n    activity_type TEXT NOT NULL,\n    payload JSONB NOT NULL DEFAULT 'null'::jsonb,\n    serialization TEXT NOT NULL DEFAULT 'json-v1',\n    options JSONB NOT NULL DEFAULT '{}'::jsonb,\n    catch_up TEXT NOT NULL DEFAULT 'one',\n    catch_up_limit INTEGER NOT NULL DEFAULT 100,\n    paused BOOLEAN NOT NULL DEFAULT FALSE,\n    next_fire_at TIMESTAMPTZ NOT NULL,\n    last_fire_at TIMESTAMPTZ,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, name)\n);\n\n-- The due scan: WHERE queue_name = $1 AND NOT paused AND next_fire_at \u003c= NOW()\n-- ORDER BY next_fire_at. Paused schedules are left out.\nCREATE INDEX IF NOT EXISTS idx_runnerq_schedules_due\n    ON runnerq_schedules (queue_name, next_fire_at)\n    WHERE NOT paused;\n"
+  },
+  {
+    "name": "0004_code_version",
+    "sql": "-- Version pinning (versions.md). code_version is the code version an\n-- activity must run on: a root gets the enqueuing process's version, a child\n-- its root's, at insert. NULL is unstamped work, which every worker claims.\n-- Only a repin command changes it afterwards; the reaper, retries and wakes\n-- leave it as it is.\n--\n-- No index: a pinned claim filters on it during the dequeue index walk, as a\n-- multi-type claim filters on activity_type, so it stays out of every index\n-- key and predicate and a repin is a HOT update.\nALTER TABLE runnerq_activities ADD COLUMN IF NOT EXISTS code_version TEXT;\n"
   }
 ];
 /** Built in order after the migrations. */
@@ -105,6 +109,12 @@ export const postgresCatalog: Catalog = {
           "name": "activity_type",
           "type": "text",
           "nullable": false,
+          "default": null
+        },
+        {
+          "name": "code_version",
+          "type": "text",
+          "nullable": true,
           "default": null
         },
         {

@@ -85,6 +85,7 @@ const activityFields: Record<string, Field> = {
     kind: "string",
     nullable: true,
   },
+  version: { expr: "a.code_version", kind: "string", nullable: true },
 };
 
 const eventFields: Record<string, Field> = {
@@ -147,6 +148,7 @@ const canonicalEvents: Record<string, string> = {
   RunNow: RecordEvent.runNow,
   Rescheduled: RecordEvent.rescheduled,
   PriorityChanged: RecordEvent.priorityChanged,
+  Repinned: RecordEvent.repinned,
 };
 export function canonicalEvent(internal: string): string {
   return Object.hasOwn(canonicalEvents, internal)
@@ -168,7 +170,7 @@ export function queryCapabilities(): QueryCapabilities {
     activityFilters: [...Object.keys(activityFields), "metadata"].sort(),
     activitySorts: Object.keys(activitySorts).sort(),
     eventFilters: Object.keys(eventFields).sort(),
-    groupBy: ["queue", "root", "status", "type"],
+    groupBy: ["queue", "root", "status", "type", "version"],
     buckets: ["completed_at", "created_at"],
     durations: ["queue", "run", "total"],
   };
@@ -514,7 +516,7 @@ function activitySelect(inc: RecordInclude): { cols: string; joins: string } {
   let cols = `a.id, a.activity_type, a.queue_name, a.status, a.priority,
     COALESCE(a.root_activity_id, a.id) AS root_id, a.parent_activity_id, a.depth, a.idempotency_key,
     a.retry_count, a.max_retries, a.created_at, a.scheduled_at, a.started_at, a.completed_at,
-    ${updatedAtSQL} AS updated_at, a.timeout_seconds, a.lease_deadline_ms, a.current_worker_id, a.metadata,
+    ${updatedAtSQL} AS updated_at, a.timeout_seconds, a.lease_deadline_ms, a.current_worker_id, a.metadata, a.code_version,
     y.detail AS yield_detail`;
   // The latest park reason, only for waiting rows.
   let joins = ` LEFT JOIN LATERAL (
@@ -606,6 +608,7 @@ function scanRecord(r: Row, inc: RecordInclude): ActivityRecord {
     rec.leaseExpiresAt = new Date(Number(r.lease_deadline_ms));
   if (r.current_worker_id && status === "processing")
     rec.executorId = (r.current_worker_id as string).split(":")[0]!;
+  if (r.code_version) rec.version = r.code_version as string;
   if (r.metadata && typeof r.metadata === "object") {
     const metadata: Record<string, string> = {};
     for (const [k, v] of Object.entries(r.metadata))
@@ -959,6 +962,8 @@ const groupExprs: Record<string, string> = {
   type: "a.activity_type",
   queue: "a.queue_name",
   root: "CASE WHEN a.parent_activity_id IS NULL THEN 'true' ELSE 'false' END",
+  // Null for unstamped work, which leaves the key out.
+  version: "a.code_version",
 };
 const durationExprs: Record<string, string> = {
   queue:

@@ -63,6 +63,7 @@ test("spec: command fingerprints", () => {
       at: input.at,
       priority: input.priority,
       signalPayload: input.payload,
+      version: input.version,
     };
     assert.equal(commandFingerprint(command), output.fingerprint, name);
   }

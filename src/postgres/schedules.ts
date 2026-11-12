@@ -36,6 +36,7 @@ function storedOptions(s: ScheduleDefinition): Record<string, JsonValue> {
     retry_delay_seconds: 1,
     max_retry_delay_seconds: o.maxRetryDelayMs / 1000,
     metadata: { ...o.metadata },
+    ...(o.version && { code_version: o.version }),
   };
 }
 function readOptions(raw: Row | null): ActivityColumns {
@@ -47,6 +48,7 @@ function readOptions(raw: Row | null): ActivityColumns {
     retryDelaySeconds: o.retry_delay_seconds ?? 1,
     maxRetryDelaySeconds: o.max_retry_delay_seconds ?? 0,
     metadata: o.metadata ?? {},
+    codeVersion: typeof o.code_version === "string" ? o.code_version : null,
   };
 }
 interface ActivityColumns {
@@ -56,6 +58,7 @@ interface ActivityColumns {
   retryDelaySeconds: number;
   maxRetryDelaySeconds: number;
   metadata: Record<string, string>;
+  codeVersion: string | null;
 }
 
 function record(r: Row): ScheduleRecord {
@@ -73,6 +76,7 @@ function record(r: Row): ScheduleRecord {
       timeoutMs: o.timeoutSeconds * 1000,
       maxRetryDelayMs: o.maxRetryDelaySeconds * 1000,
       metadata: o.metadata,
+      ...(o.codeVersion && { version: o.codeVersion }),
     },
     catchUp: r.catch_up,
     catchUpLimit: r.catch_up_limit,
@@ -273,8 +277,8 @@ export class PostgresSchedules implements ScheduleStorage {
         ON CONFLICT DO NOTHING RETURNING activity_id),
       activity AS (
         INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,created_at,max_retries,
-          timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,root_activity_id,depth)
-        SELECT $3,$1,$4,$5,'pending',$6,$7,$8,$9,$10,$11::jsonb,$2,$3,0 FROM key RETURNING id),
+          timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,root_activity_id,depth,code_version)
+        SELECT $3,$1,$4,$5,'pending',$6,$7,$8,$9,$10,$11::jsonb,$2,$3,0,$14 FROM key RETURNING id),
       input AS (
         INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization)
         SELECT id,$1,$12::jsonb,$13 FROM activity)
@@ -294,6 +298,7 @@ export class PostgresSchedules implements ScheduleStorage {
         JSON.stringify(o.metadata),
         JSON.stringify(r.payload ?? null),
         r.serialization,
+        o.codeVersion,
       ],
     );
     const row = result.rows[0]!;

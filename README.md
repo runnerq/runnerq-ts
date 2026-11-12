@@ -251,6 +251,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 - [Schedules](docs/schedules.md): cron schedules, time zones, catch-up and management
 - [Managing work](docs/managing-work.md): the client: cancel, retry, reschedule, run now, get and list
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
+- [Version pinning](docs/versions.md): keeping in-flight work on the code that started it across a deploy; draining, stranded work, `repin`
 - [Observability](docs/observability.md): logger, labelled metrics and gauges, tracing and `runnerq/otel`
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
 - [Conductor agent](docs/conductor.md): connecting workers to a console

@@ -726,3 +726,27 @@ integration(
     );
   },
 );
+
+test("an activity reports its version, and an unstamped one none", async () => {
+  const { toActivity } = await import("../dist/conductor/queries.js");
+  const base = {
+    id: "a",
+    type: "t",
+    queue: "q",
+    status: "pending",
+    priority: 2,
+    rootId: "a",
+    depth: 0,
+    idempotencyKey: "",
+    attempt: 1,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    timeoutMs: 1000,
+    executorId: "",
+  };
+  assert.equal(toActivity({ ...base, version: "B" }).version, "B");
+  assert.equal(
+    "version" in JSON.parse(JSON.stringify(toActivity(base))),
+    false,
+  );
+});

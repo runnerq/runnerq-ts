@@ -101,6 +101,21 @@ export const metricNames = {
    */
   queueOldestPendingAge: "queue_oldest_pending_age",
   /**
+   * A gauge ({activity}): unfinished activities (pending, scheduled, running
+   * or waiting) in the queue by code version. When a version reaches 0 its
+   * workers can stop. Sampled with queue_depth, only by workers that have a
+   * version; a version that has dropped to zero is reported as 0.
+   */
+  activitiesByVersion: "activities_by_version",
+  /**
+   * A gauge ({activity}): runnable activities (due and unclaimed) pinned to a
+   * version this worker does not serve, by version, and 0 for each version it
+   * serves. A version whose minimum across the queue's workers stays above 0
+   * is served by none of them: stranded work. Sampled with queue_depth, only
+   * by workers that have a version.
+   */
+  activitiesUnserved: "activities_unserved",
+  /**
    * A gauge ({activity}): attempts running on this worker now, for every
    * activity type it serves.
    */
@@ -118,6 +133,11 @@ export const metricLabels = {
    * scheduled, running, waiting or dead_letter.
    */
   status: "status",
+  /**
+   * A code version activities are pinned to (versions.md); empty for unstamped
+   * activities.
+   */
+  version: "version",
 } as const;
 
 export type MetricName = (typeof metricNames)[keyof typeof metricNames];
@@ -286,6 +306,22 @@ export const metricCatalog: readonly MetricInfo[] = [
     labels: ["queue"],
     description:
       "How long the oldest pending (due, unclaimed) activity has been due; 0 when none is pending. Sampled with queue_depth.",
+  },
+  {
+    name: "activities_by_version",
+    kind: "gauge",
+    unit: "{activity}",
+    labels: ["queue", "version"],
+    description:
+      "Unfinished activities (pending, scheduled, running or waiting) in the queue by code version. When a version reaches 0 its workers can stop. Sampled with queue_depth, only by workers that have a version; a version that has dropped to zero is reported as 0.",
+  },
+  {
+    name: "activities_unserved",
+    kind: "gauge",
+    unit: "{activity}",
+    labels: ["queue", "version"],
+    description:
+      "Runnable activities (due and unclaimed) pinned to a version this worker does not serve, by version, and 0 for each version it serves. A version whose minimum across the queue's workers stays above 0 is served by none of them: stranded work. Sampled with queue_depth, only by workers that have a version.",
   },
   {
     name: "activities_in_flight",
