@@ -153,6 +153,23 @@ export interface Storage {
 }
 
 /**
+ * Hints that a result for an id may have been stored, in this process or another sharing the
+ * database (optional). The worker uses it to stop a handler promptly when its activity is
+ * cancelled (a cancel stores the activity's error result): on a hint it renews the claim at
+ * once instead of at the next heartbeat. Hints may be lost or spurious, so consumers recheck
+ * stored state. The returned function ends the subscription.
+ */
+export interface ResultNotifier {
+  notifyResult(id: string, onHint: () => void): () => void;
+}
+export function isResultNotifier(storage: unknown): storage is ResultNotifier {
+  return (
+    typeof (storage as Partial<ResultNotifier> | null)?.notifyResult ===
+    "function"
+  );
+}
+
+/**
  * Applies operator commands to the backend's own queue (optional). Commands are idempotent by `Command.id`: the
  * result is kept for at least 24 hours and replayed for the same id, and the same id with a
  * different `fingerprint` is a `conflict`. Per-target problems (not found, wrong state) are
@@ -231,3 +248,12 @@ export interface CommandResult {
 
 export { QueryError, RecordEvent, isQueryStorage } from "./query.js";
 export type * from "./query.js";
+
+export { isScheduleStorage } from "./schedule.js";
+export type {
+  ScheduleStorage,
+  ScheduleDefinition,
+  ScheduleRecord,
+  ScheduleExecution,
+  CatchUp,
+} from "./schedule.js";

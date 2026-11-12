@@ -26,6 +26,7 @@ import type {
   Command,
   CommandResult,
   CommandStorage,
+  ResultNotifier,
 } from "../storage.js";
 import {
   catalog,
@@ -54,6 +55,12 @@ import type {
 } from "../query.js";
 import { Notifications } from "./notifications.js";
 import { PostgresCommands } from "./command.js";
+import { PostgresSchedules } from "./schedules.js";
+import type {
+  ScheduleDefinition,
+  ScheduleRecord,
+  ScheduleStorage,
+} from "../schedule.js";
 import {
   deleteTree,
   expiredRootSQL,
@@ -92,6 +99,15 @@ function poolConfig(config: Omit<PostgresConfig, "queue">): PoolConfig {
     application_name: "runnerq-ts",
     idle_in_transaction_session_timeout: 10_000,
   };
+}
+// pg emits a lost connection as an 'error' event on a checked-out client
+// (pg-pool listens only while it is idle), and an unheard 'error' event ends
+// the process. The client's pending and next queries reject anyway, so the
+// event needs no handling of its own.
+function newPool(config: Omit<PostgresConfig, "queue">): Pool {
+  const pool = new Pool(poolConfig(config));
+  pool.on("connect", (client) => client.on("error", () => {}));
+  return pool;
 }
 const initializeHint = "run PostgresStorage.initialize to bring it up to date";
 const inlinePayloads = () =>
@@ -251,7 +267,12 @@ async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
 
 export class PostgresStorage
   extends EventEmitter<{ storageError: [error: Error] }>
-  implements Storage, QueryStorage, CommandStorage
+  implements
+    Storage,
+    QueryStorage,
+    CommandStorage,
+    ResultNotifier,
+    ScheduleStorage
 {
   readonly queue: string;
   private readonly pool: Pool;
@@ -261,10 +282,11 @@ export class PostgresStorage
     this.query(sql, values),
   );
   private readonly commands: PostgresCommands;
+  private readonly schedules: PostgresSchedules;
   private constructor(config: PostgresConfig) {
     super();
     this.queue = config.queue;
-    this.pool = new Pool(poolConfig(config));
+    this.pool = newPool(config);
     this.pool.on("error", (error) => {
       for (const listener of this.rawListeners("storageError")) {
         try {
@@ -291,6 +313,12 @@ export class PostgresStorage
         if (work) this.notifications.hint("work");
       },
     });
+    this.schedules = new PostgresSchedules({
+      queue: this.queue,
+      query: (sql, values) => this.query(sql, values),
+      tx: (body) => this.tx(body),
+      work: () => this.notifications.hint("work"),
+    });
   }
   /**
    * Creates the schema in an empty database, or brings an existing one up to date, as
@@ -299,7 +327,7 @@ export class PostgresStorage
   static async initialize(
     config: Omit<PostgresConfig, "queue">,
   ): Promise<void> {
-    const pool = new Pool(poolConfig(config));
+    const pool = newPool(config);
     try {
       const client = await pool.connect();
       try {
@@ -864,6 +892,9 @@ export class PostgresStorage
       sub.close();
     }
   }
+  notifyResult(id: string, onHint: () => void): () => void {
+    return this.notifications.watch(`result:${id}`, onHint);
+  }
   async waitForWork(signal: AbortSignal, timeoutMs = 2_000): Promise<void> {
     const sub = this.notifications.subscribe("work", signal);
     try {
@@ -1261,6 +1292,30 @@ export class PostgresStorage
     return this.queries.tree(activityId, include, maxNodes);
   }
   /** Applies a command to this storage's queue; see `CommandStorage`. */
+  upsertSchedule(schedule: ScheduleDefinition): Promise<void> {
+    return this.schedules.upsertSchedule(schedule);
+  }
+  getSchedule(name: string): Promise<ScheduleRecord> {
+    return this.schedules.getSchedule(name);
+  }
+  listSchedules(): Promise<ScheduleRecord[]> {
+    return this.schedules.listSchedules();
+  }
+  pauseSchedule(name: string): Promise<void> {
+    return this.schedules.pauseSchedule(name);
+  }
+  resumeSchedule(name: string): Promise<void> {
+    return this.schedules.resumeSchedule(name);
+  }
+  deleteSchedule(name: string): Promise<void> {
+    return this.schedules.deleteSchedule(name);
+  }
+  triggerSchedule(name: string): Promise<string> {
+    return this.schedules.triggerSchedule(name);
+  }
+  fireSchedules(limit: number): Promise<number> {
+    return this.schedules.fireSchedules(limit);
+  }
   applyCommand(command: Command): Promise<CommandResult> {
     return this.commands.apply(command);
   }

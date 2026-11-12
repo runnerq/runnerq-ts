@@ -16,14 +16,14 @@ stopped instead of redoing completed work.
 ## Install
 
 Node.js 22 or later, an ESM application, and PostgreSQL are required.
-PostgreSQL 17 and 18 are covered by CI. The package ships compiled JavaScript
+PostgreSQL 14 to 18 are covered by CI. The package ships compiled JavaScript
 and TypeScript declarations.
 
-`runnerq` isn't on npm yet. Install it from GitHub:
-
 ```bash
-npm install github:runnerq/runnerq-ts
+npm install runnerq
 ```
+
+The package is on npm from v0.6.0.
 
 ## Quick start
 
@@ -181,6 +181,24 @@ Priorities, retries with exponential backoff, timeouts, delayed starts, a dead-l
 </details>
 
 <details>
+<summary><strong>Cron schedules</strong></summary>
+
+Declare a schedule on the worker and every worker of the queue fires it, once per tick, in any IANA time zone and across daylight-saving changes. Pause, resume, trigger and list schedules from any process with `client.schedules`.
+
+```ts
+worker.registerSchedule({
+  name: "nightly-report",
+  cron: "30 2 * * *",
+  timezone: "Europe/London",
+  activity: NightlyReport,
+});
+```
+
+See [Schedules](docs/schedules.md).
+
+</details>
+
+<details>
 <summary><strong>Rich types</strong></summary>
 
 Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by default, including after a restart. Use `serialization: "portable"` for plain-JSON contracts another SDK can read. See [Serialization](docs/serialization.md).
@@ -191,6 +209,18 @@ Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by defa
 <summary><strong>Pluggable storage</strong></summary>
 
 `PostgresStorage` is built in, and `runnerq/storage` exports the contract for custom backends.
+
+</details>
+
+<details>
+<summary><strong>Manage work from code</strong></summary>
+
+`RunnerQClient` needs no worker. Next to `execute`, `signal` and `result` it lists activities and cancels, retries, reschedules, runs now, reprioritises or deletes them. A cancel aborts a running handler's `ctx.signal` on whichever worker holds it. Every command is idempotent by command id. See [Managing work](docs/managing-work.md).
+
+```ts
+await client.cancel(id, { reason: "customer asked" });
+await client.retry(failedId, { resetAttempts: true });
+```
 
 </details>
 
@@ -212,12 +242,16 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 | 03  | [fan-out](examples/03-fan-out/)                      | children and a durable join with one execution slot                        |
 | 04  | [signals-and-sleep](examples/04-signals-and-sleep/)  | buffered signals, persisted deadlines, a durable timer                     |
 | 06  | [multiple-files](examples/06-multiple-files/)        | definitions, handlers, worker and producer in separate files               |
+| 07  | [cron-schedules](examples/07-cron-schedules/main.ts) | a cron schedule fired once per tick across workers                         |
 
 ## Documentation
 
 - [Activities](docs/activities.md): contracts, options, retries and recorded failures
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
+- [Schedules](docs/schedules.md): cron schedules, time zones, catch-up and management
+- [Managing work](docs/managing-work.md): the client: cancel, retry, reschedule, run now, get and list
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
+- [Observability](docs/observability.md): logger, labelled metrics and gauges, tracing and `runnerq/otel`
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
 - [Conductor agent](docs/conductor.md): connecting workers to a console
 - [Architecture and guarantees](docs/architecture.md): transactions, recovery and replay limitations
@@ -229,6 +263,7 @@ npm ci
 npm test                  # Build, type tests, unit tests; database tests skip without DSN
 RUNNERQ_TEST_DSN=postgres://postgres:runnerq@localhost:5432/runnerq npm test
 npm run test:integration  # Requires RUNNERQ_TEST_DSN; never silently skips
+npm run test:upgrade      # Previous version parks work, this one finishes it (RUNNERQ_TEST_DSN)
 # runnerq-spec's cross-language scenarios, through test/conformance-driver.mjs (needs Go):
 go run -C spec/tools/conformance . -dsn "$RUNNERQ_TEST_DSN" -driver ts="node $PWD/test/conformance-driver.mjs"
 npm run format:check

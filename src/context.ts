@@ -16,10 +16,17 @@ import {
   guard,
   suspend,
   track,
+  Suspension,
   type AttemptScope,
 } from "./scope.js";
 import { encode, decode, type SerializedValue } from "./serialization.js";
 import { linkSignal, pause } from "./async.js";
+import { startSpan, type TraceSpan } from "./observability.js";
+import {
+  spanAttributes as attr,
+  spanNames,
+  spanOutcomes,
+} from "./observability-spec.js";
 import type { StoredResult } from "./storage.js";
 
 export interface StepContext {
@@ -90,14 +97,19 @@ export class ActivityContext {
         guard(s);
         let data: SerializedValue;
         let decoded: T;
+        const span = this.span(spanNames.step, { [attr.stepName]: name });
         try {
-          const value = await executionScope.run({ ...s, inStep: true }, () =>
-            fn({ signal: s.signal }),
-          );
+          const step = () =>
+            executionScope.run({ ...s, inStep: true }, () =>
+              fn({ signal: s.signal }),
+            );
+          const value = await (span ? span.run(step) : step());
           guard(s, false);
           data = encode(value);
           decoded = parse(decode(data), options.parse, `step ${name}`);
+          span?.end(spanOutcomes.ok);
         } catch (error) {
+          span?.end(spanOutcomes.error, error);
           if (
             !retryable(error) &&
             !s.signal.aborted &&
@@ -150,30 +162,52 @@ export class ActivityContext {
         integer(durationMs, "sleep duration", 0, 8_000_000_000_000);
         const s = this.scope,
           id = this.named("sleep", name);
-        let stored = await s.recover(() => s.storage.getResult(id));
-        if (!stored) {
-          stored = {
-            state: "Ok",
-            serialization: "json-v1",
-            data: { wake_at: new Date(Date.now() + durationMs).toISOString() },
-          };
-          const value = stored;
-          await s.recover(
-            () => s.storage.checkpoint(s.fence, id, value, `sleep:${name}`),
-            true,
-          );
+        const span = this.span(spanNames.sleep, { [attr.stepName]: name });
+        let wakeAt = "";
+        try {
+          await this.sleepFor(s, id, name, durationMs, (at) => (wakeAt = at));
+          span?.end(spanOutcomes.elapsed, undefined, { [attr.wakeAt]: wakeAt });
+        } catch (error) {
+          if (error instanceof Suspension)
+            span?.end(spanOutcomes.parked, undefined, {
+              [attr.wakeAt]: wakeAt,
+            });
+          else span?.end(spanOutcomes.error, error);
+          throw error;
         }
-        const wake = timestamp(decode(stored), "wake_at");
-        if (wake <= Date.now()) return;
-        if (wake > this.budget())
-          suspend(s, {
-            kind: "sleep",
-            step: name,
-            wakeAt: new Date(wake).toISOString(),
-          });
-        await pause(wake - Date.now(), s.signal);
       }),
     );
+  }
+  private async sleepFor(
+    s: AttemptScope,
+    id: string,
+    name: string,
+    durationMs: number,
+    reached: (wakeAt: string) => void,
+  ): Promise<void> {
+    let stored = await s.recover(() => s.storage.getResult(id));
+    if (!stored) {
+      stored = {
+        state: "Ok",
+        serialization: "json-v1",
+        data: { wake_at: new Date(Date.now() + durationMs).toISOString() },
+      };
+      const value = stored;
+      await s.recover(
+        () => s.storage.checkpoint(s.fence, id, value, `sleep:${name}`),
+        true,
+      );
+    }
+    const wake = timestamp(decode(stored), "wake_at");
+    reached(new Date(wake).toISOString());
+    if (wake <= Date.now()) return;
+    if (wake > this.budget())
+      suspend(s, {
+        kind: "sleep",
+        step: name,
+        wakeAt: new Date(wake).toISOString(),
+      });
+    await pause(wake - Date.now(), s.signal);
   }
   waitForSignal<T = unknown>(
     name: string,
@@ -181,71 +215,92 @@ export class ActivityContext {
   ): Promise<T> {
     return track(this.scope, () =>
       this.exclusiveWait(async () => {
-        const timeout = integer(
-          options.timeoutMs ?? 0,
-          "signal timeout",
-          0,
-          8_000_000_000_000,
-        );
-        const s = this.scope,
-          waitId = this.named("signalwait", name),
-          resultId = checkpointId(this.activityId, "signal", name);
-        let checkpoint = await s.recover(() => s.storage.getResult(waitId));
-        if (!checkpoint) {
-          checkpoint = {
-            state: "Ok",
-            serialization: "json-v1",
-            data: {
-              deadline: timeout
-                ? new Date(Date.now() + timeout).toISOString()
-                : null,
-            },
-          };
-          const value = checkpoint;
-          await s.recover(
-            () => s.storage.checkpoint(s.fence, waitId, value, ""),
-            true,
+        const span = this.span(spanNames.signalWait, {
+          [attr.signalName]: name,
+        });
+        try {
+          const value = await this.signalFor<T>(name, options);
+          span?.end(spanOutcomes.received);
+          return value;
+        } catch (error) {
+          span?.end(
+            error instanceof Suspension
+              ? spanOutcomes.parked
+              : error instanceof SignalTimeoutError
+                ? spanOutcomes.timeout
+                : spanOutcomes.error,
+            error instanceof Suspension ? undefined : error,
           );
-        }
-        const deadline = timestamp(decode(checkpoint), "deadline", true);
-        for (;;) {
-          const ready = await s.recover(() => s.storage.getResult(resultId));
-          if (ready)
-            return parse(decode(ready), options.parse, `signal ${name}`);
-          if (deadline <= Date.now()) {
-            const last = await s.recover(() => s.storage.getResult(resultId));
-            if (last)
-              return parse(decode(last), options.parse, `signal ${name}`);
-            throw new SignalTimeoutError(name);
-          }
-          if (deadline > this.budget())
-            suspend(s, {
-              kind: "signal",
-              step: name,
-              resultId,
-              wakeAt: new Date(
-                Math.min(deadline, Date.now() + 60_000),
-              ).toISOString(),
-            });
-          const { signal, done } = linkSignal(
-            [s.signal],
-            Math.max(1, Math.ceil(deadline - Date.now())),
-          );
-          try {
-            const result = await s.recover(
-              () => s.storage.waitResult(resultId, signal),
-              false,
-              signal,
-            );
-            return parse(decode(result), options.parse, `signal ${name}`);
-          } catch (error) {
-            if (!signal.aborted || s.signal.aborted) throw error;
-          } finally {
-            done();
-          }
+          throw error;
         }
       }),
     );
+  }
+  private async signalFor<T>(
+    name: string,
+    options: { timeoutMs?: number; parse?: Parser<T> },
+  ): Promise<T> {
+    const timeout = integer(
+      options.timeoutMs ?? 0,
+      "signal timeout",
+      0,
+      8_000_000_000_000,
+    );
+    const s = this.scope,
+      waitId = this.named("signalwait", name),
+      resultId = checkpointId(this.activityId, "signal", name);
+    let checkpoint = await s.recover(() => s.storage.getResult(waitId));
+    if (!checkpoint) {
+      checkpoint = {
+        state: "Ok",
+        serialization: "json-v1",
+        data: {
+          deadline: timeout
+            ? new Date(Date.now() + timeout).toISOString()
+            : null,
+        },
+      };
+      const value = checkpoint;
+      await s.recover(
+        () => s.storage.checkpoint(s.fence, waitId, value, ""),
+        true,
+      );
+    }
+    const deadline = timestamp(decode(checkpoint), "deadline", true);
+    for (;;) {
+      const ready = await s.recover(() => s.storage.getResult(resultId));
+      if (ready) return parse(decode(ready), options.parse, `signal ${name}`);
+      if (deadline <= Date.now()) {
+        const last = await s.recover(() => s.storage.getResult(resultId));
+        if (last) return parse(decode(last), options.parse, `signal ${name}`);
+        throw new SignalTimeoutError(name);
+      }
+      if (deadline > this.budget())
+        suspend(s, {
+          kind: "signal",
+          step: name,
+          resultId,
+          wakeAt: new Date(
+            Math.min(deadline, Date.now() + 60_000),
+          ).toISOString(),
+        });
+      const { signal, done } = linkSignal(
+        [s.signal],
+        Math.max(1, Math.ceil(deadline - Date.now())),
+      );
+      try {
+        const result = await s.recover(
+          () => s.storage.waitResult(resultId, signal),
+          false,
+          signal,
+        );
+        return parse(decode(result), options.parse, `signal ${name}`);
+      } catch (error) {
+        if (!signal.aborted || s.signal.aborted) throw error;
+      } finally {
+        done();
+      }
+    }
   }
   spawn<I, O>(
     definition: ActivityDefinition<I, O>,
@@ -319,6 +374,16 @@ export class ActivityContext {
         wakeAt: new Date(Date.now() + 60_000).toISOString(),
       });
     });
+  }
+  /** Starts a span under the attempt's when the worker has a tracer. */
+  private span(
+    name: string,
+    attributes: Record<string, string>,
+  ): TraceSpan | undefined {
+    return startSpan(this.scope.tracer, name, this.scope.span, () => ({
+      [attr.activityId]: this.activityId,
+      ...attributes,
+    }));
   }
   private budget(): number {
     const left = Math.max(0, this.scope.deadline - Date.now());

@@ -20,4 +20,6 @@ On Node releases where type stripping is enabled by default, the flag is optiona
 
 - `06-multiple-files`: the layout for a real app. `activities.ts` holds the definitions, `handlers.ts` the handlers, `worker.ts` registers and runs them, and `producer.ts` submits work importing only the definitions. Run `worker.ts`, then `producer.ts` in another terminal.
 
+- `07-cron-schedules`: a schedule declared on the worker, fired every 10 seconds. Start it in two terminals: each heartbeat runs in exactly one.
+
 The examples simulate external effects with console output. Real effects must use provider idempotency keys where possible: a crash between an effect and its checkpoint commit can repeat the effect.
