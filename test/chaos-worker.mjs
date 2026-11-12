@@ -1,5 +1,5 @@
 // runnerq-spec's chaos worker (spec/tools/chaos/README.md). "work" runs a
-// Worker serving <prefix>.flow; "client" enqueues roots and delivers signals
+// Worker serving <prefix>.flow and <prefix>.limited; "client" enqueues roots and delivers signals
 // for the harness, one JSON request per stdin line.
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
@@ -90,7 +90,7 @@ async function work() {
     return nonce;
   };
 
-  worker.register(definition(`${prefix}.flow`), async (ctx, input) => {
+  const flow = async (ctx, input) => {
     if (!input || !Array.isArray(input.steps))
       throw new NonRetryableError("bad payload");
     await ledger.query(
@@ -124,6 +124,10 @@ async function work() {
     }
     await runSteps(input.after);
     return out;
+  };
+  worker.register(definition(`${prefix}.flow`), flow);
+  worker.register(definition(`${prefix}.limited`), flow, {
+    maxConcurrent: positive(env.RUNNERQ_CHAOS_LIMIT, 2),
   });
 
   await worker.start();

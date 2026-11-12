@@ -199,6 +199,23 @@ See [Schedules](docs/schedules.md).
 </details>
 
 <details>
+<summary><strong>Concurrency and rate limits</strong></summary>
+
+Cap a type fleet-wide where you register it: how many run at once, how many start per second, or both. Limits live in the database, so every worker sees one value, and `client.limits` changes them at runtime.
+
+```ts
+worker.register(sendEmail, handler, {
+  maxConcurrent: 10,
+  rateLimit: 5,
+  ratePeriodMs: 1000,
+});
+```
+
+See [Limits](docs/limits.md).
+
+</details>
+
+<details>
 <summary><strong>Rich types</strong></summary>
 
 Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by default, including after a restart. Use `serialization: "portable"` for plain-JSON contracts another SDK can read. See [Serialization](docs/serialization.md).
@@ -249,6 +266,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 - [Activities](docs/activities.md): contracts, options, retries and recorded failures
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
 - [Schedules](docs/schedules.md): cron schedules, time zones, catch-up and management
+- [Limits](docs/limits.md): concurrency and rate limits per activity type
 - [Managing work](docs/managing-work.md): the client: cancel, retry, reschedule, run now, get and list
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
 - [Observability](docs/observability.md): logger, labelled metrics and gauges, tracing and `runnerq/otel`
