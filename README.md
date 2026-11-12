@@ -195,6 +195,18 @@ Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by defa
 </details>
 
 <details>
+<summary><strong>Manage work from code</strong></summary>
+
+`RunnerQClient` needs no worker. Next to `execute`, `signal` and `result` it lists activities and cancels, retries, reschedules, runs now, reprioritises or deletes them. A cancel aborts a running handler's `ctx.signal` on whichever worker holds it. Every command is idempotent by command id. See [Managing work](docs/managing-work.md).
+
+```ts
+await client.cancel(id, { reason: "customer asked" });
+await client.retry(failedId, { resetAttempts: true });
+```
+
+</details>
+
+<details>
 <summary><strong>A console for your workers</strong></summary>
 
 The conductor agent (`runnerq/conductor`) connects a worker to a console that can query and, if you allow it, control its activities. `metadataOnly: true` keeps payloads and results in your process. See [Conductor agent](docs/conductor.md).
@@ -217,6 +229,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 
 - [Activities](docs/activities.md): contracts, options, retries and recorded failures
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
+- [Managing work](docs/managing-work.md): the client: cancel, retry, reschedule, run now, get and list
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
 - [Observability](docs/observability.md): logger, labelled metrics and gauges, tracing and `runnerq/otel`
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema

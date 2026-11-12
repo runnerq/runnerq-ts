@@ -109,6 +109,12 @@ export class Notifications {
       )
       .catch(() => {});
   }
+  /** Calls `listener` on every hint for `name` until the returned function is called. */
+  watch(name: string, listener: () => void): () => void {
+    this.listening ??= this.listen();
+    this.bus.on(name, listener);
+    return () => this.bus.off(name, listener);
+  }
   subscribe(
     name: string,
     signal?: AbortSignal,

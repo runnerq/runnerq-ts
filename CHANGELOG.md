@@ -29,6 +29,14 @@ Go SDK's next release.
   default), and a `Tracer` option on `Worker` and `RunnerQClient` that
   carries the W3C `traceparent` in activity metadata. OpenTelemetry is the
   `runnerq/otel` export, with `@opentelemetry/api` as an optional peer.
+- Managing work from code: `RunnerQClient` cancels, retries, reschedules,
+  runs now, reprioritizes and deletes activities (by id, ids or a filter),
+  and reads them (`get`, `list`), idempotent by command id. Cancelling a
+  running activity aborts its handler's `ctx.signal` (`claim_lost`) on
+  whichever worker holds it and cascades to children by default;
+  `isCancelled(error)` recognizes an awaited activity that was cancelled.
+  Command fingerprints follow runnerq-spec, so a mixed Go/TypeScript fleet
+  replays each other's commands.
 
 ### Breaking
 

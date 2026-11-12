@@ -26,6 +26,7 @@ import type {
   Command,
   CommandResult,
   CommandStorage,
+  ResultNotifier,
 } from "../storage.js";
 import {
   catalog,
@@ -260,7 +261,7 @@ async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
 
 export class PostgresStorage
   extends EventEmitter<{ storageError: [error: Error] }>
-  implements Storage, QueryStorage, CommandStorage
+  implements Storage, QueryStorage, CommandStorage, ResultNotifier
 {
   readonly queue: string;
   private readonly pool: Pool;
@@ -872,6 +873,9 @@ export class PostgresStorage
     } finally {
       sub.close();
     }
+  }
+  notifyResult(id: string, onHint: () => void): () => void {
+    return this.notifications.watch(`result:${id}`, onHint);
   }
   async waitForWork(signal: AbortSignal, timeoutMs = 2_000): Promise<void> {
     const sub = this.notifications.subscribe("work", signal);

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { RunnerQError } from "./errors.js";
 import { businessKeyPrefix, stepKeyPrefix } from "./spec.js";
+import type { Command } from "./storage.js";
+import type { QueryFilter } from "./query.js";
 
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -118,4 +120,53 @@ export function businessKey(key: string, type: string): string {
 /** The idempotency key of the activity a step spawns under `parent` in `root`'s tree. */
 export function stepKey(root: string, parent: string, step: string): string {
   return `${stepKeyPrefix}${root}:${parent}:${step}`;
+}
+
+/**
+ * A command's canonical fingerprint (runnerq-spec vectors/command_fingerprint.json): the
+ * SHA-256 of a canonical JSON form of its input, without its id. The client sets
+ * `Command.fingerprint` to it, so a command id repeated with the same input replays from the
+ * shared ledger whichever SDK sent it.
+ */
+export function commandFingerprint(cmd: Command): string {
+  const m: Record<string, unknown> = { kind: cmd.kind };
+  const t = cmd.target ?? {};
+  if (t.ids?.length) m.ids = t.ids.map((id) => id.toLowerCase());
+  if (t.filter) m.filter = fingerprintFilter(t.filter);
+  if (t.max) m.max = t.max;
+  if (cmd.dryRun) m.dry_run = true;
+  if (cmd.cascadeChildren) m.cascade = true;
+  if (cmd.resetAttempts) m.reset_attempts = true;
+  if (cmd.reason) m.reason = cmd.reason;
+  if (cmd.signalName) m.name = cmd.signalName;
+  if (cmd.at !== undefined) {
+    const at = cmd.at instanceof Date ? cmd.at : new Date(cmd.at);
+    if (!Number.isNaN(at.getTime())) m.at = at.toISOString();
+  }
+  if (cmd.priority) m.priority = cmd.priority;
+  if (cmd.signalPayload !== undefined && cmd.signalPayload !== null)
+    m.payload = cmd.signalPayload;
+  return createHash("sha256").update(canonicalJson(m)).digest("hex");
+}
+function fingerprintFilter(f: QueryFilter): Record<string, unknown> {
+  const m: Record<string, unknown> = {};
+  if (f.and?.length) m.and = f.and.map(fingerprintFilter);
+  if (f.or?.length) m.or = f.or.map(fingerprintFilter);
+  if (f.not) m.not = fingerprintFilter(f.not);
+  if (f.field) m.field = f.field;
+  if (f.op) m.op = f.op;
+  if (f.value !== undefined && f.value !== null) m.value = f.value;
+  return m;
+}
+/** Sorted keys (code point order), no whitespace; JSON.stringify's strings and numbers. */
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v instanceof Date) return JSON.stringify(v);
+  const obj = v as Record<string, unknown>;
+  return `{${Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`)
+    .join(",")}}`;
 }

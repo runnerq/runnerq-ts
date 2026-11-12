@@ -1,7 +1,18 @@
 export { activity } from "./activity.js";
 export type { ActivityDefinition, Parser } from "./activity.js";
 export { RunnerQClient, ActivityHandle } from "./client.js";
-export type { ResultOptions, ChildActivityHandle } from "./client.js";
+export type {
+  ResultOptions,
+  ChildActivityHandle,
+  Target,
+  CommandOptions,
+  CancelOptions,
+  RetryOptions,
+  CommandOutcome,
+  CommandItem,
+  CommandResult,
+  ListActivitiesOptions,
+} from "./client.js";
 export { ActivityContext } from "./context.js";
 export type { StepContext } from "./context.js";
 export { Worker } from "./worker.js";
@@ -61,6 +72,7 @@ export {
   SignalTimeoutError,
   ActivityFailedError,
   RecordedError,
+  isCancelled,
 } from "./errors.js";
 export { isControlFlow } from "./scope.js";
 export type { JsonValue } from "./codec.js";
