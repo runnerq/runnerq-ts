@@ -5,9 +5,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      # Every Node version on the newest Postgres, every supported Postgres on the oldest Node.
       matrix:
         node: [22, 24, 26]
-        postgres: [17, 18]
+        postgres: [18]
+        include:
+          - { node: 22, postgres: 14 }
+          - { node: 22, postgres: 15 }
+          - { node: 22, postgres: 16 }
+          - { node: 22, postgres: 17 }
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -34,6 +40,36 @@ jobs:
       - run: npm run format:check
       - run: npm test
         timeout-minutes: 3
+  upgrade:
+    # The previous SDK version creates the schema and parks work; this one must
+    # migrate it and finish all of it. See test/upgrade/run.mjs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: runnerq
+          POSTGRES_DB: runnerq_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d runnerq_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0 # the previous version is built from history
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test:upgrade
+        env:
+          RUNNERQ_TEST_DSN: postgres://postgres:runnerq@localhost:5432/runnerq_test
   package:
     # What `npm publish` would upload. The version is replaced by a throwaway
     # prerelease so the dry run doesn't fail once package.json's version is on npm.

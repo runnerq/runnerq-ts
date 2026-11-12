@@ -52,6 +52,7 @@
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "npm run build && npm run typecheck && node --test test/*.test.mjs",
     "test:integration": "npm run build && npm run typecheck && node scripts/test-integration.mjs",
+    "test:upgrade": "npm run build && node test/upgrade/run.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "spec:gen": "go run -C spec ./tools/gen -lang ts -out ../src/spec.ts && go run -C spec ./tools/gen -lang ts -part schema -out ../src/spec-schema.ts && go run -C spec ./tools/gen -part conductor -lang ts -out ../src/conductor/protocol.ts && go run -C spec ./tools/gen -part conductor -lang ts-specs -spec-import ./decode.js -out ../src/conductor/specs.ts",

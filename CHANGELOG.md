@@ -18,6 +18,10 @@ Go SDK's next release.
   made from the changelog plus label-generated notes, as in the Go SDK.
 - Security checks in CI (`npm audit` on runtime dependencies, CodeQL),
   Dependabot, and `SECURITY.md` with private vulnerability reporting.
+- An upgrade test in CI: the previous version creates the schema and parks
+  work (a sleep, a signal wait, a parent waiting on a child, a delayed
+  start); this version migrates the database and must finish it, running
+  each remaining step once. CI also covers PostgreSQL 14 to 18.
 
 ### Breaking
 

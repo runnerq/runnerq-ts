@@ -161,3 +161,7 @@ token: do step 4, then push the tag.
 2. Tag the Go SDK at the same version if it isn't already.
 3. Announce the release; the GitHub release URL is
    `https://github.com/runnerq/runnerq-ts/releases/tag/vX.Y.Z`.
+
+The upgrade test (`npm run test:upgrade`, the `upgrade` CI job) upgrades
+from the newest `v*` tag before `HEAD`, so from the next PR on it starts from
+this release.
