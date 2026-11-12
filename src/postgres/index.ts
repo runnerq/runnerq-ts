@@ -55,6 +55,12 @@ import type {
 } from "../query.js";
 import { Notifications } from "./notifications.js";
 import { PostgresCommands } from "./command.js";
+import { PostgresSchedules } from "./schedules.js";
+import type {
+  ScheduleDefinition,
+  ScheduleRecord,
+  ScheduleStorage,
+} from "../schedule.js";
 import {
   deleteTree,
   expiredRootSQL,
@@ -261,7 +267,12 @@ async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
 
 export class PostgresStorage
   extends EventEmitter<{ storageError: [error: Error] }>
-  implements Storage, QueryStorage, CommandStorage, ResultNotifier
+  implements
+    Storage,
+    QueryStorage,
+    CommandStorage,
+    ResultNotifier,
+    ScheduleStorage
 {
   readonly queue: string;
   private readonly pool: Pool;
@@ -271,6 +282,7 @@ export class PostgresStorage
     this.query(sql, values),
   );
   private readonly commands: PostgresCommands;
+  private readonly schedules: PostgresSchedules;
   private constructor(config: PostgresConfig) {
     super();
     this.queue = config.queue;
@@ -300,6 +312,12 @@ export class PostgresStorage
         for (const id of results) this.notifications.hint("result", id);
         if (work) this.notifications.hint("work");
       },
+    });
+    this.schedules = new PostgresSchedules({
+      queue: this.queue,
+      query: (sql, values) => this.query(sql, values),
+      tx: (body) => this.tx(body),
+      work: () => this.notifications.hint("work"),
     });
   }
   /**
@@ -1274,6 +1292,30 @@ export class PostgresStorage
     return this.queries.tree(activityId, include, maxNodes);
   }
   /** Applies a command to this storage's queue; see `CommandStorage`. */
+  upsertSchedule(schedule: ScheduleDefinition): Promise<void> {
+    return this.schedules.upsertSchedule(schedule);
+  }
+  getSchedule(name: string): Promise<ScheduleRecord> {
+    return this.schedules.getSchedule(name);
+  }
+  listSchedules(): Promise<ScheduleRecord[]> {
+    return this.schedules.listSchedules();
+  }
+  pauseSchedule(name: string): Promise<void> {
+    return this.schedules.pauseSchedule(name);
+  }
+  resumeSchedule(name: string): Promise<void> {
+    return this.schedules.resumeSchedule(name);
+  }
+  deleteSchedule(name: string): Promise<void> {
+    return this.schedules.deleteSchedule(name);
+  }
+  triggerSchedule(name: string): Promise<string> {
+    return this.schedules.triggerSchedule(name);
+  }
+  fireSchedules(limit: number): Promise<number> {
+    return this.schedules.fireSchedules(limit);
+  }
   applyCommand(command: Command): Promise<CommandResult> {
     return this.commands.apply(command);
   }

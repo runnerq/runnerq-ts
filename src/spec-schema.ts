@@ -37,6 +37,10 @@ export const postgresMigrations: readonly PostgresMigration[] = [
   {
     "name": "0002_drop_worker_pools",
     "sql": "-- runnerq_worker_pools held a row per engine for a capacity report nothing\n-- reads any more.\nDROP TABLE IF EXISTS runnerq_worker_pools;\n"
+  },
+  {
+    "name": "0003_schedules",
+    "sql": "-- Cron schedules (schedules.md). A schedule belongs to a queue and is named\n-- within it. Workers fire due schedules: in one transaction each claims the\n-- row (FOR UPDATE SKIP LOCKED), enqueues an activity per fire time with the\n-- idempotency key schedule:\u003cname\u003e:\u003cfire time\u003e, and advances next_fire_at, so\n-- a tick fires once however many workers race for it.\n--\n-- payload and serialization are the fired activity's input, as in\n-- runnerq_inputs. options holds the fired activity's execution options\n-- (priority, max_retries, timeout_seconds, retry_delay_seconds,\n-- max_retry_delay_seconds, metadata); an absent key takes the default\n-- schedules.md gives. catch_up is 'skip', 'one' or 'all'; catch_up_limit\n-- caps how many due ticks 'all' fires at once.\nCREATE TABLE IF NOT EXISTS runnerq_schedules (\n    queue_name TEXT NOT NULL,\n    name TEXT NOT NULL,\n    cron TEXT NOT NULL,\n    timezone TEXT NOT NULL DEFAULT 'UTC',\n    activity_type TEXT NOT NULL,\n    payload JSONB NOT NULL DEFAULT 'null'::jsonb,\n    serialization TEXT NOT NULL DEFAULT 'json-v1',\n    options JSONB NOT NULL DEFAULT '{}'::jsonb,\n    catch_up TEXT NOT NULL DEFAULT 'one',\n    catch_up_limit INTEGER NOT NULL DEFAULT 100,\n    paused BOOLEAN NOT NULL DEFAULT FALSE,\n    next_fire_at TIMESTAMPTZ NOT NULL,\n    last_fire_at TIMESTAMPTZ,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, name)\n);\n\n-- The due scan: WHERE queue_name = $1 AND NOT paused AND next_fire_at \u003c= NOW()\n-- ORDER BY next_fire_at. Paused schedules are left out.\nCREATE INDEX IF NOT EXISTS idx_runnerq_schedules_due\n    ON runnerq_schedules (queue_name, next_fire_at)\n    WHERE NOT paused;\n"
   }
 ];
 /** Built in order after the migrations. */
@@ -513,6 +517,105 @@ export const postgresCatalog: Catalog = {
       "primary_key": [
         "activity_id"
       ]
+    },
+    {
+      "name": "runnerq_schedules",
+      "columns": [
+        {
+          "name": "activity_type",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "catch_up",
+          "type": "text",
+          "nullable": false,
+          "default": "'one'::text"
+        },
+        {
+          "name": "catch_up_limit",
+          "type": "int4",
+          "nullable": false,
+          "default": "100"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        },
+        {
+          "name": "cron",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "last_fire_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "next_fire_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "options",
+          "type": "jsonb",
+          "nullable": false,
+          "default": "'{}'::jsonb"
+        },
+        {
+          "name": "paused",
+          "type": "bool",
+          "nullable": false,
+          "default": "false"
+        },
+        {
+          "name": "payload",
+          "type": "jsonb",
+          "nullable": false,
+          "default": "'null'::jsonb"
+        },
+        {
+          "name": "queue_name",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "serialization",
+          "type": "text",
+          "nullable": false,
+          "default": "'json-v1'::text"
+        },
+        {
+          "name": "timezone",
+          "type": "text",
+          "nullable": false,
+          "default": "'UTC'::text"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        }
+      ],
+      "primary_key": [
+        "queue_name",
+        "name"
+      ]
     }
   ],
   "indexes": [
@@ -580,6 +683,11 @@ export const postgresCatalog: Catalog = {
       "name": "idx_runnerq_root_terminal",
       "table": "runnerq_activities",
       "definition": "CREATE INDEX idx_runnerq_root_terminal ON runnerq_activities USING btree (queue_name, status, completed_at) WHERE ((parent_activity_id IS NULL) AND (status = ANY (ARRAY['completed'::text, 'failed'::text, 'dead_letter'::text, 'cancelled'::text])))"
+    },
+    {
+      "name": "idx_runnerq_schedules_due",
+      "table": "runnerq_schedules",
+      "definition": "CREATE INDEX idx_runnerq_schedules_due ON runnerq_schedules USING btree (queue_name, next_fire_at) WHERE (NOT paused)"
     }
   ],
   "retired": {

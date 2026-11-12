@@ -16,6 +16,13 @@ export type {
 export { ActivityContext } from "./context.js";
 export type { StepContext } from "./context.js";
 export { Worker } from "./worker.js";
+export { Schedules } from "./schedule.js";
+export type {
+  Schedule,
+  ScheduleRecord,
+  ScheduleExecution,
+  CatchUp,
+} from "./schedule.js";
 export { ChangeSignal, reportExecutor } from "./executor.js";
 export type {
   ExecutorInfo,

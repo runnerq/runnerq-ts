@@ -37,6 +37,12 @@ Go SDK's next release.
   `isCancelled(error)` recognizes an awaited activity that was cancelled.
   Command fingerprints follow runnerq-spec, so a mixed Go/TypeScript fleet
   replays each other's commands.
+- Cron schedules: `worker.registerSchedule` (upserted on start) and
+  `client.schedules` (upsert, get, list, pause, resume, trigger, delete).
+  Each tick fires exactly once across a fleet, including a mixed
+  Go/TypeScript one; the dialect, time zones, daylight saving and catch-up
+  follow runnerq-spec's `schedules.md`. Adds the `runnerq_schedules` table
+  (migration `0003_schedules`).
 
 ### Breaking
 

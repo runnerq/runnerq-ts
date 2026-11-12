@@ -29,6 +29,7 @@ import {
 } from "./query.js";
 import type { Priority } from "./options.js";
 import { executionScope, guard, track, type AttemptScope } from "./scope.js";
+import { Schedules } from "./schedule.js";
 import {
   startSpan,
   withTraceparent,
@@ -296,11 +297,14 @@ const priorities: Record<Priority, number> = {
  */
 export class RunnerQClient {
   readonly storage: Storage;
+  /** The queue's cron schedules: upsert, pause, resume, trigger, delete and list. */
+  readonly schedules: Schedules;
   /** Traces this client's submissions and signals (see `Tracer`). */
   readonly tracer?: Tracer;
   constructor({ storage, tracer }: { storage: Storage; tracer?: Tracer }) {
     this.storage = storage;
     this.tracer = tracer;
+    this.schedules = new Schedules(storage);
   }
   execute<I, O>(
     definition: ActivityDefinition<I, O>,

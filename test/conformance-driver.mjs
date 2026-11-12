@@ -117,6 +117,48 @@ const ops = {
       }),
     };
   },
+  async upsert_schedule(a) {
+    const maxAttempts = a.max_attempts ?? 3;
+    await storage.upsertSchedule({
+      name: a.name,
+      cron: a.cron,
+      timezone: a.timezone ?? "UTC",
+      type: a.type,
+      payload: a.payload ?? null,
+      serialization: "json-v1",
+      options: {
+        priority: priorities[(a.priority ?? 2) - 1],
+        maxAttempts: maxAttempts === 0 ? "unlimited" : maxAttempts,
+        timeoutMs: (a.timeout_s ?? 30) * 1000,
+        maxRetryDelayMs: 0,
+        metadata: a.metadata ?? {},
+      },
+      catchUp: a.catch_up ?? "one",
+      catchUpLimit: a.catch_up_limit ?? 100,
+    });
+    return {};
+  },
+  async pause_schedule(a) {
+    await storage.pauseSchedule(a.name);
+    return {};
+  },
+  async resume_schedule(a) {
+    await storage.resumeSchedule(a.name);
+    return {};
+  },
+  async delete_schedule(a) {
+    await storage.deleteSchedule(a.name);
+    return {};
+  },
+  async trigger_schedule(a) {
+    return { id: await storage.triggerSchedule(a.name) };
+  },
+  async list_schedules() {
+    return { names: (await storage.listSchedules()).map((s) => s.name) };
+  },
+  async fire_schedules(a) {
+    return { count: await storage.fireSchedules(a.limit ?? 100) };
+  },
   async command(a) {
     const command = {
       id: a.command_id,

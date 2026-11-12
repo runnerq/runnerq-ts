@@ -248,3 +248,12 @@ export interface CommandResult {
 
 export { QueryError, RecordEvent, isQueryStorage } from "./query.js";
 export type * from "./query.js";
+
+export { isScheduleStorage } from "./schedule.js";
+export type {
+  ScheduleStorage,
+  ScheduleDefinition,
+  ScheduleRecord,
+  ScheduleExecution,
+  CatchUp,
+} from "./schedule.js";
