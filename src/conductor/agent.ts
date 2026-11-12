@@ -319,7 +319,12 @@ export class Agent {
 
   private hello(): Hello {
     const { info } = this.worker.snapshot();
-    const labels = { ...info.labels, ...this.config.labels };
+    // One version concept: the code version wins over a label of the name.
+    const labels = {
+      ...info.labels,
+      ...this.config.labels,
+      ...(info.version && { version: info.version }),
+    };
     return {
       protocol_versions: [conductorVersion],
       sdk: info.sdk,

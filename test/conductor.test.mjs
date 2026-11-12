@@ -244,3 +244,28 @@ test("an aborted signal says goodbye; bad config is refused", async (t) => {
   assert.throws(() => startAgent(w, { url: "ftp://x", apiKey: key }));
   assert.throws(() => startAgent(w, { url: "not a url", apiKey: key }));
 });
+
+test("the code version is the version label, whatever labels say", async (t) => {
+  const g = await fakeGateway(t);
+  const s = fakeStorage({ queue: "q1" });
+  const w = new Worker({
+    storage: s,
+    labels: { version: "label" },
+    version: "2026.11.2",
+  });
+  w.register(activity("Echo"), (_, input) => input);
+  await w.start();
+  t.after(() => w.stop({ graceMs: 100 }));
+  const agent = startAgent(w, {
+    url: g.url + "/base/",
+    apiKey: key,
+    labels: { version: "agent", region: "eu" },
+    logger: quiet,
+  });
+  t.after(() => agent.close());
+  await g.until(() => g.hellos.length === 1, "hello");
+  assert.deepEqual(g.hellos[0].executor.labels, {
+    version: "2026.11.2",
+    region: "eu",
+  });
+});

@@ -83,6 +83,7 @@ export const RecordEvent = {
   runNow: "activity.run_now",
   rescheduled: "activity.rescheduled",
   priorityChanged: "activity.priority_changed",
+  repinned: "activity.repinned",
 } as const;
 
 export type FilterOp =
@@ -188,6 +189,8 @@ export interface ActivityRecord {
   leaseExpiresAt?: Date;
   /** The executor running it (running activities only), or "". */
   executorId: string;
+  /** The code version it is pinned to; absent when unstamped. */
+  version?: string;
   wait?: RecordWait;
   metadata?: Record<string, string>;
   /** Only with `include.lastError`. */

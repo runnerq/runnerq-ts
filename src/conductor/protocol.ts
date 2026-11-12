@@ -414,6 +414,8 @@ export interface Activity {
   lease_expires_at?: string;
   /** The executor running it, while running. */
   executor_id?: string;
+  /** The code version it is pinned to (versions.md); absent when unstamped. */
+  version?: string;
   /** While waiting. */
   wait?: Wait;
   metadata?: Record<string, string>;

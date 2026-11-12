@@ -36,6 +36,11 @@ export interface ScheduleExecution {
   timeoutMs: number;
   maxRetryDelayMs: number;
   metadata: Readonly<Record<string, string>>;
+  /**
+   * The code version fires are pinned to (versions.md), stored as `options.code_version`;
+   * absent fires unstamped work. Set at upsert from the upserting process's version.
+   */
+  version?: string;
 }
 
 /** A schedule as storage upserts it. */
@@ -121,6 +126,11 @@ function parse(cron: string, timezone: string): CronExpression {
   return e;
 }
 
+/** A code version is 1 to 256 bytes (versions.md). */
+export function validVersion(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && Buffer.byteLength(v) <= 256;
+}
+
 /** Checks a definition storage is asked to upsert. */
 export function validateSchedule(s: ScheduleDefinition): void {
   if (typeof s.name !== "string" || !s.name.trim())
@@ -138,6 +148,8 @@ export function validateSchedule(s: ScheduleDefinition): void {
       "catchUpLimit",
       `catchUpLimit must be 1 to ${maxCatchUpLimit}`,
     );
+  if (s.options.version !== undefined && !validVersion(s.options.version))
+    throw invalid("version", "A version is 1 to 256 bytes");
   parse(s.cron, s.timezone);
 }
 
@@ -256,7 +268,11 @@ export function scheduleDefinition<I, O>(
 
 /** Manages a queue's cron schedules from any process, worker or not (`client.schedules`). */
 export class Schedules {
-  constructor(private readonly storage: Storage) {}
+  /** `version` pins what the schedules this manager upserts fire (versions.md). */
+  constructor(
+    private readonly storage: Storage,
+    private readonly version?: string,
+  ) {}
   private get store(): ScheduleStorage {
     if (!isScheduleStorage(this.storage))
       throw new RunnerQError(
@@ -270,7 +286,9 @@ export class Schedules {
    * its next fire time is kept unless `cron` or `timezone` changed.
    */
   async upsert<I, O>(schedule: Schedule<I, O>): Promise<void> {
-    await this.store.upsertSchedule(scheduleDefinition(schedule));
+    await this.store.upsertSchedule(
+      withVersion(scheduleDefinition(schedule), this.version),
+    );
   }
   async get(name: string): Promise<ScheduleRecord> {
     return this.store.getSchedule(name);
@@ -301,6 +319,16 @@ export class Schedules {
   async delete(name: string): Promise<void> {
     await this.store.deleteSchedule(name);
   }
+}
+
+/** The definition with its fires pinned to `version`, or unstamped without one. */
+export function withVersion(
+  d: ScheduleDefinition,
+  version: string | undefined,
+): ScheduleDefinition {
+  const options = { ...d.options };
+  delete options.version;
+  return { ...d, options: version ? { ...options, version } : options };
 }
 
 /** The stored idempotency key of a schedule's fire at a time. */

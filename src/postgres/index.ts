@@ -82,6 +82,13 @@ const lost = () =>
   new RunnerQError("claim_lost", "Execution no longer owns this activity");
 const iso = (v: Date | string | null): string | null =>
   v === null ? null : new Date(v).toISOString();
+/**
+ * An inserted activity's code_version: a root's own ($17), a child's root's, whatever the
+ * spawner passed (versions.md).
+ */
+const codeVersionInsertSQL = `CASE WHEN $12::uuid IS NULL THEN $17::text
+  ELSE (SELECT r.code_version FROM runnerq_activities r WHERE r.id=$13 AND r.queue_name=$2) END`;
+
 /** The started_at an event ending an attempt records. Every claim sets it. */
 const attemptStart = (v: Date | null): string =>
   (v ?? new Date(0)).toISOString();
@@ -560,8 +567,9 @@ export class PostgresStorage
       // One statement for the activity, its input and the parent link.
       await c.query(
         `WITH activity AS (INSERT INTO runnerq_activities(id,queue_name,activity_type,priority,status,scheduled_at,max_retries,
-        timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth)
-        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14)),
+        timeout_seconds,retry_delay_seconds,max_retry_delay_seconds,metadata,idempotency_key,parent_activity_id,root_activity_id,depth,code_version)
+        VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint>0 THEN NOW()+$6*INTERVAL '1 millisecond' ELSE NULL END,$7,$8,1,$9,$10::jsonb,$11,$12,$13,$14,
+        ${codeVersionInsertSQL})),
         link AS (INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
         SELECT $2,$12,$1,$1 WHERE $12::uuid IS NOT NULL ON CONFLICT DO NOTHING)
         INSERT INTO runnerq_inputs(activity_id,queue_name,payload,serialization) VALUES($1,$2,$15::jsonb,$16)`,
@@ -582,6 +590,7 @@ export class PostgresStorage
           a.depth,
           JSON.stringify(a.payload),
           a.serialization,
+          a.version || null,
         ],
       );
       return a.id;
@@ -594,6 +603,7 @@ export class PostgresStorage
     types: readonly string[],
     leaseMs: number,
     executorId?: string,
+    versions?: readonly string[],
   ): Promise<Claim[]> {
     integer(limit, "claim limit", 1);
     integer(leaseMs, "leaseMs", 1);
@@ -606,9 +616,13 @@ export class PostgresStorage
         : randomUUID();
     return this.tx(async (c) => {
       const filter =
-        types.length === 1
+        (types.length === 1
           ? "activity_type=$5"
-          : "activity_type=ANY($5::text[])";
+          : "activity_type=ANY($5::text[])") +
+        // Version pinning's one claim predicate (versions.md), only for a worker with a version.
+        (versions?.length
+          ? " AND (code_version IS NULL OR code_version=ANY($6::text[]))"
+          : "");
       // One statement claims and reads the inputs (one round trip for the batch); the
       // order is the claim order, which UPDATE RETURNING alone doesn't keep.
       const r = await c.query(
@@ -622,7 +636,7 @@ export class PostgresStorage
         lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
         FROM picked WHERE a.id=picked.id RETURNING a.*)
         SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
-        c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,
+        c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,c.code_version,
         i.activity_id AS input_id,i.payload,i.serialization
         FROM claimed c LEFT JOIN runnerq_inputs i ON i.queue_name=$1 AND i.activity_id=c.id
         ORDER BY c.priority DESC,c.retry_count DESC,COALESCE(c.scheduled_at,c.created_at) ASC`,
@@ -632,6 +646,7 @@ export class PostgresStorage
           prefix,
           leaseMs,
           types.length === 1 ? types[0] : types,
+          ...(versions?.length ? [versions] : []),
         ],
       );
       return r.rows.map((a): Claim => {
@@ -654,6 +669,7 @@ export class PostgresStorage
           depth: a.depth,
           metadata: a.metadata ?? {},
           leaseDeadlineMs: Number(a.lease_deadline_ms),
+          ...(a.code_version !== null && { version: a.code_version }),
         };
       });
     });
@@ -1168,6 +1184,7 @@ export class PostgresStorage
       lastErrorAt: iso(a.last_error_at),
       idempotencyKey: a.idempotency_key,
       waitingResultId: a.waiting_result_id,
+      codeVersion: a.code_version ?? null,
     };
   }
   async list(options: ListOptions = {}): Promise<ActivitySnapshot[]> {

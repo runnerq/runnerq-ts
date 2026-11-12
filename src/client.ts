@@ -29,7 +29,7 @@ import {
 } from "./query.js";
 import type { Priority } from "./options.js";
 import { executionScope, guard, track, type AttemptScope } from "./scope.js";
-import { Schedules } from "./schedule.js";
+import { Schedules, validVersion } from "./schedule.js";
 import {
   startSpan,
   withTraceparent,
@@ -100,6 +100,7 @@ export async function submit<I, O>(
   scope?: AttemptScope,
   child = false,
   tracer: Tracer | undefined = scope?.tracer,
+  version?: string,
 ): Promise<ActivityHandle<O>> {
   const config = executionOptions(options);
   if (!scope && (config.step || config.asRoot || config.replay))
@@ -150,6 +151,13 @@ export async function submit<I, O>(
       ? businessKey(config.idempotency.key, definition.name)
       : undefined;
   const parentId = linked ? scope.claim.id : null;
+  // A root is pinned to its submitter's version: the client's, or for a handler's asRoot
+  // spawn its worker's. A child takes its root's in storage.
+  const pinned = linked
+    ? undefined
+    : (version ?? (child ? scope?.version : undefined));
+  if (pinned !== undefined && !validVersion(pinned))
+    throw new RunnerQError("configuration", "A version is 1 to 256 bytes");
   const span = startSpan(tracer, spanNames.enqueue, scope?.span, () => {
     const a: Record<string, TraceAttributeValue> = {
       [attr.queue]: storage.queue,
@@ -178,6 +186,7 @@ export async function submit<I, O>(
     depth,
     key,
     fence: scope?.fence,
+    ...(pinned && { version: pinned }),
   };
   let existing: string;
   try {
@@ -301,10 +310,27 @@ export class RunnerQClient {
   readonly schedules: Schedules;
   /** Traces this client's submissions and signals (see `Tracer`). */
   readonly tracer?: Tracer;
-  constructor({ storage, tracer }: { storage: Storage; tracer?: Tracer }) {
+  /**
+   * The code version this client pins the roots it submits, and the schedules it upserts,
+   * to (versions.md), as a worker's own client does with its `version`. Without it they are
+   * unstamped and any worker may run them.
+   */
+  readonly version?: string;
+  constructor({
+    storage,
+    tracer,
+    version,
+  }: {
+    storage: Storage;
+    tracer?: Tracer;
+    version?: string;
+  }) {
+    if (version !== undefined && !validVersion(version))
+      throw new RunnerQError("configuration", "A version is 1 to 256 bytes");
     this.storage = storage;
     this.tracer = tracer;
-    this.schedules = new Schedules(storage);
+    this.version = version;
+    this.schedules = new Schedules(storage, version);
   }
   execute<I, O>(
     definition: ActivityDefinition<I, O>,
@@ -329,6 +355,7 @@ export class RunnerQClient {
           scope,
           false,
           this.tracer ?? scope.tracer,
+          this.version,
         ),
       );
     }
@@ -340,6 +367,7 @@ export class RunnerQClient {
       undefined,
       false,
       this.tracer,
+      this.version,
     );
   }
   handle<O = unknown>(id: string): ActivityHandle<O>;
@@ -485,6 +513,24 @@ export class RunnerQClient {
    */
   delete(target: Target, options: CommandOptions = {}): Promise<CommandResult> {
     return this.command("delete", target, options, {});
+  }
+  /**
+   * Moves unfinished activities to another code version, for when old work is known to be
+   * safe on new code (versions.md). Only workers serving `version` claim them from then on;
+   * a running attempt finishes where it runs. Activities already on `version`, and finished
+   * ones, are not eligible. Children spawned later take their root's version, so repin a
+   * workflow by its tree (filter on `root_id`) or a whole version (filter on `version`).
+   */
+  repin(
+    target: Target,
+    version: string,
+    options: CommandOptions = {},
+  ): Promise<CommandResult> {
+    if (!validVersion(version))
+      return Promise.reject(
+        new RunnerQError("configuration", "A version is 1 to 256 bytes"),
+      );
+    return this.command("repin", target, options, { version });
   }
   private async command(
     kind: CommandKind,

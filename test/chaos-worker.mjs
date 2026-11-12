@@ -18,6 +18,8 @@ const dsn = env.RUNNERQ_CHAOS_DSN;
 const queue = env.RUNNERQ_CHAOS_QUEUE;
 const prefix = env.RUNNERQ_CHAOS_PREFIX;
 const workerName = env.RUNNERQ_CHAOS_WORKER ?? "";
+// The code version to run and stamp (tools/chaos -rolling), if any.
+const version = env.RUNNERQ_CHAOS_VERSION || undefined;
 const positive = (s, d) => (Number(s) > 0 ? Number(s) : d);
 if (!dsn || !queue || !prefix) {
   console.error(
@@ -68,6 +70,7 @@ async function work() {
       Math.floor(positive(env.RUNNERQ_CHAOS_LEASE_MS, 60_000) / 3),
     ),
     shutdownGraceMs: 10_000,
+    version,
   });
   worker.on("workerError", (error) =>
     console.error("workerError:", error?.message ?? error),
@@ -147,7 +150,7 @@ async function client() {
     connectionString: dsn,
     queue,
   });
-  const c = new RunnerQClient({ storage });
+  const c = new RunnerQClient({ storage, version });
   const reply = (v) => process.stdout.write(JSON.stringify(v) + "\n");
   reply({ ready: true });
   for await (const line of createInterface({ input: process.stdin })) {

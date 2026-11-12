@@ -69,6 +69,11 @@ export interface MetricLabels {
   readonly activityType?: string;
   /** A canonical activity status, on `queue_depth` only. */
   readonly status?: string;
+  /**
+   * A code version, on `activities_by_version` and `activities_unserved` only; "" for
+   * unstamped activities.
+   */
+  readonly version?: string;
 }
 
 /**

@@ -51,6 +51,7 @@ const ops = {
       depth: a.depth ?? 0,
       ...(a.key && { key: businessKey(a.key.key, a.type) }),
       ...(a.fence && { fence: fence(a.fence) }),
+      ...(a.version && { version: a.version }),
     });
     return id === a.id ? {} : { existing: id };
   },
@@ -59,6 +60,8 @@ const ops = {
       a.limit ?? 1,
       a.types,
       a.lease_ms ?? 30_000,
+      undefined,
+      a.versions,
     );
     return { claims: claims.map((c) => ({ id: c.id, token: c.token })) };
   },
@@ -132,6 +135,7 @@ const ops = {
         timeoutMs: (a.timeout_s ?? 30) * 1000,
         maxRetryDelayMs: 0,
         metadata: a.metadata ?? {},
+        ...(a.version && { version: a.version }),
       },
       catchUp: a.catch_up ?? "one",
       catchUpLimit: a.catch_up_limit ?? 100,
@@ -176,6 +180,7 @@ const ops = {
       priority: a.priority,
       signalName: a.name,
       ...(a.payload !== undefined && { signalPayload: a.payload }),
+      ...(a.version !== undefined && { version: a.version }),
     };
     command.fingerprint = a.fingerprint ?? commandFingerprint(command);
     const res = await storage.applyCommand(command);

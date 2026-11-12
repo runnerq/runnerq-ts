@@ -12,6 +12,8 @@ export interface AttemptScope {
   deadline: number;
   maxDepth: number;
   waitGraceMs: number;
+  /** The worker's code version, pinning a handler's asRoot spawns. */
+  version?: string;
   closed: boolean;
   inStep?: boolean;
   suspension?: Park;
