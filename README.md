@@ -16,14 +16,14 @@ stopped instead of redoing completed work.
 ## Install
 
 Node.js 22 or later, an ESM application, and PostgreSQL are required.
-PostgreSQL 17 and 18 are covered by CI. The package ships compiled JavaScript
+PostgreSQL 14 to 18 are covered by CI. The package ships compiled JavaScript
 and TypeScript declarations.
 
-`runnerq` isn't on npm yet. Install it from GitHub:
-
 ```bash
-npm install github:runnerq/runnerq-ts
+npm install runnerq
 ```
+
+The package is on npm from v0.6.0.
 
 ## Quick start
 
@@ -231,6 +231,7 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
 - [Managing work](docs/managing-work.md): the client: cancel, retry, reschedule, run now, get and list
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
+- [Observability](docs/observability.md): logger, labelled metrics and gauges, tracing and `runnerq/otel`
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
 - [Conductor agent](docs/conductor.md): connecting workers to a console
 - [Architecture and guarantees](docs/architecture.md): transactions, recovery and replay limitations
@@ -242,6 +243,7 @@ npm ci
 npm test                  # Build, type tests, unit tests; database tests skip without DSN
 RUNNERQ_TEST_DSN=postgres://postgres:runnerq@localhost:5432/runnerq npm test
 npm run test:integration  # Requires RUNNERQ_TEST_DSN; never silently skips
+npm run test:upgrade      # Previous version parks work, this one finishes it (RUNNERQ_TEST_DSN)
 # runnerq-spec's cross-language scenarios, through test/conformance-driver.mjs (needs Go):
 go run -C spec/tools/conformance . -dsn "$RUNNERQ_TEST_DSN" -driver ts="node $PWD/test/conformance-driver.mjs"
 npm run format:check

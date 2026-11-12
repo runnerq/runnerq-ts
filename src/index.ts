@@ -35,8 +35,35 @@ export type {
   StopSummary,
   ExecutionEvent,
   ActivityHandler,
-  Metrics,
 } from "./worker.js";
+export {
+  jsonLogger,
+  silentLogger,
+  unlabeledMetrics,
+  validTraceparent,
+} from "./observability.js";
+export type {
+  Logger,
+  LogLevel,
+  LogFields,
+  Metrics,
+  LabeledMetrics,
+  MetricLabels,
+  Tracer,
+  TraceSpan,
+  SpanStart,
+  TraceAttributeValue,
+} from "./observability.js";
+export {
+  metricNames,
+  metricLabels,
+  metricCatalog,
+  spanNames,
+  spanAttributes,
+  spanOutcomes,
+  traceparentKey,
+} from "./observability-spec.js";
+export type { MetricInfo, MetricName } from "./observability-spec.js";
 export { runner } from "./options.js";
 export type { ActivityOption, Priority, DuplicatePolicy } from "./options.js";
 export {
