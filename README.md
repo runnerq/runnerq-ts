@@ -181,6 +181,24 @@ Priorities, retries with exponential backoff, timeouts, delayed starts, a dead-l
 </details>
 
 <details>
+<summary><strong>Cron schedules</strong></summary>
+
+Declare a schedule on the worker and every worker of the queue fires it, once per tick, in any IANA time zone and across daylight-saving changes. Pause, resume, trigger and list schedules from any process with `client.schedules`.
+
+```ts
+worker.registerSchedule({
+  name: "nightly-report",
+  cron: "30 2 * * *",
+  timezone: "Europe/London",
+  activity: NightlyReport,
+});
+```
+
+See [Schedules](docs/schedules.md).
+
+</details>
+
+<details>
 <summary><strong>Rich types</strong></summary>
 
 Inputs, results and signals keep `Date`, `bigint`, `Map`, `Set` and more by default, including after a restart. Use `serialization: "portable"` for plain-JSON contracts another SDK can read. See [Serialization](docs/serialization.md).
@@ -212,11 +230,13 @@ Each runs against a local PostgreSQL; see [examples/README.md](examples/README.m
 | 03  | [fan-out](examples/03-fan-out/)                      | children and a durable join with one execution slot                        |
 | 04  | [signals-and-sleep](examples/04-signals-and-sleep/)  | buffered signals, persisted deadlines, a durable timer                     |
 | 06  | [multiple-files](examples/06-multiple-files/)        | definitions, handlers, worker and producer in separate files               |
+| 07  | [cron-schedules](examples/07-cron-schedules/main.ts) | a cron schedule fired once per tick across workers                         |
 
 ## Documentation
 
 - [Activities](docs/activities.md): contracts, options, retries and recorded failures
 - [Durable execution](docs/durable-execution.md): steps, sleeps, signals, children and fan-out
+- [Schedules](docs/schedules.md): cron schedules, time zones, catch-up and management
 - [Workers](docs/workers.md): lifecycle, configuration, events, executor snapshots, reading state
 - [Serialization and compatibility](docs/serialization.md): native and portable formats, custom types, the shared schema
 - [Conductor agent](docs/conductor.md): connecting workers to a console

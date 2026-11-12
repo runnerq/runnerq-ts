@@ -11,6 +11,7 @@ import {
 import { executionOptions, type ActivityOption } from "./options.js";
 import type { Storage, StoredResult, Submission } from "./storage.js";
 import { executionScope, guard, track, type AttemptScope } from "./scope.js";
+import { Schedules } from "./schedule.js";
 
 export interface ResultOptions {
   signal?: AbortSignal;
@@ -144,8 +145,11 @@ export async function submit<I, O>(
 }
 export class RunnerQClient {
   readonly storage: Storage;
+  /** The queue's cron schedules: upsert, pause, resume, trigger, delete and list. */
+  readonly schedules: Schedules;
   constructor({ storage }: { storage: Storage }) {
     this.storage = storage;
+    this.schedules = new Schedules(storage);
   }
   execute<I, O>(
     definition: ActivityDefinition<I, O>,

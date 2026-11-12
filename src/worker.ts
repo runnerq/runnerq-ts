@@ -9,6 +9,12 @@ import { maxTimerMs, pause, recover } from "./async.js";
 import { executionScope, type AttemptScope } from "./scope.js";
 import type { Storage, Claim, Fence, Retention } from "./storage.js";
 import {
+  isScheduleStorage,
+  scheduleDefinition,
+  type Schedule,
+  type ScheduleDefinition,
+} from "./schedule.js";
+import {
   ChangeSignal,
   thisHostname,
   thisSdk,
@@ -37,6 +43,9 @@ export interface Change {
   attempt?: number;
   at: Date;
 }
+
+/** How often a worker fires its queue's due schedules. */
+const scheduleIntervalMs = 1_000;
 
 export interface StopSummary {
   drained: boolean;
@@ -119,6 +128,7 @@ export class Worker
       activityTypes?: readonly string[];
     };
   private readonly handlers = new Map<string, Registration>();
+  private readonly schedules = new Map<string, ScheduleDefinition>();
   private readonly inFlight = new Set<Promise<void>>();
   private readonly slotFreed = new ChangeSignal();
   /** Running attempts' controllers by activity id, aborted when the shutdown budget runs out. */
@@ -228,6 +238,31 @@ export class Worker
     });
     return this;
   }
+  /**
+   * Declares a cron schedule that `start()` upserts, so the schedules a deployment's code
+   * declares are the ones stored. Every worker of the queue fires the queue's schedules,
+   * each tick once.
+   */
+  registerSchedule<I, O>(schedule: Schedule<I, O>): this {
+    if (this.state !== "idle")
+      throw new RunnerQError(
+        "configuration",
+        "Register schedules before starting the worker",
+      );
+    if (!isScheduleStorage(this.config.storage))
+      throw new RunnerQError(
+        "configuration",
+        "This storage does not support schedules",
+      );
+    const definition = scheduleDefinition(schedule);
+    if (this.schedules.has(definition.name))
+      throw new RunnerQError(
+        "configuration",
+        `Duplicate schedule: ${definition.name}`,
+      );
+    this.schedules.set(definition.name, definition);
+    return this;
+  }
   get storage(): Storage {
     return this.config.storage;
   }
@@ -287,6 +322,10 @@ export class Worker
           "configuration",
           "At least one registered handler is required and all filtered types must be registered",
         );
+      const store = this.config.storage;
+      if (isScheduleStorage(store))
+        for (const definition of this.schedules.values())
+          await store.upsertSchedule(definition);
       this.state = "running";
       this.startedAt = new Date();
       this.servedTypes = [...types].sort();
@@ -295,6 +334,16 @@ export class Worker
           this.config.storage.reap(this.config.reaperBatchSize),
         ),
       ];
+      if (isScheduleStorage(store))
+        this.maintenance.push(
+          this.loop(scheduleIntervalMs, async () => {
+            const n = await store.fireSchedules(100);
+            if (n)
+              this.metric(() =>
+                this.config.metrics?.increment("schedule_fires", n),
+              );
+          }),
+        );
       if (this.config.retention)
         this.maintenance.push(
           this.loop(this.config.retention.intervalMs ?? 600_000, () =>
