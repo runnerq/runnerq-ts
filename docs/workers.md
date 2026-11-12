@@ -47,8 +47,7 @@ Retention is disabled by default. It deletes complete terminal trees and their i
 
 ### Executor snapshots
 
-A started worker is an executor: `worker.snapshot()` describes it as it is now, and is
-what RunnerQ Cloud shows in Fleet.
+A started worker is an executor: `worker.snapshot()` describes it as it is now.
 
 ```ts
 const worker = new Worker({ storage, labels: { region: "eu-west-1" } });
@@ -63,8 +62,7 @@ const { info, state, counters } = worker.snapshot();
 the next change (an activity starting or finishing, or a drain beginning), so a reporter
 needn't wait for its interval; `reportExecutor()` is that loop, spacing reports by a
 minimum gap. `worker.observe(observer)` (before `start()`) calls `executorStarted(worker)`
-and `executorStopped(id)`; a storage backend that implements both is attached
-automatically, which is how RunnerQ Cloud's storage adapter reports hosted workers.
+and `executorStopped(id)`.
 
 ## Reading state
 

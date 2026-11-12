@@ -20,7 +20,6 @@ export async function setup(t) {
       "runnerq_events",
       "runnerq_dependencies",
       "runnerq_idempotency",
-      "runnerq_worker_pools",
       "runnerq_commands",
       "runnerq_activities",
     ]) {

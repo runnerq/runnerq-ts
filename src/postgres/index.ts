@@ -1226,7 +1226,7 @@ export class PostgresStorage
       )
     ).map((r) => this.toEvent(r));
   }
-  // QueryStorage (RunnerQ Cloud's reads) spans every queue in the schema.
+  // QueryStorage spans every queue in the schema.
   queryCapabilities(): QueryCapabilities {
     return queryCapabilities();
   }
@@ -1260,7 +1260,7 @@ export class PostgresStorage
   ): Promise<ActivityTree> {
     return this.queries.tree(activityId, include, maxNodes);
   }
-  /** Applies a RunnerQ Cloud command to this storage's queue; see `CommandStorage`. */
+  /** Applies a command to this storage's queue; see `CommandStorage`. */
   applyCommand(command: Command): Promise<CommandResult> {
     return this.commands.apply(command);
   }

@@ -70,7 +70,8 @@ test("a worker's snapshot, counters, changes and observers", async () => {
   assert.deepEqual(before.info.labels, { region: "eu" });
 
   await worker.start();
-  assert.deepEqual(started, [worker]);
+  // Storage that is an observer is told only when observed like any other.
+  assert.deepEqual(started, []);
   assert.deepEqual(extra.started, [worker]);
 
   const running = worker.changed();
@@ -119,7 +120,7 @@ test("a worker's snapshot, counters, changes and observers", async () => {
   await within(draining, 2_000, "change when the drain began");
   assert.equal(worker.snapshot().state.draining, true);
   await stopping;
-  assert.deepEqual(stopped, [worker.id]);
+  assert.deepEqual(stopped, []);
   assert.deepEqual(extra.stopped, [worker.id]);
   assert.throws(() =>
     worker.observe({ executorStarted() {}, executorStopped() {} }),

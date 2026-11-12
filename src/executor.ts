@@ -4,7 +4,7 @@ import { maxTimerMs, pause } from "./async.js";
 
 /** Who an executor (a started worker) is. */
 export interface ExecutorInfo {
-  /** Fixed for the worker's lifetime; RunnerQ Cloud's executor id. */
+  /** Fixed for the worker's lifetime: `worker.id`. */
   id: string;
   queue: string;
   activityTypes: string[];
@@ -63,7 +63,7 @@ export interface ExecutorSource {
 }
 /**
  * Hears a worker start and stop and reads its snapshots on its own schedule: every observer
- * given to `observe()`, and the storage when it is one (RunnerQ Cloud's hosted adapter).
+ * given to `observe()`.
  * Both calls must return promptly; the worker awaits `executorStopped`'s promise (for a final
  * report) up to the stop's grace period, at least a second, then reports a `workerError`.
  */
@@ -71,13 +71,6 @@ export interface ExecutorObserver {
   executorStarted(source: ExecutorSource): void;
   executorStopped(id: string): void | Promise<void>;
 }
-export function isExecutorObserver(value: unknown): value is ExecutorObserver {
-  return (
-    typeof (value as ExecutorObserver | null)?.executorStarted === "function" &&
-    typeof (value as ExecutorObserver | null)?.executorStopped === "function"
-  );
-}
-
 /** Tells any number of waiters about changes. */
 export class ChangeSignal {
   private next?: { promise: Promise<void>; resolve: () => void };
