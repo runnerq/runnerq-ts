@@ -70,6 +70,7 @@ wraps it with `unlabeledMetrics`, which drops labels and gauges.
 | `activity_heartbeat_failed`                                                      | counter       | a renewal failed and will be retried                                                        |
 | `activity_completion_pending_started` / `_finished`, `activity_completion_error` | counter       | recording completions                                                                       |
 | `activity_trees_swept`                                                           | counter       | trees deleted by retention                                                                  |
+| `schedule_fires`                                                                 | counter       | activities enqueued by firing due schedules                                                 |
 | `storage_retry`                                                                  | counter       | storage writes retried                                                                      |
 | `activity_claim_lag`, `activity_execution`, `activity_completion_persistence`    | histogram (s) | due → start, attempt duration, completion recording                                         |
 | `queue_depth`                                                                    | gauge         | activities by type and status (`pending`, `scheduled`, `running`, `waiting`, `dead_letter`) |
