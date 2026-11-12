@@ -43,6 +43,8 @@ Go SDK's next release.
   Go/TypeScript one; the dialect, time zones, daylight saving and catch-up
   follow runnerq-spec's `schedules.md`. Adds the `runnerq_schedules` table
   (migration `0003_schedules`).
+- `metricNames.scheduleFires` (`schedule_fires`, label `queue`): activities
+  enqueued by firing due schedules, now in runnerq-spec's metric catalog.
 
 ### Breaking
 

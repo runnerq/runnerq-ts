@@ -392,7 +392,7 @@ export class Worker
         this.maintenance.push(
           this.loop(scheduleIntervalMs, async () => {
             const n = await store.fireSchedules(100);
-            if (n) this.count("schedule_fires", { queue: this.queue }, n);
+            if (n) this.count(m.scheduleFires, { queue: this.queue }, n);
           }),
         );
       if (this.config.retention)
