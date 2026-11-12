@@ -1,6 +1,7 @@
 name: Release
 
-# Publishes runnerq to npm, with provenance, when a v* tag is pushed.
+# Publishes runnerq to npm, with provenance, when a v* tag is pushed, then
+# creates the GitHub release.
 # See RELEASING.md for the one-time npm setup and the release steps.
 on:
   push:
@@ -32,6 +33,12 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version (expected v$version)"
             exit 1
           fi
+      - name: CHANGELOG.md must have a section for the tag
+        run: |
+          grep -Eq "^## v?${GITHUB_REF_NAME#v}( |$)" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME; rename ## Unreleased before tagging."
+            exit 1
+          }
       - run: npm ci --no-audit --no-fund
       - run: npm test
       - run: npm run pack:check
@@ -47,3 +54,32 @@ jobs:
           # Empty once trusted publishing is configured on npmjs.com; npm then
           # authenticates with the workflow's OIDC token instead.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    # The release body is the tag's CHANGELOG.md section followed by the PR
+    # list GitHub generates from labels (.github/release.yml), as in runnerq-go.
+    needs: npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '
+            $0 ~ "^## v?" v "( |$)" { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "CHANGELOG.md has no section for $TAG; rename ## Unreleased before tagging." >&2
+            exit 1
+          fi
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --generate-notes $prerelease
