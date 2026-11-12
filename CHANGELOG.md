@@ -2,8 +2,8 @@
 
 All notable changes to `runnerq` are recorded here. The project follows
 [semver](https://semver.org); see [RELEASING.md](RELEASING.md) for what that
-means before 1.0. GitHub release notes are drafted from PR labels; this file
-is the curated summary, with upgrade steps for anything that breaks.
+means before 1.0. Each GitHub release is this file's section for the tag
+followed by the PR list GitHub generates from labels.
 
 ## Unreleased
 
@@ -14,8 +14,8 @@ Go SDK's next release.
 
 - `runnerq` is published to npm, with provenance, from CI on a `v*` tag.
   Install with `npm install runnerq` instead of the GitHub URL.
-- A release process: this changelog, `RELEASING.md` and release notes
-  drafted from PR labels.
+- A release process: this changelog, `RELEASING.md`, and GitHub releases
+  made from the changelog plus label-generated notes, as in the Go SDK.
 
 ### Breaking
 
