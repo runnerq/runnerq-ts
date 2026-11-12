@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: spec/go.mod
       - run: npm run spec:gen && git diff --exit-code
@@ -87,7 +87,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: spec/tools/conformance/go.mod
       - run: npm ci --no-audit --no-fund
