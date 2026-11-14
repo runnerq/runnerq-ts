@@ -29,7 +29,7 @@ jobs:
     env:
       RUNNERQ_TEST_DSN: postgres://postgres:runnerq@localhost:5432/runnerq_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: actions/setup-node@v4
@@ -58,7 +58,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
           fetch-depth: 0 # the previous version is built from history
@@ -75,7 +75,7 @@ jobs:
     # prerelease so the dry run doesn't fail once package.json's version is on npm.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: actions/setup-node@v4
@@ -92,7 +92,7 @@ jobs:
     # from the pinned runnerq-spec submodule (npm run spec:gen).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: actions/setup-go@v5
@@ -116,7 +116,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: actions/setup-node@v4
