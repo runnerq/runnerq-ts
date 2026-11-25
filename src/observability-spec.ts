@@ -69,6 +69,8 @@ export const metricNames = {
   activityYielded: "activity_yielded",
   /** A counter ({tree}): terminal workflow trees deleted by retention. */
   activityTreesSwept: "activity_trees_swept",
+  /** A counter ({activity}): activities enqueued by firing due schedules. */
+  scheduleFires: "schedule_fires",
   /**
    * A counter ({retry}): storage writes made for an attempt (completion,
    * failure, park, checkpoint, spawn) that failed transiently and are being
@@ -239,6 +241,13 @@ export const metricCatalog: readonly MetricInfo[] = [
     unit: "{tree}",
     labels: ["queue"],
     description: "Terminal workflow trees deleted by retention.",
+  },
+  {
+    name: "schedule_fires",
+    kind: "counter",
+    unit: "{activity}",
+    labels: ["queue"],
+    description: "Activities enqueued by firing due schedules.",
   },
   {
     name: "storage_retry",
