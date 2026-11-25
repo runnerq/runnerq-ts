@@ -43,6 +43,10 @@ export const postgresMigrations: readonly PostgresMigration[] = [
     "sql": "-- Cron schedules (schedules.md). A schedule belongs to a queue and is named\n-- within it. Workers fire due schedules: in one transaction each claims the\n-- row (FOR UPDATE SKIP LOCKED), enqueues an activity per fire time with the\n-- idempotency key schedule:\u003cname\u003e:\u003cfire time\u003e, and advances next_fire_at, so\n-- a tick fires once however many workers race for it.\n--\n-- payload and serialization are the fired activity's input, as in\n-- runnerq_inputs. options holds the fired activity's execution options\n-- (priority, max_retries, timeout_seconds, retry_delay_seconds,\n-- max_retry_delay_seconds, metadata); an absent key takes the default\n-- schedules.md gives. catch_up is 'skip', 'one' or 'all'; catch_up_limit\n-- caps how many due ticks 'all' fires at once.\nCREATE TABLE IF NOT EXISTS runnerq_schedules (\n    queue_name TEXT NOT NULL,\n    name TEXT NOT NULL,\n    cron TEXT NOT NULL,\n    timezone TEXT NOT NULL DEFAULT 'UTC',\n    activity_type TEXT NOT NULL,\n    payload JSONB NOT NULL DEFAULT 'null'::jsonb,\n    serialization TEXT NOT NULL DEFAULT 'json-v1',\n    options JSONB NOT NULL DEFAULT '{}'::jsonb,\n    catch_up TEXT NOT NULL DEFAULT 'one',\n    catch_up_limit INTEGER NOT NULL DEFAULT 100,\n    paused BOOLEAN NOT NULL DEFAULT FALSE,\n    next_fire_at TIMESTAMPTZ NOT NULL,\n    last_fire_at TIMESTAMPTZ,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, name)\n);\n\n-- The due scan: WHERE queue_name = $1 AND NOT paused AND next_fire_at \u003c= NOW()\n-- ORDER BY next_fire_at. Paused schedules are left out.\nCREATE INDEX IF NOT EXISTS idx_runnerq_schedules_due\n    ON runnerq_schedules (queue_name, next_fire_at)\n    WHERE NOT paused;\n"
   },
   {
+    "name": "0004_code_version",
+    "sql": "-- Version pinning (versions.md). code_version is the code version an\n-- activity must run on: a root gets the enqueuing process's version, a child\n-- its root's, at insert. NULL is unstamped work, which every worker claims.\n-- Only a repin command changes it afterwards; the reaper, retries and wakes\n-- leave it as it is.\n--\n-- No index: a pinned claim filters on it during the dequeue index walk, as a\n-- multi-type claim filters on activity_type, so it stays out of every index\n-- key and predicate and a repin is a HOT update.\nALTER TABLE runnerq_activities ADD COLUMN IF NOT EXISTS code_version TEXT;\n"
+  },
+  {
     "name": "0005_limits",
     "sql": "-- Concurrency and rate limits (limits.md). A limit applies to one activity\n-- type within a queue; a type without a row is unlimited.\n--\n-- max_concurrent caps the type's running ('processing') activities across\n-- every worker of the queue. It is not a counter: a claim counts the running\n-- rows (idx_runnerq_processing_v2) while it holds this row's lock, so a\n-- worker that dies leaves nothing to drift.\n--\n-- rate_tokens and rate_per_seconds are a token bucket: at most rate_tokens\n-- claims in a burst, refilled continuously at rate_tokens per\n-- rate_per_seconds. tokens and refilled_at are the bucket's level and when it\n-- was last brought up to date, by the database clock; a claim updates them\n-- under the same lock. Both rate columns are set or both are null.\n--\n-- updated_at is when the definition (max_concurrent, rate_tokens,\n-- rate_per_seconds) last changed.\nCREATE TABLE IF NOT EXISTS runnerq_limits (\n    queue_name TEXT NOT NULL,\n    activity_type TEXT NOT NULL,\n    max_concurrent INTEGER,\n    rate_tokens INTEGER,\n    rate_per_seconds DOUBLE PRECISION,\n    tokens DOUBLE PRECISION NOT NULL DEFAULT 0,\n    refilled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, activity_type),\n    CHECK (max_concurrent IS NULL OR max_concurrent \u003e= 1),\n    CHECK ((rate_tokens IS NULL) = (rate_per_seconds IS NULL)),\n    CHECK (rate_tokens IS NULL OR (rate_tokens \u003e= 1 AND rate_per_seconds \u003e 0)),\n    CHECK (max_concurrent IS NOT NULL OR rate_tokens IS NOT NULL)\n);\n"
   }
@@ -109,6 +113,12 @@ export const postgresCatalog: Catalog = {
           "name": "activity_type",
           "type": "text",
           "nullable": false,
+          "default": null
+        },
+        {
+          "name": "code_version",
+          "type": "text",
+          "nullable": true,
           "default": null
         },
         {

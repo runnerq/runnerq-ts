@@ -140,6 +140,7 @@ export function otelMetricsSink(options: OtelOptions = {}): LabeledMetrics {
     const a: Attributes = { [metricLabels.queue]: labels.queue };
     if (labels.activityType) a[metricLabels.activityType] = labels.activityType;
     if (labels.status) a[metricLabels.status] = labels.status;
+    if (labels.version) a[metricLabels.version] = labels.version;
     return a;
   };
   return {

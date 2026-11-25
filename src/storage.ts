@@ -32,6 +32,11 @@ export interface Submission {
   depth: number;
   key?: string;
   fence?: Fence;
+  /**
+   * The code version a root is pinned to (versions.md); absent is unstamped. Storage ignores
+   * it for a child and stores the child's root's version instead.
+   */
+  version?: string;
 }
 export interface Claim {
   serialization: SerializationFormat;
@@ -48,6 +53,8 @@ export interface Claim {
   leaseDeadlineMs: number;
   /** When the activity became due (ISO-8601); the worker reports claim lag from it. */
   dueAt?: string;
+  /** The code version it is pinned to; absent when unstamped. */
+  version?: string;
 }
 export interface Park {
   kind: "sleep" | "signal" | "await";
@@ -99,6 +106,8 @@ export interface ActivitySnapshot {
   lastErrorAt: string | null;
   idempotencyKey: string | null;
   waitingResultId: string | null;
+  /** The code version it is pinned to, or null when unstamped. */
+  codeVersion: string | null;
 }
 export interface ListOptions {
   status?: ActivityStatus;
@@ -119,12 +128,18 @@ export interface StepRecord extends StoredResult {
 export interface Storage {
   readonly queue: string;
   submit(activity: Submission): Promise<string>;
-  /** Backends that can should record `executorId` (the worker's id) for queries' executor_id. */
+  /**
+   * Backends that can should record `executorId` (the worker's id) for queries' executor_id.
+   * Non-empty `versions` claims only unstamped activities and those pinned to one of them
+   * (version pinning, versions.md); empty or absent applies no version filter. A backend must
+   * honour it: a worker with a version relies on it.
+   */
   claim(
     limit: number,
     types: readonly string[],
     leaseMs: number,
     executorId?: string,
+    versions?: readonly string[],
   ): Promise<Claim[]>;
   renew(fence: Fence, leaseMs: number): Promise<boolean>;
   complete(fence: Fence, value: SerializedValue): Promise<void>;
@@ -191,7 +206,8 @@ export type CommandKind =
   | "reschedule"
   | "set_priority"
   | "delete"
-  | "signal";
+  | "signal"
+  | "repin";
 /** Exactly one of `ids`, a `filter` bounded by `max`, or an `idempotencyKey` (signal only). */
 export interface CommandTarget {
   /** At most 1000. */
@@ -224,6 +240,8 @@ export interface Command {
   signalName?: string;
   /** signal: the payload; absent stores none. */
   signalPayload?: JsonValue;
+  /** repin: the code version to pin the targets to (1 to 256 bytes). */
+  version?: string;
 }
 export type CommandOutcome = "applied" | "skipped" | "would_apply";
 export interface CommandItem {

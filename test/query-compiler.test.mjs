@@ -284,6 +284,7 @@ test("capabilities match the Go agent's", () => {
       "status",
       "type",
       "updated_at",
+      "version",
     ],
     activitySorts: ["completed_at", "created_at", "priority"],
     eventFilters: [
@@ -295,7 +296,7 @@ test("capabilities match the Go agent's", () => {
       "seq",
       "type",
     ],
-    groupBy: ["queue", "root", "status", "type"],
+    groupBy: ["queue", "root", "status", "type", "version"],
     buckets: ["completed_at", "created_at"],
     durations: ["queue", "run", "total"],
   });

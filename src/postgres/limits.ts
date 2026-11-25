@@ -16,6 +16,10 @@ export const eligibleSQL = `queue_name=$1 AND status IN ('pending','scheduled','
 export const claimOrderSQL =
   "priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC";
 
+/** Empty serves lists leave claims unfiltered; unstamped work is always eligible. */
+export const versionFilterSQL = (parameter: string) =>
+  `(cardinality(${parameter}::text[])=0 OR code_version IS NULL OR code_version=ANY(${parameter}::text[]))`;
+
 const available = (at: string) =>
   `LEAST(l.rate_tokens::float8,l.tokens+GREATEST(0,EXTRACT(EPOCH FROM ${at}-l.refilled_at))*l.rate_tokens/l.rate_per_seconds)`;
 const running = `(SELECT count(*) FROM runnerq_activities r
@@ -27,13 +31,14 @@ const running = `(SELECT count(*) FROM runnerq_activities r
 // running count and bucket it reads are current, and no other claimer of these types can change
 // them until commit.
 const checkSQL = `SELECT l.activity_type,
-  EXISTS(SELECT 1 FROM runnerq_activities WHERE ${eligibleSQL} AND activity_type=l.activity_type) AS has_work,
+  EXISTS(SELECT 1 FROM runnerq_activities WHERE ${eligibleSQL} AND activity_type=l.activity_type
+    AND ${versionFilterSQL("$3")}) AS has_work,
   (l.max_concurrent IS NULL OR l.max_concurrent>${running})
     AND (l.rate_tokens IS NULL OR ${available("clock_timestamp()")}>=1) AS has_room
   FROM runnerq_limits l WHERE l.queue_name=$1 AND l.activity_type=ANY($2::text[])`;
 const lockSQL = `SELECT activity_type FROM runnerq_limits WHERE queue_name=$1 AND activity_type=ANY($2::text[])
   ORDER BY activity_type FOR UPDATE`;
-/** $1 queue, $2 claim limit, $3 token prefix, $4 lease ms, $5 locked types. */
+/** $1 queue, $2 claim limit, $3 token prefix, $4 lease ms, $5 locked types, $6 versions. */
 export const limitedClaimSQL = `WITH clock AS (SELECT clock_timestamp() AS at),
   lim AS (
     SELECT l.activity_type,l.rate_tokens,clock.at,b.avail,
@@ -45,6 +50,7 @@ export const limitedClaimSQL = `WITH clock AS (SELECT clock_timestamp() AS at),
     SELECT c.id,c.activity_type AS claim_type FROM lim CROSS JOIN LATERAL (
       SELECT id,activity_type,priority,retry_count,scheduled_at,created_at FROM runnerq_activities
       WHERE ${eligibleSQL} AND activity_type=lim.activity_type
+        AND ${versionFilterSQL("$6")}
       ORDER BY ${claimOrderSQL} LIMIT GREATEST(lim.allowance,0) FOR UPDATE SKIP LOCKED) c
     ORDER BY c.priority DESC,c.retry_count DESC,COALESCE(c.scheduled_at,c.created_at) ASC
     LIMIT $2),
@@ -135,9 +141,14 @@ export class PostgresLimits implements LimitStorage {
     prefix: string,
     leaseMs: number,
     claimed: string,
+    versions: readonly string[] = [],
   ): Promise<{ rows: Row[]; heldBack: boolean }> {
     const q = this.deps.queue;
-    const checked = await this.deps.query(checkSQL, [q, plan.limited]);
+    const checked = await this.deps.query(checkSQL, [
+      q,
+      plan.limited,
+      versions,
+    ]);
     const found = new Set<string>();
     const ready: string[] = [];
     let heldBack = false;
@@ -163,6 +174,7 @@ export class PostgresLimits implements LimitStorage {
           prefix,
           leaseMs,
           types,
+          versions,
         ])
       ).rows;
     });

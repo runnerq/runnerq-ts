@@ -24,6 +24,8 @@ import { deleteTree, lockTree, terminalSQL } from "./trees.js";
 
 const maxCommandIds = 1000;
 const maxCommandFilter = 10_000;
+/** A code version's length bound (versions.md). */
+export const maxCodeVersionBytes = 256;
 /** The protocol promises replay for at least 24 hours; Go keeps a week. */
 const ledgerKeepMs = 7 * 24 * 3600_000;
 
@@ -38,6 +40,8 @@ const eligibleSQL: Record<CommandKind, string> = {
   cancel: `a.status NOT IN ${terminalSQL}`,
   set_priority: `a.status NOT IN ${terminalSQL}`,
   signal: `a.status NOT IN ${terminalSQL}`,
+  // And a version other than the target's (resolve).
+  repin: `a.status NOT IN ${terminalSQL}`,
   retry: "a.status IN ('failed','dead_letter','cancelled')",
   run_now: "a.status IN ('scheduled','retrying','waiting')",
   reschedule: "a.status IN ('scheduled','retrying')",
@@ -175,6 +179,13 @@ function validate(cmd: Command): Time | undefined {
     case "signal":
       if (!cmd.signalName) throw invalid("name", "signal needs a name");
       return undefined;
+    case "repin":
+      if (!cmd.version || Buffer.byteLength(cmd.version) > maxCodeVersionBytes)
+        throw invalid(
+          "version",
+          `repin needs a version of 1 to ${maxCodeVersionBytes} bytes`,
+        );
+      return undefined;
   }
   throw new QueryError(
     "unsupported",
@@ -192,6 +203,7 @@ interface Row {
   id: string;
   status: string;
   parent: string | null;
+  version: string | null;
 }
 type ResultInput = Omit<StoredResult, "data"> & { data?: JsonValue };
 
@@ -380,8 +392,11 @@ export class PostgresCommands {
     const sb = new SqlBuilder();
     const where = sb.where(t.filter, "activities");
     const max = t.max!;
+    let eligible = eligibleSQL[cmd.kind];
+    if (cmd.kind === "repin")
+      eligible += ` AND a.code_version IS DISTINCT FROM ${sb.arg(cmd.version)}`;
     const r = await c.query(
-      `SELECT a.id FROM runnerq_activities a WHERE a.queue_name=${sb.arg(queue)} AND ${eligibleSQL[cmd.kind]} AND ${where}
+      `SELECT a.id FROM runnerq_activities a WHERE a.queue_name=${sb.arg(queue)} AND ${eligible} AND ${where}
       ORDER BY a.created_at,a.id LIMIT ${max + 1}`,
       sb.args,
     );
@@ -397,7 +412,7 @@ export class PostgresCommands {
     const out = new Map<string, Row>();
     if (!valid.length) return out;
     const r = await c.query(
-      `SELECT id,status,parent_activity_id FROM runnerq_activities
+      `SELECT id,status,parent_activity_id,code_version FROM runnerq_activities
       WHERE queue_name=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR UPDATE`,
       [this.host.queue, valid],
     );
@@ -406,6 +421,7 @@ export class PostgresCommands {
         id: x.id,
         status: x.status,
         parent: x.parent_activity_id,
+        version: x.code_version,
       });
     return out;
   }
@@ -543,6 +559,20 @@ export class PostgresCommands {
         if (woke) post.work = true;
         return ok(woke ? "pending" : row.status);
       }
+
+      case "repin":
+        if (terminal.has(row.status)) return skipped(row, "already finished");
+        if (row.version === cmd.version)
+          return skipped(row, `already pinned to ${cmd.version}`);
+        await exec(
+          "UPDATE runnerq_activities SET code_version=$3 WHERE id=$1 AND queue_name=$2",
+          [row.id, queue, cmd.version],
+        );
+        Object.assign(detail, { from: row.version, to: cmd.version });
+        await event("Repinned");
+        // Blocked claimers serving the new version may take it now.
+        post.work = true;
+        return ok(row.status);
     }
   }
 

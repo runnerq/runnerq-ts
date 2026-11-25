@@ -139,6 +139,7 @@ export function commandFingerprint(cmd: Command): string {
   if (cmd.resetAttempts) m.reset_attempts = true;
   if (cmd.reason) m.reason = cmd.reason;
   if (cmd.signalName) m.name = cmd.signalName;
+  if (cmd.version) m.version = cmd.version;
   if (cmd.at !== undefined) {
     const at = cmd.at instanceof Date ? cmd.at : new Date(cmd.at);
     if (!Number.isNaN(at.getTime())) m.at = at.toISOString();

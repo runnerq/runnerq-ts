@@ -14,6 +14,8 @@ export interface ExecutorInfo {
   hostname: string;
   sdk: ExecutorSdk;
   labels: Record<string, string>;
+  /** The code version the executor runs (`WorkerConfig.version`), if any. */
+  version?: string;
 }
 export interface ExecutorSdk {
   name: string;

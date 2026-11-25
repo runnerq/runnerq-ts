@@ -17,9 +17,12 @@ import {
 import {
   isScheduleStorage,
   scheduleDefinition,
+  validVersion,
+  withVersion,
   type Schedule,
   type ScheduleDefinition,
 } from "./schedule.js";
+import { RunnerQClient } from "./client.js";
 import {
   ChangeSignal,
   thisHostname,
@@ -49,7 +52,7 @@ import {
   spanOutcomes as outcomes,
   traceparentKey,
 } from "./observability-spec.js";
-import { isQueryStorage } from "./query.js";
+import { isQueryStorage, type QueryFilter } from "./query.js";
 import { isLimitStorage, validateLimit, type Limit } from "./limit.js";
 
 /** Internal: the agent's handle on `Worker`'s interrupt (not exported from the package). */
@@ -132,8 +135,20 @@ export interface WorkerConfig {
    * 0, the default, leaves them off.
    */
   gaugeIntervalMs?: number;
-  /** Free-form tags (region, deploy version), carried in the worker's snapshots. */
+  /**
+   * Free-form tags (region, deploy version), carried in the worker's snapshots. With a
+   * `version`, the label "version" is that version.
+   */
   labels?: Readonly<Record<string, string>>;
+  /**
+   * The code version this worker runs (1 to 256 bytes): the roots its `client` submits and
+   * its handlers spawn with `asRoot`, and the schedules it declares, are pinned to it, and it
+   * claims only unstamped work and work pinned to a version it serves (versions.md). Absent,
+   * the default, pins and filters nothing.
+   */
+  version?: string;
+  /** Further versions this worker claims, besides its own `version` and unstamped work. */
+  serves?: readonly string[];
 }
 /**
  * Limits on a registered activity type. `maxConcurrent` and the rate cap the type across every
@@ -182,6 +197,9 @@ export class Worker
     Omit<WorkerConfig, "activityTypes"> & {
       activityTypes?: readonly string[];
     };
+  /** The claim's version filter: the version, then `serves`; undefined without a version. */
+  private readonly served?: readonly string[];
+  private clientInstance?: RunnerQClient;
   private readonly handlers = new Map<string, Registration>();
   /** Limits to store at start, by type. */
   private readonly limits = new Map<string, Limit>();
@@ -264,6 +282,7 @@ export class Worker
       retention: config.retention ? { ...config.retention } : undefined,
       labels: { ...config.labels },
     };
+    this.served = servedVersions(config.version, config.serves);
     if (this.config.heartbeatMs >= this.config.leaseMs)
       throw new RunnerQError(
         "configuration",
@@ -372,6 +391,18 @@ export class Worker
   get storage(): Storage {
     return this.config.storage;
   }
+  /** A client on the worker's storage and tracer that pins its roots to the worker's `version`. */
+  get client(): RunnerQClient {
+    return (this.clientInstance ??= new RunnerQClient({
+      storage: this.config.storage,
+      tracer: this.config.tracer,
+      version: this.config.version,
+    }));
+  }
+  /** The code version this worker runs (`WorkerConfig.version`), if any. */
+  get version(): string | undefined {
+    return this.config.version;
+  }
   snapshot(): ExecutorSnapshot {
     return {
       info: {
@@ -384,7 +415,11 @@ export class Worker
         startedAt: this.startedAt,
         hostname: this.hostname,
         sdk: thisSdk(),
-        labels: { ...this.config.labels },
+        labels: {
+          ...this.config.labels,
+          ...(this.config.version && { version: this.config.version }),
+        },
+        ...(this.config.version && { version: this.config.version }),
       },
       state: {
         running: Array.from(this.running.values(), (a) => ({ ...a })).sort(
@@ -431,7 +466,9 @@ export class Worker
       const store = this.config.storage;
       if (isScheduleStorage(store))
         for (const definition of this.schedules.values())
-          await store.upsertSchedule(definition);
+          await store.upsertSchedule(
+            withVersion(definition, this.config.version),
+          );
       if (isLimitStorage(store))
         for (const limit of this.limits.values()) await store.setLimit(limit);
       this.state = "running";
@@ -512,6 +549,7 @@ export class Worker
           claimTypes,
           this.config.leaseMs,
           this.id,
+          this.served,
         );
         // A claim already committed during shutdown still executes under the drain budget.
         for (const claim of claims) {
@@ -699,6 +737,7 @@ export class Worker
       persistence: this.lifetime.signal,
       deadline,
       maxDepth: config.maxActivityDepth,
+      version: config.version,
       waitGraceMs: config.waitGraceMs,
       closed: false,
       pending: new Set(),
@@ -1082,6 +1121,10 @@ export class Worker
     types: readonly string[],
   ): Promise<void> {
     const reported = new Map<string, MetricLabels>();
+    const versions = {
+      byVersion: new Set<string>(),
+      unserved: new Set<string>(),
+    };
     while (!this.intake.signal.aborted) {
       try {
         await pause(
@@ -1089,6 +1132,7 @@ export class Worker
           this.intake.signal,
         );
         await this.sampleGaugesOnce(types, reported);
+        await this.sampleVersionGauges(versions);
       } catch (error) {
         if (!this.intake.signal.aborted) this.report(error);
       }
@@ -1159,6 +1203,88 @@ export class Worker
     }
     this.gauge(m.queueOldestPendingAge, { queue }, age);
   }
+  /**
+   * Sets `activities_by_version` and `activities_unserved`, for a worker with a version.
+   * `seen` holds the versions reported above 0 before, so one that empties drops to 0 and
+   * the stranded-work warning is logged once per spell.
+   */
+  private async sampleVersionGauges(seen: {
+    byVersion: Set<string>;
+    unserved: Set<string>;
+  }): Promise<void> {
+    const served = this.served;
+    const storage = this.config.storage;
+    if (!served || !isQueryStorage(storage)) return;
+    const queue = this.queue;
+    const count = async (filter: QueryFilter) => {
+      const rows = await storage.aggregateActivities({
+        filter,
+        groupBy: ["version"],
+        count: true,
+        limit: 1000,
+      });
+      const out = new Map<string, number>();
+      for (const row of rows.rows) {
+        const v = row.key?.version ?? "";
+        out.set(v, (out.get(v) ?? 0) + row.count);
+      }
+      return out;
+    };
+    const inQueue: QueryFilter = { field: "queue", op: "eq", value: queue };
+    const byVersion = await count({
+      and: [
+        inQueue,
+        {
+          field: "status",
+          op: "in",
+          value: ["pending", "scheduled", "running", "waiting"],
+        },
+      ],
+    });
+    this.setVersionGauge(m.activitiesByVersion, byVersion, seen.byVersion);
+    const unserved = await count({
+      and: [
+        inQueue,
+        { field: "version", op: "exists", value: true },
+        { field: "version", op: "nin", value: [...served] },
+        {
+          or: [
+            { field: "status", op: "eq", value: "pending" },
+            {
+              and: [
+                { field: "status", op: "in", value: ["scheduled", "waiting"] },
+                {
+                  field: "scheduled_for",
+                  op: "lte",
+                  value: new Date().toISOString(),
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    for (const [version, n] of unserved)
+      if (!seen.unserved.has(version))
+        this.log.warn(
+          "Runnable work is pinned to a version this worker does not serve",
+          { queue, version, count: n },
+        );
+    for (const v of served) if (!unserved.has(v)) unserved.set(v, 0);
+    this.setVersionGauge(m.activitiesUnserved, unserved, seen.unserved);
+  }
+  private setVersionGauge(
+    name: string,
+    counts: Map<string, number>,
+    reported: Set<string>,
+  ): void {
+    const queue = this.queue;
+    for (const [version, n] of counts) this.gauge(name, { queue, version }, n);
+    for (const version of reported)
+      if (!counts.has(version)) this.gauge(name, { queue, version }, 0);
+    reported.clear();
+    for (const [version, n] of counts) if (n > 0) reported.add(version);
+  }
   private publish<K extends keyof WorkerEvents>(
     name: K,
     ...args: WorkerEvents[K]
@@ -1201,3 +1327,30 @@ const asError = (error: unknown): Error =>
   error instanceof Error ? error : new Error(message(error));
 const reclaimed = () =>
   new RunnerQError("claim_lost", "Execution was reclaimed");
+
+/** A worker serves at most this many versions, its own included. */
+const maxServedVersions = 64;
+
+function servedVersions(
+  version: string | undefined,
+  serves: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (version === undefined) {
+    if (serves?.length)
+      throw new RunnerQError(
+        "configuration",
+        "serves needs a version: a worker without one claims every version",
+      );
+    return undefined;
+  }
+  const all = [version, ...(serves ?? [])];
+  if (!all.every(validVersion))
+    throw new RunnerQError("configuration", "A version is 1 to 256 bytes");
+  const out = [...new Set(all)];
+  if (out.length > maxServedVersions)
+    throw new RunnerQError(
+      "configuration",
+      `A worker serves at most ${maxServedVersions} versions, its own included`,
+    );
+  return out;
+}

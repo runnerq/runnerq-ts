@@ -54,6 +54,7 @@ don't cover. Reads and commands are scoped to the storage's queue.
 | `reschedule`  | scheduled                        | Runs at the new time                                                                                       |
 | `setPriority` | unfinished                       | New priority                                                                                               |
 | `delete`      | finished roots                   | Removed with their whole tree                                                                              |
+| `repin`       | unfinished, on another version   | Pinned to the new version ([Version pinning](versions.md))                                                 |
 
 Each takes a target: an id, an array of ids, or a bounded filter.
 

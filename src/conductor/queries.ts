@@ -141,6 +141,7 @@ export function toActivity(r: ActivityRecord): Activity {
     timeout_ms: r.timeoutMs || undefined,
     lease_expires_at: tsp(r.leaseExpiresAt),
     executor_id: opt(r.executorId),
+    version: opt(r.version),
     wait:
       r.wait &&
       compact({
