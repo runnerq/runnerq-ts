@@ -25,6 +25,17 @@ Go SDK's next release.
   label `version` and `snapshot().info.version`, over the conductor too.
   Needs schema migration `0004_code_version` (one nullable column, applied by
   `PostgresStorage.initialize`). Without a version nothing changes.
+- Concurrency and rate limits per activity type: `maxConcurrent` and
+  `rateLimit`/`ratePeriodMs` in `worker.register`'s new options cap a type
+  across every worker of the queue (stored in `runnerq_limits`, upserted on
+  start), and `maxConcurrentPerWorker` caps it on one worker.
+  `client.limits` sets, gets, lists and deletes limits at runtime. The
+  running count is read from the activities on each claim, so it never
+  drifts; waiting and retrying activities don't count. Claims of unlimited
+  types are unchanged. New optional `LimitStorage` capability. Needs schema
+  migration `0005_limits` and the index `idx_runnerq_processing_v2`, which
+  replaces `idx_runnerq_processing` (run `PostgresStorage.initialize`). See
+  [docs/limits.md](docs/limits.md).
 - `runnerq` is published to npm, with provenance, from CI on a `v*` tag.
   Install with `npm install runnerq` instead of the GitHub URL.
 - A release process: this changelog, `RELEASING.md`, and GitHub releases

@@ -45,6 +45,10 @@ export const postgresMigrations: readonly PostgresMigration[] = [
   {
     "name": "0004_code_version",
     "sql": "-- Version pinning (versions.md). code_version is the code version an\n-- activity must run on: a root gets the enqueuing process's version, a child\n-- its root's, at insert. NULL is unstamped work, which every worker claims.\n-- Only a repin command changes it afterwards; the reaper, retries and wakes\n-- leave it as it is.\n--\n-- No index: a pinned claim filters on it during the dequeue index walk, as a\n-- multi-type claim filters on activity_type, so it stays out of every index\n-- key and predicate and a repin is a HOT update.\nALTER TABLE runnerq_activities ADD COLUMN IF NOT EXISTS code_version TEXT;\n"
+  },
+  {
+    "name": "0005_limits",
+    "sql": "-- Concurrency and rate limits (limits.md). A limit applies to one activity\n-- type within a queue; a type without a row is unlimited.\n--\n-- max_concurrent caps the type's running ('processing') activities across\n-- every worker of the queue. It is not a counter: a claim counts the running\n-- rows (idx_runnerq_processing_v2) while it holds this row's lock, so a\n-- worker that dies leaves nothing to drift.\n--\n-- rate_tokens and rate_per_seconds are a token bucket: at most rate_tokens\n-- claims in a burst, refilled continuously at rate_tokens per\n-- rate_per_seconds. tokens and refilled_at are the bucket's level and when it\n-- was last brought up to date, by the database clock; a claim updates them\n-- under the same lock. Both rate columns are set or both are null.\n--\n-- updated_at is when the definition (max_concurrent, rate_tokens,\n-- rate_per_seconds) last changed.\nCREATE TABLE IF NOT EXISTS runnerq_limits (\n    queue_name TEXT NOT NULL,\n    activity_type TEXT NOT NULL,\n    max_concurrent INTEGER,\n    rate_tokens INTEGER,\n    rate_per_seconds DOUBLE PRECISION,\n    tokens DOUBLE PRECISION NOT NULL DEFAULT 0,\n    refilled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    PRIMARY KEY (queue_name, activity_type),\n    CHECK (max_concurrent IS NULL OR max_concurrent \u003e= 1),\n    CHECK ((rate_tokens IS NULL) = (rate_per_seconds IS NULL)),\n    CHECK (rate_tokens IS NULL OR (rate_tokens \u003e= 1 AND rate_per_seconds \u003e 0)),\n    CHECK (max_concurrent IS NOT NULL OR rate_tokens IS NOT NULL)\n);\n"
   }
 ];
 /** Built in order after the migrations. */
@@ -74,10 +78,10 @@ export const postgresConcurrentIndexes: readonly PostgresConcurrentIndex[] = [
     "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_status\nON runnerq_activities (status, created_at DESC, id DESC)\nWHERE status \u003c\u003e 'completed'"
   },
   {
-    "name": "idx_runnerq_processing",
+    "name": "idx_runnerq_processing_v2",
     "table": "runnerq_activities",
-    "replaces": "idx_runnerq_activities_processing",
-    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_processing\nON runnerq_activities (queue_name)\nWHERE status = 'processing'"
+    "replaces": "idx_runnerq_processing",
+    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_processing_v2\nON runnerq_activities (queue_name, activity_type)\nWHERE status = 'processing'"
   },
   {
     "name": "idx_runnerq_root_children",
@@ -473,6 +477,63 @@ export const postgresCatalog: Catalog = {
       ]
     },
     {
+      "name": "runnerq_limits",
+      "columns": [
+        {
+          "name": "activity_type",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "max_concurrent",
+          "type": "int4",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "queue_name",
+          "type": "text",
+          "nullable": false,
+          "default": null
+        },
+        {
+          "name": "rate_per_seconds",
+          "type": "float8",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "rate_tokens",
+          "type": "int4",
+          "nullable": true,
+          "default": null
+        },
+        {
+          "name": "refilled_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        },
+        {
+          "name": "tokens",
+          "type": "float8",
+          "nullable": false,
+          "default": "0"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        }
+      ],
+      "primary_key": [
+        "queue_name",
+        "activity_type"
+      ]
+    },
+    {
       "name": "runnerq_results",
       "columns": [
         {
@@ -665,9 +726,9 @@ export const postgresCatalog: Catalog = {
       "definition": "CREATE INDEX idx_runnerq_parent_id ON runnerq_activities USING btree (parent_activity_id) WHERE (parent_activity_id IS NOT NULL)"
     },
     {
-      "name": "idx_runnerq_processing",
+      "name": "idx_runnerq_processing_v2",
       "table": "runnerq_activities",
-      "definition": "CREATE INDEX idx_runnerq_processing ON runnerq_activities USING btree (queue_name) WHERE (status = 'processing'::text)"
+      "definition": "CREATE INDEX idx_runnerq_processing_v2 ON runnerq_activities USING btree (queue_name, activity_type) WHERE (status = 'processing'::text)"
     },
     {
       "name": "idx_runnerq_query_created",
@@ -708,7 +769,7 @@ export const postgresCatalog: Catalog = {
       "idx_runnerq_dequeue_effective",
       "idx_runnerq_dequeue_order",
       "idx_runnerq_query_status_created",
-      "idx_runnerq_activities_processing",
+      "idx_runnerq_processing",
       "idx_runnerq_root_id",
       "idx_runnerq_root_terminal_age",
       "idx_runnerq_results_owner",
@@ -718,7 +779,8 @@ export const postgresCatalog: Catalog = {
       "idx_runnerq_root_only",
       "idx_runnerq_root_status",
       "idx_runnerq_query_type_created",
-      "idx_runnerq_dependencies_producer"
+      "idx_runnerq_dependencies_producer",
+      "idx_runnerq_activities_processing"
     ]
   }
 };

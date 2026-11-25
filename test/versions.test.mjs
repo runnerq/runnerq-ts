@@ -155,6 +155,81 @@ integration("client.repin goes through the command ledger", async (t) => {
   assert.equal(page.items.length, 1);
 });
 
+integration(
+  "limited claims filter versions before spending tokens",
+  async (t) => {
+    const { storage, pool, queue } = await setup(t);
+    await storage.setLimit({
+      type: "limited",
+      maxConcurrent: 1,
+      rateLimit: 1,
+      ratePeriodMs: 3600_000,
+    });
+    const a = new RunnerQClient({ storage, version: "A" });
+    const b = new RunnerQClient({ storage, version: "B" });
+    const first = await a.execute(activity("limited"), null);
+    const bucket = () =>
+      pool.query(
+        "SELECT tokens,refilled_at FROM runnerq_limits WHERE queue_name=$1 AND activity_type='limited'",
+        [queue],
+      );
+    const before = (await bucket()).rows;
+    assert.deepEqual(
+      await storage.claim(1, ["limited"], 60_000, undefined, ["B"]),
+      [],
+    );
+    assert.deepEqual((await bucket()).rows, before);
+    const second = await b.execute(activity("limited"), null);
+    const claims = await storage.claim(1, ["limited"], 60_000, undefined, [
+      "B",
+    ]);
+    assert.deepEqual(
+      claims.map((c) => c.id),
+      [second.id],
+    );
+    assert.equal(claims[0].version, "B");
+    assert.equal((await storage.getActivity(first.id)).status, "pending");
+  },
+);
+
+integration(
+  "limited concurrency counts every version and filters unlimited fallback",
+  async (t) => {
+    const { storage } = await setup(t);
+    await storage.setLimit({ type: "limited", maxConcurrent: 1 });
+    const a = new RunnerQClient({ storage, version: "A" });
+    const b = new RunnerQClient({ storage, version: "B" });
+    const first = await a.execute(activity("limited"), null);
+    const [running] = await storage.claim(1, ["limited"], 60_000, undefined, [
+      "A",
+    ]);
+    assert.equal(running.id, first.id);
+    const second = await b.execute(activity("limited"), null);
+    await a.execute(activity("unlimited"), null);
+    const plain = await b.execute(activity("unlimited"), null);
+    const claims = await storage.claim(
+      10,
+      ["limited", "unlimited"],
+      60_000,
+      undefined,
+      ["B"],
+    );
+    assert.deepEqual(
+      claims.map((c) => c.id),
+      [plain.id],
+    );
+    await storage.complete(
+      { ownerId: running.id, token: running.token },
+      { serialization: "json-v1", data: null },
+    );
+    const next = await storage.claim(1, ["limited"], 60_000, undefined, ["B"]);
+    assert.deepEqual(
+      next.map((c) => c.id),
+      [second.id],
+    );
+  },
+);
+
 integration("version gauges count by version and unserved work", async (t) => {
   const { storage } = await setup(t);
   const gauges = new Map();
