@@ -156,6 +156,42 @@ const ops = {
   async list_schedules() {
     return { names: (await storage.listSchedules()).map((s) => s.name) };
   },
+  async set_limit(a) {
+    await storage.setLimit({
+      type: a.type,
+      ...(a.max_concurrent !== undefined && {
+        maxConcurrent: a.max_concurrent,
+      }),
+      ...(a.rate_tokens !== undefined && { rateLimit: a.rate_tokens }),
+      ...(a.rate_per_s !== undefined && {
+        ratePeriodMs: Math.round(a.rate_per_s * 1000),
+      }),
+    });
+    return {};
+  },
+  async get_limit(a) {
+    let l;
+    try {
+      l = await storage.getLimit(a.type);
+    } catch (error) {
+      if (error?.code === "not_found") return { limit: null };
+      throw error;
+    }
+    return {
+      limit: {
+        max_concurrent: l.maxConcurrent ?? null,
+        rate_tokens: l.rateLimit ?? null,
+        rate_per_s: l.ratePeriodMs === undefined ? null : l.ratePeriodMs / 1000,
+      },
+    };
+  },
+  async delete_limit(a) {
+    await storage.deleteLimit(a.type);
+    return {};
+  },
+  async list_limits() {
+    return { types: (await storage.listLimits()).map((l) => l.type) };
+  },
   async fire_schedules(a) {
     return { count: await storage.fireSchedules(a.limit ?? 100) };
   },

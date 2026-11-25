@@ -50,6 +50,7 @@ import {
   traceparentKey,
 } from "./observability-spec.js";
 import { isQueryStorage } from "./query.js";
+import { isLimitStorage, validateLimit, type Limit } from "./limit.js";
 
 /** Internal: the agent's handle on `Worker`'s interrupt (not exported from the package). */
 export const interruptActivity = Symbol("runnerq.interruptActivity");
@@ -134,6 +135,21 @@ export interface WorkerConfig {
   /** Free-form tags (region, deploy version), carried in the worker's snapshots. */
   labels?: Readonly<Record<string, string>>;
 }
+/**
+ * Limits on a registered activity type. `maxConcurrent` and the rate cap the type across every
+ * worker of the queue: `start()` stores them, replacing the type's stored limit, and the
+ * client changes them at runtime (`RunnerQClient.limits`). `maxConcurrentPerWorker` caps it on
+ * this worker only and is not stored.
+ */
+export interface RegisterOptions {
+  /** At most this many running at once in the queue; waiting and retrying ones don't count. */
+  maxConcurrent?: number;
+  /** At most this many claims per `ratePeriodMs` across the queue, in bursts of up to it. */
+  rateLimit?: number;
+  ratePeriodMs?: number;
+  /** At most this many running at once on this worker, within `concurrency`. */
+  maxConcurrentPerWorker?: number;
+}
 export type ActivityHandler<I, O> = (
   context: ActivityContext,
   input: I,
@@ -167,6 +183,11 @@ export class Worker
       activityTypes?: readonly string[];
     };
   private readonly handlers = new Map<string, Registration>();
+  /** Limits to store at start, by type. */
+  private readonly limits = new Map<string, Limit>();
+  /** maxConcurrentPerWorker by type, and how many of each type run here. */
+  private readonly caps = new Map<string, number>();
+  private readonly capped = new Map<string, number>();
   private readonly schedules = new Map<string, ScheduleDefinition>();
   private readonly inFlight = new Set<Promise<void>>();
   private readonly slotFreed = new ChangeSignal();
@@ -271,9 +292,17 @@ export class Worker
       maxTimerMs,
     );
   }
+  /**
+   * Registers the handler of an activity, with optional limits:
+   *
+   * ```ts
+   * worker.register(sendEmail, handler, { maxConcurrent: 10, rateLimit: 5, ratePeriodMs: 1000 });
+   * ```
+   */
   register<I, O>(
     definition: ActivityDefinition<I, O>,
     handler: ActivityHandler<I, O>,
+    options: RegisterOptions = {},
   ): this {
     if (this.state !== "idle")
       throw new RunnerQError(
@@ -285,6 +314,29 @@ export class Worker
         "configuration",
         `Duplicate handler: ${definition.name}`,
       );
+    const { maxConcurrentPerWorker, ...limit } = options;
+    if (maxConcurrentPerWorker !== undefined)
+      integer(maxConcurrentPerWorker, "maxConcurrentPerWorker", 1);
+    if (
+      limit.maxConcurrent !== undefined ||
+      limit.rateLimit !== undefined ||
+      limit.ratePeriodMs !== undefined
+    ) {
+      const stored = { type: definition.name, ...limit };
+      try {
+        validateLimit(stored);
+      } catch (error) {
+        throw new RunnerQError("configuration", (error as Error).message);
+      }
+      if (!isLimitStorage(this.config.storage))
+        throw new RunnerQError(
+          "configuration",
+          "This storage does not support limits",
+        );
+      this.limits.set(definition.name, stored);
+    }
+    if (maxConcurrentPerWorker !== undefined)
+      this.caps.set(definition.name, maxConcurrentPerWorker);
     this.handlers.set(definition.name, {
       input: definition.input,
       output: definition.output,
@@ -380,6 +432,8 @@ export class Worker
       if (isScheduleStorage(store))
         for (const definition of this.schedules.values())
           await store.upsertSchedule(definition);
+      if (isLimitStorage(store))
+        for (const limit of this.limits.values()) await store.setLimit(limit);
       this.state = "running";
       this.startedAt = new Date();
       this.servedTypes = [...types].sort();
@@ -444,30 +498,90 @@ export class Worker
           await this.slotFreed.changed();
           continue;
         }
-        const claims = await this.config.storage.claim(
-          this.config.concurrency - this.inFlight.size,
+        const { claimTypes, limit, narrowed } = this.planClaim(
           types,
+          this.config.concurrency - this.inFlight.size,
+        );
+        if (!claimTypes.length) {
+          // Every type is at its per-worker cap.
+          await this.slotFreed.changed();
+          continue;
+        }
+        const claims = await this.config.storage.claim(
+          limit,
+          claimTypes,
           this.config.leaseMs,
           this.id,
         );
         // A claim already committed during shutdown still executes under the drain budget.
         for (const claim of claims) {
+          const cap = this.caps.has(claim.type);
+          if (cap)
+            this.capped.set(claim.type, (this.capped.get(claim.type) ?? 0) + 1);
           const promise: Promise<void> = this.process(claim)
             .catch((error) => this.report(error))
             .finally(() => {
+              if (cap)
+                this.capped.set(claim.type, this.capped.get(claim.type)! - 1);
               this.inFlight.delete(promise);
               this.slotFreed.notify();
             });
           this.inFlight.add(promise);
         }
-        if (!claims.length)
-          await this.config.storage.waitForWork(this.intake.signal);
+        if (!claims.length) await this.waitForWork(narrowed);
       } catch (error) {
         if (!this.intake.signal.aborted) {
           this.report(error);
           await pause(1_000, this.intake.signal).catch(() => {});
         }
       }
+    }
+  }
+  /**
+   * Narrows a claim of up to `free` activities to what `maxConcurrentPerWorker` allows: types
+   * at their cap are left out, and the claim asks for no more than a capped type has room for.
+   */
+  private planClaim(
+    types: readonly string[],
+    free: number,
+  ): { claimTypes: string[]; limit: number; narrowed: boolean } {
+    if (!this.caps.size)
+      return { claimTypes: [...types], limit: free, narrowed: false };
+    const claimTypes: string[] = [];
+    let limit = free,
+      narrowed = false;
+    for (const t of types) {
+      const cap = this.caps.get(t);
+      if (cap === undefined) {
+        claimTypes.push(t);
+        continue;
+      }
+      const room = cap - (this.capped.get(t) ?? 0);
+      if (room <= 0) {
+        narrowed = true;
+        continue;
+      }
+      if (room < limit) {
+        limit = room;
+        narrowed = true;
+      }
+      claimTypes.push(t);
+    }
+    return { claimTypes, limit, narrowed };
+  }
+  /** Waits for new work; also for a freed slot when a per-worker cap narrowed the claim. */
+  private async waitForWork(narrowed: boolean): Promise<void> {
+    if (!narrowed) return this.config.storage.waitForWork(this.intake.signal);
+    const wait = new AbortController();
+    const stop = () => wait.abort();
+    this.intake.signal.addEventListener("abort", stop, { once: true });
+    void this.slotFreed.changed().then(stop);
+    try {
+      await this.config.storage.waitForWork(wait.signal);
+    } catch (error) {
+      if (this.intake.signal.aborted) throw error;
+    } finally {
+      this.intake.signal.removeEventListener("abort", stop);
     }
   }
   private async process(claim: Claim): Promise<void> {

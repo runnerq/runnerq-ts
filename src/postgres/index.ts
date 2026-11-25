@@ -56,6 +56,9 @@ import type {
 import { Notifications } from "./notifications.js";
 import { PostgresCommands } from "./command.js";
 import { PostgresSchedules } from "./schedules.js";
+import { PostgresLimits } from "./limits.js";
+import type { Limit, LimitRecord, LimitStorage } from "../limit.js";
+import { limitProbeMs } from "../spec.js";
 import type {
   ScheduleDefinition,
   ScheduleRecord,
@@ -125,7 +128,7 @@ const addedSince = {
     "idx_runnerq_commands_created",
     "idx_runnerq_query_created",
     "idx_runnerq_query_status",
-    "idx_runnerq_processing",
+    "idx_runnerq_processing_v2",
     "idx_runnerq_root_children",
     "idx_runnerq_root_terminal",
     "idx_runnerq_results_by_owner",
@@ -265,6 +268,42 @@ async function ensureConcurrentIndexes(client: PoolClient): Promise<void> {
     );
 }
 
+/** Claims the rows of a `picked` CTE ($1 queue, $3 token prefix, $4 lease ms) and reads them. */
+const claimedSQL = `claimed AS (UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
+        started_at=NOW(),waiting_result_id=NULL,
+        lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
+        FROM picked WHERE a.id=picked.id RETURNING a.*)
+        SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
+        c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,c.priority,
+        i.activity_id AS input_id,i.payload,i.serialization
+        FROM claimed c LEFT JOIN runnerq_inputs i ON i.queue_name=$1 AND i.activity_id=c.id
+        ORDER BY c.priority DESC,c.retry_count DESC,COALESCE(c.scheduled_at,c.created_at) ASC`;
+const dueTime = (a: Row) => new Date(a.scheduled_at ?? a.created_at).getTime();
+/** Claim order: priority, then attempts, then due time. */
+const byClaimOrder = (a: Row, b: Row) =>
+  b.priority - a.priority ||
+  b.retry_count - a.retry_count ||
+  dueTime(a) - dueTime(b);
+function toClaim(a: Row): Claim {
+  if (!a.input_id)
+    throw new RunnerQError("internal", `Missing input for activity ${a.id}`);
+  return {
+    id: a.id,
+    type: a.activity_type,
+    payload: a.payload,
+    serialization: a.serialization,
+    token: a.current_worker_id,
+    dueAt: new Date(a.scheduled_at ?? a.created_at).toISOString(),
+    retryCount: a.retry_count,
+    timeoutMs: Number(a.timeout_seconds) * 1000,
+    parentId: a.parent_activity_id,
+    rootId: a.root_activity_id,
+    depth: a.depth,
+    metadata: a.metadata ?? {},
+    leaseDeadlineMs: Number(a.lease_deadline_ms),
+  };
+}
+
 export class PostgresStorage
   extends EventEmitter<{ storageError: [error: Error] }>
   implements
@@ -272,7 +311,8 @@ export class PostgresStorage
     QueryStorage,
     CommandStorage,
     ResultNotifier,
-    ScheduleStorage
+    ScheduleStorage,
+    LimitStorage
 {
   readonly queue: string;
   private readonly pool: Pool;
@@ -283,6 +323,9 @@ export class PostgresStorage
   );
   private readonly commands: PostgresCommands;
   private readonly schedules: PostgresSchedules;
+  private readonly limits: PostgresLimits;
+  /** The last claim's limits held back claimable work: waitForWork probes again soon. */
+  private heldBack = false;
   private constructor(config: PostgresConfig) {
     super();
     this.queue = config.queue;
@@ -318,6 +361,11 @@ export class PostgresStorage
       query: (sql, values) => this.query(sql, values),
       tx: (body) => this.tx(body),
       work: () => this.notifications.hint("work"),
+    });
+    this.limits = new PostgresLimits({
+      queue: this.queue,
+      query: (sql, values) => this.query(sql, values),
+      tx: (body) => this.tx(body),
     });
   }
   /**
@@ -604,6 +652,33 @@ export class PostgresStorage
       executorId && !executorId.includes(":")
         ? `${executorId}:batch:${randomUUID()}`
         : randomUUID();
+    const plan = await this.limits.plan(types);
+    if (!plan) {
+      this.heldBack = false;
+      return (await this.claimRows(limit, types, leaseMs, prefix)).map(toClaim);
+    }
+    const limited = await this.limits.claim(
+      plan,
+      limit,
+      prefix,
+      leaseMs,
+      claimedSQL,
+    );
+    this.heldBack = limited.heldBack;
+    const left = limit - limited.rows.length;
+    const rest =
+      left > 0 && plan.rest.length
+        ? await this.claimRows(left, plan.rest, leaseMs, prefix)
+        : [];
+    return [...limited.rows, ...rest].sort(byClaimOrder).map(toClaim);
+  }
+  /** The ordinary claim: unlimited types, one statement. */
+  private claimRows(
+    limit: number,
+    types: readonly string[],
+    leaseMs: number,
+    prefix: string,
+  ): Promise<Row[]> {
     return this.tx(async (c) => {
       const filter =
         types.length === 1
@@ -617,15 +692,7 @@ export class PostgresStorage
         AND (status='pending' OR scheduled_at<=NOW()) AND ${filter}
         ORDER BY priority DESC,retry_count DESC,COALESCE(scheduled_at,created_at) ASC
         LIMIT $2 FOR UPDATE SKIP LOCKED),
-        claimed AS (UPDATE runnerq_activities a SET status='processing',current_worker_id=$3||':'||a.id::text,
-        started_at=NOW(),waiting_result_id=NULL,
-        lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint+GREATEST($4::bigint,(timeout_seconds+10)*1000)
-        FROM picked WHERE a.id=picked.id RETURNING a.*)
-        SELECT c.id,c.activity_type,c.current_worker_id,c.scheduled_at,c.created_at,c.retry_count,c.timeout_seconds,
-        c.parent_activity_id,c.root_activity_id,c.depth,c.metadata,c.lease_deadline_ms,
-        i.activity_id AS input_id,i.payload,i.serialization
-        FROM claimed c LEFT JOIN runnerq_inputs i ON i.queue_name=$1 AND i.activity_id=c.id
-        ORDER BY c.priority DESC,c.retry_count DESC,COALESCE(c.scheduled_at,c.created_at) ASC`,
+        ${claimedSQL}`,
         [
           this.queue,
           limit,
@@ -634,28 +701,7 @@ export class PostgresStorage
           types.length === 1 ? types[0] : types,
         ],
       );
-      return r.rows.map((a): Claim => {
-        if (!a.input_id)
-          throw new RunnerQError(
-            "internal",
-            `Missing input for activity ${a.id}`,
-          );
-        return {
-          id: a.id,
-          type: a.activity_type,
-          payload: a.payload,
-          serialization: a.serialization,
-          token: a.current_worker_id,
-          dueAt: new Date(a.scheduled_at ?? a.created_at).toISOString(),
-          retryCount: a.retry_count,
-          timeoutMs: Number(a.timeout_seconds) * 1000,
-          parentId: a.parent_activity_id,
-          rootId: a.root_activity_id,
-          depth: a.depth,
-          metadata: a.metadata ?? {},
-          leaseDeadlineMs: Number(a.lease_deadline_ms),
-        };
-      });
+      return r.rows;
     });
   }
   async renew(f: Fence, leaseMs: number): Promise<boolean> {
@@ -896,6 +942,7 @@ export class PostgresStorage
     return this.notifications.watch(`result:${id}`, onHint);
   }
   async waitForWork(signal: AbortSignal, timeoutMs = 2_000): Promise<void> {
+    if (this.heldBack) timeoutMs = Math.min(timeoutMs, limitProbeMs);
     const sub = this.notifications.subscribe("work", signal);
     try {
       await sub.wait(timeoutMs);
@@ -1315,6 +1362,18 @@ export class PostgresStorage
   }
   fireSchedules(limit: number): Promise<number> {
     return this.schedules.fireSchedules(limit);
+  }
+  setLimit(limit: Limit): Promise<void> {
+    return this.limits.setLimit(limit);
+  }
+  getLimit(type: string): Promise<LimitRecord> {
+    return this.limits.getLimit(type);
+  }
+  listLimits(): Promise<LimitRecord[]> {
+    return this.limits.listLimits();
+  }
+  deleteLimit(type: string): Promise<void> {
+    return this.limits.deleteLimit(type);
   }
   applyCommand(command: Command): Promise<CommandResult> {
     return this.commands.apply(command);

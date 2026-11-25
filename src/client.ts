@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Limits } from "./limit.js";
 import type { ActivityDefinition } from "./activity.js";
 import { businessKey, commandFingerprint, stepKey, uuid } from "./codec.js";
 import { ActivityFailedError, RunnerQError } from "./errors.js";
@@ -299,12 +300,15 @@ export class RunnerQClient {
   readonly storage: Storage;
   /** The queue's cron schedules: upsert, pause, resume, trigger, delete and list. */
   readonly schedules: Schedules;
+  /** The queue's concurrency and rate limits per activity type: set, get, list and delete. */
+  readonly limits: Limits;
   /** Traces this client's submissions and signals (see `Tracer`). */
   readonly tracer?: Tracer;
   constructor({ storage, tracer }: { storage: Storage; tracer?: Tracer }) {
     this.storage = storage;
     this.tracer = tracer;
     this.schedules = new Schedules(storage);
+    this.limits = new Limits(storage);
   }
   execute<I, O>(
     definition: ActivityDefinition<I, O>,

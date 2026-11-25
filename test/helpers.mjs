@@ -22,6 +22,7 @@ export async function setup(t) {
       "runnerq_idempotency",
       "runnerq_commands",
       "runnerq_schedules",
+      "runnerq_limits",
       "runnerq_activities",
     ]) {
       await pool.query(`DELETE FROM ${table} WHERE queue_name=$1`, [queue]);

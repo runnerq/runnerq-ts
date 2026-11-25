@@ -257,3 +257,6 @@ export type {
   ScheduleExecution,
   CatchUp,
 } from "./schedule.js";
+
+export { isLimitStorage, validateLimit } from "./limit.js";
+export type { LimitStorage, Limit, LimitRecord } from "./limit.js";
